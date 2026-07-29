@@ -34,8 +34,9 @@ for PDF, DOCX, ODT, HTML, plain-text, or custom-command output.
 
 The interface uses an Everforest dark palette, a transparent editor canvas,
 mouse-enabled scrolling, and modal dialogs with safe nested error handling. On
-wide terminals, the 80-column prose area is centered while the scrollbar stays
-flush against the far-right edge; narrow terminals use the available width.
+wide terminals, the 80-column prose area is centered while list markers and ATX
+heading markers hang into the existing left margin; the scrollbar stays flush
+against the far-right edge. Narrow terminals use the available width.
 Headings, bold emphasis, and italic emphasis receive lightweight syntax
 highlighting; highlighting is visual only and never changes document text.
 
@@ -57,11 +58,12 @@ Optional:
   aspell and an appropriate dictionary package, for spell checking.
 
 Usage:
-  ./carriage_v1.18.py [file.md]
+  ./carriage_v1.33.py [file.md]
 """
 
 import asyncio
 import copy
+from functools import lru_cache
 import hashlib
 import json
 import os
@@ -113,9 +115,10 @@ from prompt_toolkit.widgets import (
 )
 
 APP_NAME = "Carriage"
-APP_VERSION = "1.18"
+APP_VERSION = "1.33"
 
 WRAP_COLUMN = 80
+STRUCTURE_GUTTER_WIDTH = 8
 TAB_WIDTH = 4
 AUTOSAVE_INTERVAL_SECONDS = 30
 RECOVERY_FORMAT_VERSION = 2
@@ -199,27 +202,37 @@ class EditorState:
 state = EditorState()
 
 
-def _center_padding_widths(columns):
-    """Return padding for 80 text columns plus a private cursor gutter.
+def _prose_layout_widths(columns):
+    """Return left padding, structural gutter, and right padding.
 
-    On wide terminals, Carriage reserves one extra display cell immediately
-    after the 80-column prose area. Real text never occupies that cell; it is
-    available only for the insertion point after character 80. This keeps soft
-    wrapping honestly at 80 columns without a phantom blank row.
+    The 80-column prose body stays centered exactly where it did before the
+    hanging-gutter display was introduced. On sufficiently wide terminals, up
+    to STRUCTURE_GUTTER_WIDTH cells immediately to the left of that prose body
+    are borrowed from the existing left-side breathing room. List markers,
+    canonical list continuation indentation, and ATX heading markers occupy
+    that borrowed area visually; ordinary prose receives display-only padding
+    there so every prose body begins at the same screen column.
 
-    The scrollbar owns the far-right terminal column. On terminals too narrow
-    to provide the extra cursor cell, the editor uses all available width.
+    One additional content cell remains reserved after the prose body for the
+    insertion point at column 80. Narrow terminals gracefully reduce or remove
+    the hanging gutter rather than taking space away from prose.
     """
     scrollbar_width = 1
     available = max(1, columns - scrollbar_width)
     if available <= WRAP_COLUMN:
-        return 0, 0
+        return 0, 0, 0
 
-    # Center the 80 text columns. The 81st content cell is a blank cursor
-    # gutter taken from the right-side breathing room.
-    left = max(0, (available - WRAP_COLUMN) // 2)
-    content_width = WRAP_COLUMN + 1
+    prose_left = max(0, (available - WRAP_COLUMN) // 2)
+    gutter = min(STRUCTURE_GUTTER_WIDTH, prose_left)
+    left = prose_left - gutter
+    content_width = gutter + WRAP_COLUMN + 1
     right = max(0, available - left - content_width)
+    return left, gutter, right
+
+
+def _center_padding_widths(columns):
+    """Return only the transparent outer padding used by TextArea margins."""
+    left, _gutter, right = _prose_layout_widths(columns)
     return left, right
 
 
@@ -758,52 +771,119 @@ class ProseMarkdownLexer(Lexer):
         return get_line
 
 
-class WrapBoundarySpacerProcessor(Processor):
-    """Keep real text wrapping at 80 while reserving an end-cursor cell.
+class ProseLayoutProcessor(Processor):
+    """Render structural Markdown in a hanging gutter beside 80-column prose.
 
-    prompt_toolkit adds a synthetic trailing space to every buffer line so the
-    cursor can sit after the final character. Carriage gives the content one
-    extra display cell for that purpose. For source lines longer than 80
-    characters, this processor inserts a blank boundary cell after each group
-    of 80 characters so the next real character begins on the next screen row.
+    The source buffer remains ordinary Markdown. This processor adds only
+    display-space: supported list/ATX prefixes hang into the left gutter, and
+    temporarily overlong physical source lines receive invisible right-edge
+    padding at word boundaries so prompt_toolkit soft-wraps before the next
+    word instead of cutting that word in half.
 
-    The blank boundary cells have explicit source/display mappings, which keeps
-    mouse clicks and cursor movement aligned with the underlying buffer.
+    The display-only padding never changes the Markdown buffer. Hard-wrapped
+    source remains authoritative, and source/display mappings stay explicit so
+    mouse placement and cursor movement continue to address real buffer
+    positions.
     """
 
     def apply_transformation(self, ti):
-        if ti.width <= WRAP_COLUMN:
-            return Transformation(ti.fragments)
+        # The Window width is the hanging gutter + 80 prose cells + one spare
+        # cursor cell on wide terminals. The spare cell gives the insertion
+        # point after an exactly 80-column line a real screen position.
+        gutter = max(0, min(STRUCTURE_GUTTER_WIDTH, ti.width - (WRAP_COLUMN + 1)))
+        prefix_width = _display_structural_prefix_width(ti.document.text, ti.lineno)
+        if prefix_width > gutter:
+            # There is not enough left-side room to hang this marker without
+            # stealing prose width. Fall back to ordinary source display.
+            prefix_width = 0
 
+        padding = max(0, gutter - prefix_width)
         fragments = explode_text_fragments(ti.fragments)
         source_length = len(fragments)
-        if source_length <= WRAP_COLUMN:
-            return Transformation(ti.fragments)
 
         result = []
         source_to_display_map = {}
         display_to_source_map = {}
         display_pos = 0
 
-        for source_pos, fragment in enumerate(fragments):
-            if source_pos and source_pos % WRAP_COLUMN == 0:
+        # Display-only left padding. Clicking in it maps to source column zero.
+        for _ in range(padding):
+            result.append(("", " "))
+            display_to_source_map[display_pos] = 0
+            display_pos += 1
+
+        def append_display_padding(count, source_pos):
+            nonlocal display_pos
+            for _ in range(max(0, count)):
                 result.append(("", " "))
                 display_to_source_map[display_pos] = source_pos
                 display_pos += 1
+
+        def next_word_width(start):
+            """Display width of the next ordinary word after `start`."""
+            width = 0
+            found = False
+            for index in range(start, source_length):
+                char = fragments[index][1]
+                if char.isspace():
+                    if found:
+                        break
+                    continue
+                found = True
+                width += max(0, get_cwidth(char))
+            return width
+
+        # Number of display cells occupied by prose on the current visual row.
+        # Structural source characters are rendered in the hanging gutter and
+        # therefore do not consume this 80-column prose budget.
+        body_col = 0
+
+        for source_pos, fragment in enumerate(fragments):
+            char = fragment[1]
+            in_body = source_pos >= prefix_width
+
+            if in_body and char != " " and body_col >= WRAP_COLUMN:
+                # A token with no usable preceding separator has reached the
+                # edge. Reserve the private cursor cell so prompt_toolkit wraps
+                # the next source character onto the following visual row.
+                fill = max(0, (WRAP_COLUMN + 1) - body_col)
+                append_display_padding(fill, source_pos)
+                body_col = 0
 
             source_to_display_map[source_pos] = display_pos
             display_to_source_map[display_pos] = source_pos
             result.append(fragment)
             display_pos += 1
 
+            if not in_body:
+                continue
+
+            char_width = max(0, get_cwidth(char))
+            body_col += char_width
+
+            if char == " ":
+                word_width = next_word_width(source_pos + 1)
+                if (
+                    0 < word_width <= WRAP_COLUMN
+                    and body_col + word_width > WRAP_COLUMN
+                ):
+                    # Fill the remainder of this visual row, including the
+                    # private cursor cell. The next source character then wraps
+                    # naturally before the word. This is display-only: the one
+                    # real Markdown separator remains the only source space.
+                    fill = max(0, (WRAP_COLUMN + 1) - body_col)
+                    append_display_padding(fill, source_pos)
+                    body_col = 0
+
         source_to_display_map[source_length] = display_pos
         display_to_source_map[display_pos] = source_length
 
         def source_to_display(position):
+            position = max(0, min(position, source_length))
             return source_to_display_map.get(position, display_pos)
 
         def display_to_source(position):
-            position = min(position, display_pos)
+            position = max(0, min(position, display_pos))
             while position >= 0:
                 if position in display_to_source_map:
                     return display_to_source_map[position]
@@ -815,6 +895,20 @@ class WrapBoundarySpacerProcessor(Processor):
             source_to_display=source_to_display,
             display_to_source=display_to_source,
         )
+
+
+def _soft_wrap_line_prefix(lineno, wrap_count):
+    """Align display-only soft-wrap continuations with the prose column."""
+    if wrap_count <= 0:
+        return []
+    try:
+        columns = get_app().output.get_size().columns
+    except Exception:
+        columns = WRAP_COLUMN + 1
+    _left, gutter, _right = _prose_layout_widths(columns)
+    if gutter <= 0:
+        return []
+    return [("class:editor", " " * gutter)]
 
 
 class FullWidthSafeBufferControl(BufferControl):
@@ -834,17 +928,20 @@ text_area = TextArea(
     wrap_lines=True,
     scrollbar=True,
     focus_on_click=True,
-    input_processors=[WrapBoundarySpacerProcessor()],
+    input_processors=[ProseLayoutProcessor()],
     style="class:editor",
 )
 text_area.control.__class__ = FullWidthSafeBufferControl
 text_area.window.__class__ = ScrollableWindow
 text_area.window.on_scrollbar_interact = _on_scrollbar_interact
-
-# Keep real prose at exactly 80 display columns on wide terminals. The Window
-# receives one additional private cursor cell, while WrapBoundarySpacerProcessor
-# forces real source text to wrap after every 80 characters. The TextArea
-# window remains full-width so the scrollbar stays flush right.
+# Keep display-only continuations aligned with the prose column. The layout
+# processor pads only at word boundaries, so overlong/unreflowed source remains
+# visible without horizontal scrolling or mid-word visual splits.
+text_area.window.get_line_prefix = _soft_wrap_line_prefix
+# Keep the prose body at exactly 80 display columns on wide terminals. The
+# ProseLayoutProcessor borrows part of the existing left-side breathing room as
+# a hanging structural gutter, with one spare cursor cell after the prose body.
+# The Window remains full-width so the scrollbar stays flush right.
 _scrollbar_margin = text_area.window.right_margins[-1]
 text_area.window.left_margins = [CenterPaddingMargin("left")]
 text_area.window.right_margins = [
@@ -2575,103 +2672,386 @@ def _collect_definition_list(lines, index):
     return lines[index:end], end
 
 
-def _simple_list_continuation_text(line, base_indent, marker_prefix):
-    """Return prose from a supported continuation line, or None if complex.
+@dataclass
+class _WrapBlock:
+    """A logical prose/list block that both wrapping paths can render."""
 
-    Carriage live-wraps list items with a hanging indent exactly as wide as the
-    item's marker prefix. Markdown also permits a lazy continuation at the
-    list's base indentation. Reflow accepts both forms so text produced by
-    live wrapping can always be normalized later, while other indentation is
-    still treated conservatively as potentially nested or code-like syntax.
+    kind: str
+    start: int
+    end: int
+    source_lines: list[str]
+    marker: str | None = None
+    body_lines: list[str] | None = None
+    # For a contiguous simple list, every item shares one prose width based
+    # on the widest marker in that list. This keeps source lines at or below
+    # WRAP_COLUMN without adding fake padding after shorter markers.
+    wrap_width: int | None = None
+    list_items: list["_WrapBlock"] | None = None
+
+
+def _simple_list_fragment_is_safe(text):
+    """Return True only for prose Carriage can safely treat as list content.
+
+    This check is applied to both the first line (after its list marker) and
+    every continuation line (after only a recognized continuation indent has
+    been removed). Keeping this structural test in one place prevents live
+    wrapping and Ctrl+J from disagreeing about what a "simple list" means.
     """
-    leading_spaces = len(line) - len(line.lstrip(" "))
-    hanging_indent = len(marker_prefix)
+    if not text.strip():
+        return True
 
+    stripped = text.lstrip()
+    return not (
+        _ATX_HEADING_RE.match(text)
+        or _LIST_ITEM_RE.match(text)
+        or stripped.startswith(">")
+        or _fence_marker(text)
+        or _is_indented_code(text)
+        or _is_strong_html_start(text)
+        or _REFERENCE_DEF_RE.match(text)
+        or _DEFINITION_MARKER_RE.match(text)
+        or _OTHER_LIST_RE.match(text)
+        or _is_thematic_break(text)
+        or _generic_fence_marker(text)
+        or stripped.startswith("|")
+        or _GRID_BORDER_RE.match(text)
+        or _SIMPLE_TABLE_SEPARATOR_RE.match(text)
+        or _is_pipe_table_separator(text)
+        or _looks_structural_or_ambiguous(text)
+    )
+
+
+def _simple_list_continuation(line, marker_prefix, allow_lazy=False):
+    """Return prose content for one supported simple-list continuation.
+
+    Canonical continuation lines use the hanging indent implied by the full
+    marker prefix. Markdown also permits a paragraph inside a list item to use
+    a *lazy continuation* with no indentation. Ctrl+J/live wrapping may accept
+    that valid form and normalize it when reflowing. Display-only gutter logic
+    keeps ``allow_lazy`` false so it never hides source characters that are not
+    actually indentation.
+    """
+    hanging_indent = len(marker_prefix)
+    leading_spaces = len(line) - len(line.lstrip(" "))
     if leading_spaces == hanging_indent:
         return line[hanging_indent:]
-    if leading_spaces == base_indent:
-        return line[base_indent:]
+    if allow_lazy and leading_spaces == 0:
+        return line
     return None
 
 
-def _collect_simple_list(lines, index, width):
-    """Reflow a contiguous flat prose list, or return None if it is complex.
+def _parse_simple_list_item(lines, index, limit=None):
+    """Parse one flat prose list item into the shared wrapping model.
 
-    A supported item may span physical lines. Continuations can either use
-    Carriage's hanging indent or Markdown's lazy base indentation. Nested list
-    markers, code-like indentation, block structures, and blank-separated
-    multi-paragraph items remain opaque.
+    Return None when the item contains nested lists, headings, blockquotes,
+    code-like indentation, raw HTML, noncanonical continuation indentation, or
+    other structure that should remain opaque. Carriage does not repair list
+    syntax: wrapping is allowed only when every physical line is confidently
+    valid simple prose belonging to this one item.
     """
-    end = _nonblank_run_end(lines, index)
-    i = index
-    items = []
+    if not (0 <= index < len(lines)):
+        return None
+
+    match = _LIST_ITEM_RE.match(lines[index])
+    if match is None:
+        return None
+
     base_indent = len(lines[index]) - len(lines[index].lstrip(" "))
+    marker = match.group(1)
+    first_body = lines[index][len(marker):]
+    if not _simple_list_fragment_is_safe(first_body):
+        return None
 
-    while i < end:
-        match = _LIST_ITEM_RE.match(lines[i])
-        if not match:
-            return None, end
-        if len(lines[i]) - len(lines[i].lstrip(" ")) != base_indent:
-            return None, end
+    end_limit = len(lines) if limit is None else min(limit, len(lines))
+    body = [first_body]
+    i = index + 1
 
-        marker = match.group(1)
-        body = [lines[i][len(marker):]]
+    while i < end_limit and lines[i].strip():
+        next_item = _LIST_ITEM_RE.match(lines[i])
+        if next_item is not None:
+            next_indent = len(lines[i]) - len(lines[i].lstrip(" "))
+            if next_indent == base_indent:
+                break
+            # A differently indented marker is a nested/complex list.
+            return None
+
+        continuation = _simple_list_continuation(
+            lines[i], marker, allow_lazy=True
+        )
+        if continuation is None:
+            return None
+        candidate = continuation
+
+        # This catches nested markers that only become visible after removing
+        # a four-character hanging indent, e.g. "10. parent" followed by
+        # "    - nested child".
+        if not _simple_list_fragment_is_safe(candidate):
+            return None
+
+        body.append(candidate)
         i += 1
 
-        while i < end:
-            next_item = _LIST_ITEM_RE.match(lines[i])
-            if next_item is not None:
-                # A marker at the same indentation begins the next flat item;
-                # any differently indented marker makes this a nested/complex
-                # list that Carriage should preserve verbatim.
-                next_indent = len(lines[i]) - len(lines[i].lstrip(" "))
-                if next_indent != base_indent:
-                    return None, end
+    return _WrapBlock(
+        kind="list",
+        start=index,
+        end=i,
+        source_lines=list(lines[index:i]),
+        marker=marker,
+        body_lines=body,
+    )
+
+
+def _list_marker_family(marker_prefix):
+    """Return a conservative family key for one simple Markdown list marker."""
+    marker_text = marker_prefix.strip()
+    if marker_text and marker_text[0].isdigit():
+        return ("ordered", marker_text[-1])
+    return ("unordered", marker_text[:1])
+
+
+def _list_run_marker_budget(lines, index, limit, base_indent, family):
+    """Return the widest top-level marker in the surrounding flat list run.
+
+    This scan is intentionally shallower than the simple-item parser.  A
+    complex item may remain verbatim, but its top-level marker still counts
+    toward the source-width budget used by neighboring simple items.  That
+    keeps Option 2 stable across the whole contiguous list without requiring
+    every item to be simple enough for Carriage to reflow.
+    """
+    budget = 0
+    i = index
+    while i < limit and lines[i].strip():
+        match = _LIST_ITEM_RE.match(lines[i])
+        if match is not None:
+            indent = len(lines[i]) - len(lines[i].lstrip(" "))
+            if indent == base_indent:
+                marker = match.group(1)
+                if _list_marker_family(marker) != family:
+                    break
+                budget = max(budget, len(marker))
+        i += 1
+    return budget
+
+
+def _parse_simple_list_run(lines, index, limit=None, width=WRAP_COLUMN):
+    """Parse the longest simple prefix of one contiguous flat list.
+
+    Ctrl+J must keep walking the document even when one list item contains
+    unsupported structure.  Therefore a complex item ends the current simple
+    prefix instead of invalidating every preceding item in the same nonblank
+    run.  The surrounding list's widest top-level marker still determines the
+    shared prose budget for the simple items that Carriage can safely wrap.
+    """
+    if not (0 <= index < len(lines)):
+        return None
+
+    first_match = _LIST_ITEM_RE.match(lines[index])
+    if first_match is None:
+        return None
+
+    end_limit = len(lines) if limit is None else min(limit, len(lines))
+    base_indent = len(lines[index]) - len(lines[index].lstrip(" "))
+    family = _list_marker_family(first_match.group(1))
+    marker_budget = _list_run_marker_budget(
+        lines, index, end_limit, base_indent, family
+    )
+
+    items = []
+    i = index
+
+    while i < end_limit and lines[i].strip():
+        match = _LIST_ITEM_RE.match(lines[i])
+        if match is None:
+            break
+        if len(lines[i]) - len(lines[i].lstrip(" ")) != base_indent:
+            break
+        if _list_marker_family(match.group(1)) != family:
+            break
+
+        item = _parse_simple_list_item(lines, i, limit=end_limit)
+        if item is None or item.end <= i:
+            break
+        items.append(item)
+        i = item.end
+
+    if not items:
+        return None
+
+    if marker_budget <= 0:
+        marker_budget = max(len(item.marker or "") for item in items)
+    body_width = max(10, width - marker_budget)
+    for item in items:
+        item.wrap_width = body_width
+
+    return _WrapBlock(
+        kind="list-run",
+        start=index,
+        end=i,
+        source_lines=list(lines[index:i]),
+        wrap_width=body_width,
+        list_items=items,
+    )
+
+
+def _complex_list_item_end(lines, index, limit=None):
+    """Return the end of one unsupported top-level list item.
+
+    Preserve only the item Carriage cannot safely understand, not the entire
+    surrounding nonblank run.  This lets Ctrl+J resume at the next top-level
+    item and continue hard-wrapping the rest of the document.
+    """
+    if not (0 <= index < len(lines)):
+        return index + 1
+
+    first = _LIST_ITEM_RE.match(lines[index])
+    if first is None:
+        return index + 1
+
+    end_limit = len(lines) if limit is None else min(limit, len(lines))
+    base_indent = len(lines[index]) - len(lines[index].lstrip(" "))
+    i = index + 1
+    while i < end_limit and lines[i].strip():
+        match = _LIST_ITEM_RE.match(lines[i])
+        if match is not None:
+            indent = len(lines[i]) - len(lines[i].lstrip(" "))
+            if indent == base_indent:
                 break
+        i += 1
+    return i
 
-            raw_candidate = lines[i]
-            candidate = _simple_list_continuation_text(
-                raw_candidate, base_indent, marker
-            )
-            if candidate is None:
-                return None, end
 
-            # Evaluate structure after removing only the recognized list
-            # continuation indent. This prevents a legitimate hanging indent
-            # (including four spaces for markers such as "12. ") from being
-            # mistaken for an indented code block.
-            if (
-                _ATX_HEADING_RE.match(candidate)
-                or candidate.lstrip().startswith(">")
-                or _fence_marker(candidate)
-                or _is_strong_html_start(candidate)
-                or _REFERENCE_DEF_RE.match(candidate)
-                or _DEFINITION_MARKER_RE.match(candidate)
-                or _OTHER_LIST_RE.match(candidate)
-                or _is_thematic_break(candidate)
-                or _generic_fence_marker(candidate)
-                or _looks_structural_or_ambiguous(candidate)
-            ):
-                return None, end
+def _make_plain_prose_block(lines, start, end):
+    """Return a shared prose block when the requested range is plain prose."""
+    if not (0 <= start < end <= len(lines)):
+        return None
+    for line in lines[start:end]:
+        if not line.strip():
+            return None
+    return _WrapBlock(
+        kind="prose",
+        start=start,
+        end=end,
+        source_lines=list(lines[start:end]),
+    )
 
-            # Keep the content's trailing spaces/backslash intact so explicit
-            # Markdown hard breaks survive the reflow.
-            body.append(candidate)
-            i += 1
 
-        items.append((marker, body))
+def _render_wrap_block(block, width=WRAP_COLUMN):
+    """Render a shared prose/list block to the requested physical width."""
+    if block.kind == "prose":
+        return _wrap_markdown_prose(block.source_lines, width=width)
 
-    rendered = []
-    for marker, body in items:
-        rendered.extend(
-            _wrap_markdown_prose(
-                body,
-                width=width,
-                initial_indent=marker,
-                subsequent_indent=" " * len(marker),
-            )
+    if block.kind == "list" and block.marker is not None:
+        # List prose uses the shared budget of its containing list when one is
+        # available. Otherwise a standalone item subtracts its own complete
+        # marker prefix. Structural markers can still hang in the display
+        # gutter, but they count toward the 80-character Markdown source line.
+        body_width = block.wrap_width
+        if body_width is None:
+            body_width = max(10, width - len(block.marker))
+        marker_width = len(block.marker)
+        wrapped_body = _wrap_markdown_prose(
+            block.body_lines or [""], width=body_width
         )
-    return rendered, end
+        return [
+            (block.marker if i == 0 else " " * marker_width) + line
+            for i, line in enumerate(wrapped_body)
+        ]
+
+    if block.kind == "list-run" and block.list_items is not None:
+        rendered = []
+        for item in block.list_items:
+            item.wrap_width = block.wrap_width
+            rendered.extend(_render_wrap_block(item, width=width))
+        return rendered
+
+    return list(block.source_lines)
+
+
+def _collect_simple_list(lines, index, width):
+    """Reflow a contiguous flat list through the shared wrap engine."""
+    end = _nonblank_run_end(lines, index)
+    run = _parse_simple_list_run(lines, index, limit=end, width=width)
+    if run is None or run.end != end:
+        return None, end
+    return _render_wrap_block(run, width=width), end
+
+
+_ATX_DISPLAY_PREFIX_RE = re.compile(r"^\s{0,3}#{1,6}(?:[ \t]+|$)")
+
+
+@lru_cache(maxsize=8)
+def _structural_display_map(full_text):
+    """Return display metadata for safely supported hanging structures.
+
+    The map is presentation-only. It does not repair or reinterpret malformed
+    Markdown. Only ATX headings and simple flat list items accepted by the
+    shared wrapping parser participate; everything else displays verbatim.
+    """
+    lines = full_text.split("\n")
+    result = {}
+    fenced_lines = _highlight_fenced_lines(lines)
+    yaml_end = _yaml_front_matter_end(lines)
+    i = 0
+
+    while i < len(lines):
+        if (yaml_end is not None and i < yaml_end) or i in fenced_lines:
+            i += 1
+            continue
+
+        heading = _ATX_DISPLAY_PREFIX_RE.match(lines[i])
+        if heading is not None:
+            result[i] = (len(heading.group(0)), "heading")
+            i += 1
+            continue
+
+        list_match = _LIST_ITEM_RE.match(lines[i])
+        if list_match is not None:
+            if _row_in_multiline_opaque_block(lines, i) or _is_indented_code(lines[i]):
+                i += 1
+                continue
+
+            # Display mapping is intentionally more local than the strict
+            # wrapping parser. A temporarily malformed following line must not
+            # invalidate the marker/gutter mapping for a valid item above it.
+            # Hang this valid marker, then consume only canonical continuation
+            # lines that are independently safe. Stop at the first line that
+            # does not belong to this simple display item and let the outer
+            # scan interpret that line on its own.
+            marker = list_match.group(1)
+            prefix_width = len(marker)
+            result[i] = (prefix_width, "list-marker")
+
+            run_end = _nonblank_run_end(lines, i)
+            row = i + 1
+            while row < run_end:
+                if _LIST_ITEM_RE.match(lines[row]) is not None:
+                    break
+                continuation = _simple_list_continuation(lines[row], marker)
+                if continuation is None or not _simple_list_fragment_is_safe(continuation):
+                    break
+                result[row] = (prefix_width, "list-continuation")
+                row += 1
+
+            i = max(i + 1, row)
+            continue
+
+        i += 1
+
+    return result
+
+
+def _display_structural_prefix_width(full_text, row):
+    """Return source columns that visually occupy the hanging gutter."""
+    info = _structural_display_map(full_text).get(row)
+    return info[0] if info is not None else 0
+
+
+def _list_continuation_prefix_width(document, row):
+    """Return canonical continuation indentation for this row, if any."""
+    info = _structural_display_map(document.text).get(row)
+    if info is None or info[1] != "list-continuation":
+        return None
+    return info[0]
 
 
 def _collect_simple_blockquote(lines, index, width):
@@ -2745,48 +3125,126 @@ def _should_insert_missing_blank(previous_kind, current_kind):
     return previous_kind != current_kind or current_kind != "prose"
 
 
-def _simple_list_autowrap_context(lines, row):
-    """Return (item_start, marker_prefix) for a simple live-wrapped list item.
-
-    The first physical line begins with a normal Markdown bullet/number marker.
-    Continuation lines created by Carriage use a hanging indent exactly as wide
-    as that marker prefix. Restricting continuation detection to that exact
-    indent prevents unrelated prose, nested structures, and indented code from
-    being pulled into live list wrapping.
-    """
-    if not (0 <= row < len(lines)):
+def _find_live_wrap_block(lines, row):
+    """Return the same logical wrap block Ctrl+J would use around `row`."""
+    if not (0 <= row < len(lines)) or not lines[row].strip():
         return None
 
-    direct = _LIST_ITEM_RE.match(lines[row])
-    if direct is not None:
-        return row, direct.group(1)
+    yaml_end = _yaml_front_matter_end(lines)
+    if yaml_end is not None and row < yaml_end:
+        return None
+    if _row_in_multiline_opaque_block(lines, row):
+        return None
 
-    start = row - 1
-    while start >= 0 and lines[start].strip():
-        match = _LIST_ITEM_RE.match(lines[start])
-        if match is not None:
-            marker_prefix = match.group(1)
-            continuation_width = len(marker_prefix)
-            for candidate in lines[start + 1 : row + 1]:
-                if not candidate.strip() or _LIST_ITEM_RE.match(candidate):
-                    return None
-                leading_spaces = len(candidate) - len(candidate.lstrip(" "))
-                if leading_spaces != continuation_width:
-                    return None
-            return start, marker_prefix
-        start -= 1
+    run_start, run_end = _nonblank_run_bounds(lines, row)
 
+    # A cursor may be on either a marker line or one of its physical
+    # continuations. Parse the whole contiguous list so live wrapping uses the
+    # same widest-marker width budget as Ctrl+J.
+    for i in range(run_start, row + 1):
+        if _LIST_ITEM_RE.match(lines[i]) is None:
+            continue
+        block = _parse_simple_list_run(lines, i, limit=run_end, width=WRAP_COLUMN)
+        if block is not None and block.start <= row < block.end:
+            return block
+
+    # Ordinary prose retains the conservative run-level validation used by
+    # Carriage historically. The rendering itself is now shared with Ctrl+J.
+    if _run_is_plain_prose(lines, row):
+        return _make_plain_prose_block(lines, run_start, run_end)
     return None
 
 
-def _on_text_insert(buf):
-    """Hard-wrap ordinary paragraph prose after typing or a paste.
+def _live_wrap_measure_text(line):
+    """Return the text that should count toward a live-wrap decision.
 
-    Validate the affected nonblank run once, then perform all required line
-    splits in memory and replace the Buffer document once. This preserves the
-    old incremental wrapping behavior while allowing a large one-shot paste to
-    wrap completely without the former 20-line ceiling or quadratic document
-    reconstruction on every wrapped line.
+    A single trailing space is an in-progress word separator while the user is
+    typing. If that space is the character that first crosses WRAP_COLUMN, do
+    not invoke the wrapper yet: `_wrap_markdown_prose()` intentionally trims
+    layout whitespace, and doing so at this moment would consume the separator
+    before the next word exists. Once a non-space character follows it, the
+    space is internal prose and the shared wrapper can move the word safely.
+
+    Explicit Markdown hard-break markers keep their existing treatment.
+    """
+    marker = _hard_break_marker(line)
+    text = _strip_hard_break_marker(line, marker)
+    if marker is None and text.endswith(" "):
+        text = text.rstrip(" ")
+    return text
+
+
+def _wrap_block_needs_reflow(block, width=WRAP_COLUMN):
+    """Return True when a supported block exceeds its active prose budget."""
+    if block.kind == "list-run" and block.list_items is not None:
+        body_width = block.wrap_width if block.wrap_width is not None else width
+        for item in block.list_items:
+            prefix_width = len(item.marker or "")
+            for line in item.source_lines:
+                body = line[prefix_width:] if len(line) >= prefix_width else ""
+                if len(_live_wrap_measure_text(body)) > body_width:
+                    return True
+        return False
+
+    if block.kind == "list" and block.marker is not None:
+        body_width = block.wrap_width
+        if body_width is None:
+            body_width = max(10, width - len(block.marker))
+        prefix_width = len(block.marker)
+        for line in block.source_lines:
+            body = line[prefix_width:] if len(line) >= prefix_width else ""
+            if len(_live_wrap_measure_text(body)) > body_width:
+                return True
+        return False
+
+    for line in block.source_lines:
+        if len(_live_wrap_measure_text(line)) > width:
+            return True
+    return False
+
+
+def _cursor_nonspace_units(lines, block, row, col):
+    """Count stable non-whitespace characters before the live cursor.
+
+    Wrapping changes only whitespace/layout for supported blocks, so this gives
+    us a robust cursor anchor without maintaining a second wrapping algorithm.
+    """
+    units = 0
+    for absolute_row in range(block.start, min(row, block.end - 1) + 1):
+        line = lines[absolute_row]
+        stop = col if absolute_row == row else len(line)
+        stop = max(0, min(stop, len(line)))
+        units += sum(not ch.isspace() for ch in line[:stop])
+    return units
+
+
+def _cursor_from_nonspace_units(rendered, units, prefer_end=False):
+    """Map a non-whitespace cursor anchor back into rendered block lines."""
+    if not rendered:
+        return 0, 0
+    if prefer_end:
+        return len(rendered) - 1, len(rendered[-1])
+    if units <= 0:
+        return 0, 0
+
+    seen = 0
+    for row, line in enumerate(rendered):
+        for col, char in enumerate(line):
+            if not char.isspace():
+                seen += 1
+                if seen >= units:
+                    return row, col + 1
+    return len(rendered) - 1, len(rendered[-1])
+
+
+def _on_text_insert(buf):
+    """Live-wrap the affected logical prose/list block through one engine.
+
+    Ctrl+J and live wrapping share the same list parser, safety checks,
+    Markdown hard-break handling, width calculation, and renderer. The live
+    path differs only in scope: it rewrites the logical block containing the
+    insertion point rather than walking the whole document. Unsupported or
+    malformed Markdown is preserved rather than repaired.
     """
     if not state.auto_wrap:
         return
@@ -2795,259 +3253,285 @@ def _on_text_insert(buf):
     row = doc.cursor_position_row
     col = doc.cursor_position_col
     lines = list(doc.lines)
-    line = lines[row]
 
-    hard_break_marker = _hard_break_marker(line)
-    searchable_line = _strip_hard_break_marker(line, hard_break_marker)
-
-    # Markdown hard-break markers are syntax, not prose content. In
-    # particular, the two trailing spaces must never be considered word
-    # boundaries. A line whose prose is still within the target width is left
-    # alone even if its hard-break marker makes the physical line longer.
-    if len(searchable_line) <= WRAP_COLUMN:
+    block = _find_live_wrap_block(lines, row)
+    if block is None or not _wrap_block_needs_reflow(block):
         return
 
-    yaml_end = _yaml_front_matter_end(lines)
-    if yaml_end is not None and row < yaml_end:
+    rendered = _render_wrap_block(block, width=WRAP_COLUMN)
+    if rendered == block.source_lines:
         return
 
-    # Validate structure before editing. Simple list items have their own
-    # hanging-indent wrapping path; everything else still has to pass the
-    # conservative plain-prose test. This keeps live wrapping useful for the
-    # common list case without making complex Markdown containers editable as
-    # prose by accident.
-    if _row_in_multiline_opaque_block(lines, row):
-        return
+    prefer_end = row == block.end - 1 and col == len(lines[row])
+    units = _cursor_nonspace_units(lines, block, row, col)
+    relative_row, new_col = _cursor_from_nonspace_units(
+        rendered, units, prefer_end=prefer_end
+    )
 
-    list_context = _simple_list_autowrap_context(lines, row)
-    if list_context is None:
-        if not _run_is_plain_prose(lines, row):
-            return
-        list_item_start = None
-        list_marker_prefix = None
-        continuation_prefix = None
-    else:
-        list_item_start, list_marker_prefix = list_context
-        continuation_prefix = " " * len(list_marker_prefix)
-
-    changed = False
-    seen_states = set()
-
-    while True:
-        line = lines[row]
-        hard_break_marker = _hard_break_marker(line)
-        searchable_line = _strip_hard_break_marker(line, hard_break_marker)
-        if len(searchable_line) <= WRAP_COLUMN:
-            break
-
-        wrap_state = (row, col, line)
-        if wrap_state in seen_states:
-            break
-        seen_states.add(wrap_state)
-
-        # Search only the prose portion of the line. The original line is
-        # still sliced below so any hard-break marker remains attached to the
-        # final overflow segment where it belongs.
-        break_at = searchable_line.rfind(" ", 0, WRAP_COLUMN + 1)
-
-        # For list items, the marker or hanging indent is structural syntax,
-        # not a valid word boundary. A single long token after the marker may
-        # exceed the target width rather than leaving a dangling "-"/"1." line.
-        if list_item_start is not None:
-            content_start = (
-                len(list_marker_prefix)
-                if row == list_item_start
-                else len(continuation_prefix)
-            )
-        else:
-            content_start = 0
-
-        if break_at <= content_start:
-            # Long tokens such as URLs are intentionally left intact rather
-            # than split merely to satisfy the writing width.
-            break
-
-        head = line[:break_at]
-        tail = line[break_at + 1:]
-        next_exists = row + 1 < len(lines)
-        next_line = lines[row + 1] if next_exists else ""
-        has_hard_break = hard_break_marker is not None
-
-        lines[row] = head
-        if list_item_start is not None:
-            # Never merge overflow into the next physical line of a list. It
-            # could be the next item. Insert a hanging-indented continuation
-            # instead, preserving list boundaries during live typing/paste.
-            lines.insert(row + 1, continuation_prefix + tail)
-        elif next_exists and next_line.strip() and not has_hard_break:
-            lines[row + 1] = tail + " " + next_line
-        else:
-            # When the original line ends in an explicit Markdown hard break,
-            # its overflow must stay on a line of its own so the two spaces or
-            # trailing backslash remain at the physical line boundary.
-            lines.insert(row + 1, tail)
-
-        changed = True
-        if col <= break_at:
-            # The cursor remains on the completed head line. This matches the
-            # previous incremental behavior: auto-wrap follows overflow only
-            # when the insertion point itself moved into that overflow.
-            break
-
-        row += 1
-        col -= break_at + 1
-        if list_item_start is not None:
-            col += len(continuation_prefix)
-
-    if not changed:
-        return
-
+    lines[block.start:block.end] = rendered
+    new_row = block.start + relative_row
     new_text = "\n".join(lines)
     tmp = Document(text=new_text)
-    row = min(row, tmp.line_count - 1)
-    col = min(col, len(tmp.lines[row]))
-    new_cursor = tmp.translate_row_col_to_index(row, col)
+    new_row = max(0, min(new_row, tmp.line_count - 1))
+    new_col = max(0, min(new_col, len(tmp.lines[new_row])))
+    new_cursor = tmp.translate_row_col_to_index(new_row, new_col)
     buf.document = Document(text=new_text, cursor_position=new_cursor)
 
 
 text_area.buffer.on_text_insert += _on_text_insert
 
 
-def reflow_text(full_text, width=WRAP_COLUMN):
+def _reflow_boundary_start(lines, index):
+    """Return True when `index` starts something that is not plain prose.
+
+    Ctrl+J scans the whole file block by block.  This predicate is deliberately
+    local: one structural line ends the current prose paragraph, but it does not
+    make the rest of the surrounding nonblank run opaque.  That keeps an
+    unsupported construct from preventing later ordinary prose from being
+    reflowed.
     """
-    Reflow prose, not Markdown syntax.
+    if not (0 <= index < len(lines)):
+        return True
 
-    Actively formatted:
-      * ordinary prose paragraphs;
-      * simple flat bullet/decimal lists;
-      * explicit single-level prose blockquotes.
+    line = lines[index]
+    stripped = line.lstrip()
+    return bool(
+        TABLE_PLACEHOLDER_RE.match(line)
+        or _fence_marker(line)
+        or _generic_fence_marker(line)
+        or _is_strong_html_start(line)
+        or _is_pipe_table_start(lines, index)
+        or _definition_list_start(lines, index)
+        or _LIST_ITEM_RE.match(line)
+        or _ATX_HEADING_RE.match(line)
+        or stripped.startswith(">")
+        or _is_thematic_break(line)
+        or _REFERENCE_DEF_RE.match(line)
+        or _DEFINITION_MARKER_RE.match(line)
+        or _is_indented_code(line)
+        or _OTHER_LIST_RE.match(line)
+        or stripped.startswith("|")
+        or _GRID_BORDER_RE.match(line)
+        or _SIMPLE_TABLE_SEPARATOR_RE.match(line)
+        or _is_pipe_table_separator(line)
+        or _looks_structural_or_ambiguous(line)
+    )
 
-    Preserved verbatim:
-      * YAML front matter, fenced/indented code, tables, definition/reference
-        blocks, raw block HTML, complex lists/quotes, and unfamiliar or
-        ambiguous non-prose structures.
 
-    Clear prose structures such as headings may receive a missing blank line.
-    Opaque material never receives invented spacing because doing so could
-    change its meaning.
+def _collect_simple_blockquote_run(lines, index, width):
+    """Reflow one explicit single-level blockquote run.
+
+    Only consecutive physical lines beginning with ``>`` belong to this
+    supported block.  Lazy continuations and more complex quote structures are
+    left unchanged rather than making neighboring prose opaque.
+    """
+    end = index
+    while end < len(lines) and lines[end].strip() and lines[end].lstrip().startswith(">"):
+        end += 1
+
+    inner = []
+    for i in range(index, end):
+        match = re.match(r"^\s{0,3}>[ \t]?(.*)$", lines[i])
+        if not match:
+            return None, end
+        content = match.group(1)
+        if re.match(r"^\s{0,3}>", content):
+            return None, end
+        if content and (
+            _fence_marker(content)
+            or _ATX_HEADING_RE.match(content)
+            or _LIST_ITEM_RE.match(content)
+            or _is_indented_code(content)
+            or _is_strong_html_start(content)
+        ):
+            return None, end
+        inner.append(content)
+
+    rendered = []
+    paragraph = []
+    for content in inner + [""]:
+        if content.strip():
+            paragraph.append(content)
+            continue
+        if paragraph:
+            wrapped = _wrap_markdown_prose(paragraph, width=max(10, width - 2))
+            rendered.extend(f"> {line}" if line else ">" for line in wrapped)
+            paragraph = []
+        if content == "" and rendered and rendered[-1] != ">":
+            rendered.append(">")
+
+    if rendered and rendered[-1] == ">" and inner and inner[-1].strip():
+        rendered.pop()
+    return rendered, end
+
+
+def reflow_text(full_text, width=WRAP_COLUMN):
+    """Hard-wrap every supported prose block in the document.
+
+    Ctrl+J is document-wide.  It walks from the first physical line to the
+    last, reflowing every ordinary prose paragraph, simple flat list, and
+    explicit single-level blockquote it encounters.  Structural or unsupported
+    Markdown is copied verbatim, but it never causes later supported prose to
+    be skipped.
+
+    Blank lines are preserved exactly; reflow does not add or remove document
+    structure merely to normalize Markdown style.
     """
     lines = full_text.split("\n")
-    blocks = []
+    rendered = []
     i = 0
-    pending_gap = 0
 
     yaml_end = _yaml_front_matter_end(lines)
     if yaml_end is not None:
-        _append_reflow_block(blocks, 0, "yaml", lines[:yaml_end])
+        rendered.extend(lines[:yaml_end])
         i = yaml_end
 
     while i < len(lines):
-        if not lines[i].strip():
-            pending_gap += 1
+        line = lines[i]
+
+        # Preserve blank-line boundaries exactly as authored.
+        if not line.strip():
+            rendered.append(line)
             i += 1
             continue
 
-        gap = pending_gap
-        pending_gap = 0
-        line = lines[i]
-
+        # Multiline opaque structures are copied as units so text inside them
+        # is never mistaken for prose on a later iteration.
         if _fence_marker(line):
             block, i = _collect_fenced_block(lines, i)
-            _append_reflow_block(blocks, gap, "opaque", block)
+            rendered.extend(block)
             continue
 
         if _generic_fence_marker(line):
             block, i = _collect_generic_opaque_block(lines, i)
-            _append_reflow_block(blocks, gap, "opaque", block)
+            rendered.extend(block)
             continue
 
         if _is_strong_html_start(line):
             block, i = _collect_html_block(lines, i)
-            _append_reflow_block(blocks, gap, "opaque", block)
+            rendered.extend(block)
             continue
 
         if _is_pipe_table_start(lines, i):
             block, i = _collect_pipe_table(lines, i)
-            _append_reflow_block(blocks, gap, "opaque", block)
+            rendered.extend(block)
             continue
 
         if _definition_list_start(lines, i):
             block, i = _collect_definition_list(lines, i)
-            _append_reflow_block(blocks, gap, "opaque", block)
+            rendered.extend(block)
             continue
 
-        # Lists get their own structural validation before the generic opaque
-        # run check. Carriage's live list wrapping intentionally creates
-        # hanging-indented continuation lines, which the generic prose guard
-        # quite correctly regards as ambiguous outside a list context.
+        # A valid simple list is reflowed as a complete contiguous list so the
+        # widest ordered marker can determine one shared source-width budget.
         if _LIST_ITEM_RE.match(line):
-            wrapped, end = _collect_simple_list(lines, i, width)
-            if wrapped is None:
-                _append_reflow_block(blocks, gap, "opaque", lines[i:end])
+            run_end = _nonblank_run_end(lines, i)
+            run = _parse_simple_list_run(lines, i, limit=run_end, width=width)
+            if run is not None:
+                rendered.extend(_render_wrap_block(run, width=width))
+                i = run.end
             else:
-                _append_reflow_block(blocks, gap, "list", wrapped)
-            i = end
+                # Preserve only the unsupported item, then resume scanning at
+                # the next top-level item. One complex list entry must not
+                # prevent Ctrl+J from hard-wrapping simple entries elsewhere
+                # in the same list or later prose in the file.
+                item_end = _complex_list_item_end(lines, i, limit=run_end)
+                rendered.extend(lines[i:item_end])
+                i = item_end
             continue
 
-        run_end = _nonblank_run_end(lines, i)
-        if _run_has_opaque_signal(lines, i, run_end):
-            _append_reflow_block(blocks, gap, "opaque", lines[i:run_end])
-            i = run_end
-            continue
-
-        if _ATX_HEADING_RE.match(line):
-            _append_reflow_block(blocks, gap, "heading", [line])
-            i += 1
-            continue
-
-        if _is_thematic_break(line):
-            _append_reflow_block(blocks, gap, "structure", [line])
+        if _ATX_HEADING_RE.match(line) or _is_thematic_break(line):
+            rendered.append(line)
             i += 1
             continue
 
         if line.lstrip().startswith(">"):
-            wrapped, end = _collect_simple_blockquote(lines, i, width)
+            wrapped, end = _collect_simple_blockquote_run(lines, i, width)
             if wrapped is None:
-                _append_reflow_block(blocks, gap, "opaque", lines[i:end])
+                rendered.extend(lines[i:end])
             else:
-                _append_reflow_block(blocks, gap, "quote", wrapped)
+                rendered.extend(wrapped)
             i = end
             continue
 
-        # Ordinary prose. Stop only at block forms we intentionally support;
-        # anything suspicious would already have made the run opaque above.
-        paragraph = [line]
-        i += 1
-        while i < len(lines) and lines[i].strip() and not _clear_supported_start(lines, i):
-            paragraph.append(lines[i])
+        # Unsupported single-line structures are preserved locally.  The next
+        # iteration can still reflow ordinary prose that follows them.
+        if _reflow_boundary_start(lines, i):
+            rendered.append(line)
             i += 1
-        wrapped = _wrap_markdown_prose(paragraph, width=width)
-        _append_reflow_block(blocks, gap, "prose", wrapped)
+            continue
 
-    if not blocks:
-        return "\n" * max(0, pending_gap - 1)
+        # Ordinary prose continues until a blank line or the next local
+        # structural boundary.  This is the key document-wide behavior: every
+        # prose block gets its own chance to reflow regardless of what appeared
+        # earlier in the same nonblank region.
+        start = i
+        i += 1
+        while (
+            i < len(lines)
+            and lines[i].strip()
+            and not _reflow_boundary_start(lines, i)
+        ):
+            i += 1
 
-    rendered = []
-    previous_kind = None
-    for block_index, (gap_before, kind, block_lines) in enumerate(blocks):
-        if block_index == 0:
-            rendered.extend([""] * gap_before)
-        elif gap_before > 0:
-            rendered.extend([""] * gap_before)
-        elif _should_insert_missing_blank(previous_kind, kind):
-            rendered.append("")
-        rendered.extend(block_lines)
-        previous_kind = kind
+        prose_block = _make_plain_prose_block(lines, start, i)
+        if prose_block is None:
+            rendered.extend(lines[start:i])
+        else:
+            rendered.extend(_render_wrap_block(prose_block, width=width))
 
-    rendered.extend([""] * pending_gap)
     return "\n".join(rendered)
+
+def _document_cursor_nonspace_units(text, cursor_position):
+    """Return a wrapping-stable logical cursor offset for the document.
+
+    Reflow changes whitespace and physical line boundaries in supported prose,
+    but it preserves the sequence of non-whitespace characters. Counting those
+    characters before the insertion point gives Ctrl+J a stable anchor that
+    follows the author's words instead of a raw byte/character offset whose
+    meaning changes as line breaks move.
+    """
+    cursor_position = max(0, min(len(text), cursor_position))
+    return sum(not char.isspace() for char in text[:cursor_position])
+
+
+def _cursor_position_from_document_units(text, units, prefer_end=False):
+    """Map a logical non-whitespace offset back into reflowed document text."""
+    if prefer_end:
+        return len(text)
+    if units <= 0:
+        return 0
+
+    seen = 0
+    for position, char in enumerate(text):
+        if not char.isspace():
+            seen += 1
+            if seen >= units:
+                return position + 1
+    return len(text)
 
 
 def do_reflow_document():
-    # Keyboard-triggered actions get an undo snapshot automatically before
-    # the handler runs; a menu click does not, so save one explicitly here.
-    text_area.buffer.save_to_undo_stack()
-    text_area.text = reflow_text(text_area.text)
+    """Reflow the document while keeping the insertion point near its text."""
+    buf = text_area.buffer
+    old_text = buf.text
+    old_cursor = buf.cursor_position
+    new_text = reflow_text(old_text)
+
+    if new_text == old_text:
+        return
+
+    # Keyboard-triggered Ctrl+J explicitly disables prompt_toolkit's automatic
+    # save_before snapshot so menu and keyboard invocation share one undo step.
+    buf.save_to_undo_stack()
+
+    logical_units = _document_cursor_nonspace_units(old_text, old_cursor)
+    new_cursor = _cursor_position_from_document_units(
+        new_text,
+        logical_units,
+        prefer_end=(old_cursor == len(old_text)),
+    )
+    buf.document = Document(text=new_text, cursor_position=new_cursor)
 
 def do_undo():
     text_area.buffer.undo()
@@ -4802,7 +5286,7 @@ def _(event):
     with_unsaved_changes_check(do_quit)()
 
 
-@kb.add("c-j", filter=editor_focused)
+@kb.add("c-j", filter=editor_focused, save_before=lambda e: False)
 def _(event):
     do_reflow_document()
 
@@ -4873,6 +5357,113 @@ def _(event):
     event.current_buffer.insert_text(" " * spaces)
 
 
+def _at_list_item_body_start():
+    """Return True at the visible start of a supported list item's prose.
+
+    List markers live in the hanging gutter. From the writer's point of view,
+    Backspace at the first prose character crosses that entire structural
+    marker, not merely its final source-space character.
+    """
+    buf = text_area.buffer
+    if buf.selection_state is not None:
+        return False
+    doc = buf.document
+    row = doc.cursor_position_row
+    info = _structural_display_map(doc.text).get(row)
+    if info is None or info[1] != "list-marker":
+        return False
+    return doc.cursor_position_col == info[0]
+
+
+def _at_list_continuation_start():
+    buf = text_area.buffer
+    if buf.selection_state is not None:
+        return False
+    doc = buf.document
+    prefix_width = _list_continuation_prefix_width(doc, doc.cursor_position_row)
+    return prefix_width is not None and doc.cursor_position_col == prefix_width
+
+
+def _before_list_continuation():
+    buf = text_area.buffer
+    if buf.selection_state is not None:
+        return False
+    doc = buf.document
+    row = doc.cursor_position_row
+    if doc.cursor_position_col != len(doc.current_line) or row + 1 >= doc.line_count:
+        return False
+    return _list_continuation_prefix_width(doc, row + 1) is not None
+
+
+@kb.add("backspace", filter=editor_focused & Condition(_at_list_item_body_start))
+def _(event):
+    # The marker is displayed in the hanging gutter, so Backspace from the
+    # visible start of list prose removes the marker as one structural unit.
+    # Canonical continuation indentation belongs to that same marker and is
+    # removed at the same time, converting the item cleanly into ordinary
+    # prose instead of leaving a half-broken marker plus hidden indentation.
+    buf = event.current_buffer
+    doc = buf.document
+    row = doc.cursor_position_row
+    lines = list(doc.lines)
+    run_end = _nonblank_run_end(lines, row)
+    block = _parse_simple_list_item(lines, row, limit=run_end)
+    if block is None or block.marker is None:
+        return
+
+    # Use the parser's logical body rather than slicing every physical source
+    # line by the marker width. A valid lazy continuation has no indentation to
+    # remove, while a canonical continuation does; body_lines already handles
+    # both correctly.
+    converted = list(block.body_lines or [])
+
+    lines[block.start:block.end] = converted
+    new_text = "\n".join(lines)
+    tmp = Document(text=new_text)
+    new_row = min(block.start, tmp.line_count - 1)
+    new_cursor = tmp.translate_row_col_to_index(new_row, 0)
+    buf.document = Document(text=new_text, cursor_position=new_cursor)
+
+
+@kb.add("backspace", filter=editor_focused & Condition(_at_list_continuation_start))
+def _(event):
+    # Continuation indentation is structural Markdown presented in the hanging
+    # gutter. At the visible start of continuation prose, Backspace therefore
+    # crosses the whole hidden boundary in one step instead of deleting those
+    # indentation spaces one by one.
+    buf = event.current_buffer
+    doc = buf.document
+    prefix_width = _list_continuation_prefix_width(doc, doc.cursor_position_row)
+    if prefix_width is None:
+        return
+    start = buf.cursor_position - prefix_width - 1  # newline + indentation
+    if start < 0:
+        return
+    text = buf.text
+    buf.document = Document(
+        text=text[:start] + text[buf.cursor_position:],
+        cursor_position=start,
+    )
+
+
+@kb.add("delete", filter=editor_focused & Condition(_before_list_continuation))
+def _(event):
+    # Symmetric with Backspace above: Delete at the end of a physical line
+    # removes the following newline plus canonical continuation indentation as
+    # one boundary.
+    buf = event.current_buffer
+    doc = buf.document
+    prefix_width = _list_continuation_prefix_width(doc, doc.cursor_position_row + 1)
+    if prefix_width is None:
+        return
+    pos = buf.cursor_position
+    remove = 1 + prefix_width
+    buf.document = Document(
+        text=buf.text[:pos] + buf.text[pos + remove:],
+        cursor_position=pos,
+    )
+
+
 @kb.add("backspace", filter=editor_focused & Condition(lambda: text_area.buffer.selection_state is not None))
 def _(event):
     # prompt_toolkit's default backward-delete behavior does not consistently
@@ -4905,19 +5496,41 @@ def _move_editor_cursor_across_lines(delta):
     if delta > 0:
         # TABLE_SENTINEL is an internal zero-width marker attached to folded
         # table references. Skip it without consuming a visible cursor step.
+        doc = buf.document
+        row = doc.cursor_position_row
+        at_line_end = doc.cursor_position_col == len(doc.current_line)
+        continuation_width = (
+            _list_continuation_prefix_width(doc, row + 1)
+            if at_line_end and row + 1 < doc.line_count
+            else None
+        )
         while pos < len(text) and text[pos] == TABLE_SENTINEL:
             pos += 1
         if pos < len(text):
             pos += 1
+        if continuation_width is not None:
+            pos = min(len(text), pos + continuation_width)
         while pos < len(text) and text[pos] == TABLE_SENTINEL:
             pos += 1
     elif delta < 0:
-        while pos > 0 and text[pos - 1] == TABLE_SENTINEL:
-            pos -= 1
-        if pos > 0:
-            pos -= 1
-        while pos > 0 and text[pos - 1] == TABLE_SENTINEL:
-            pos -= 1
+        doc = buf.document
+        continuation_width = _list_continuation_prefix_width(
+            doc, doc.cursor_position_row
+        )
+        if (
+            continuation_width is not None
+            and doc.cursor_position_col == continuation_width
+        ):
+            # Treat canonical continuation indentation as display structure:
+            # one Left from visible column zero reaches the previous line end.
+            pos = max(0, pos - continuation_width - 1)
+        else:
+            while pos > 0 and text[pos - 1] == TABLE_SENTINEL:
+                pos -= 1
+            if pos > 0:
+                pos -= 1
+            while pos > 0 and text[pos - 1] == TABLE_SENTINEL:
+                pos -= 1
 
     buf.cursor_position = pos
 
