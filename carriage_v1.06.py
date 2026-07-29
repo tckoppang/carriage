@@ -23,8 +23,9 @@ structural-looking regions are treated as opaque and copied unchanged.
 
 File operations include New, Open, Save, and Save As. Saves and autosaves use
 a temporary file followed by atomic replacement so a failed write does not
-truncate the existing file. Autosave runs every 30 seconds for named files and
-pauses while aspell or a modal dialog is active.
+truncate the existing file. Autosave runs every 30 seconds for named files;
+modified untitled documents receive a private crash-recovery snapshot on the
+same interval. Background writes pause while aspell or a modal dialog is active.
 
 The Tools menu can hand a saved document to aspell in Markdown mode and reload
 the edited file afterward. The Export menu sends the current buffer to Pandoc
@@ -55,11 +56,13 @@ Optional:
   aspell and an appropriate dictionary package, for spell checking.
 
 Usage:
-  ./carriage_v1.02.py [file.md]
+  ./carriage_v1.06.py [file.md]
 """
 
 import asyncio
 import copy
+import hashlib
+import json
 import os
 import re
 import shlex
@@ -88,7 +91,7 @@ from prompt_toolkit.layout.containers import (
     Window,
     WindowAlign,
 )
-from prompt_toolkit.layout.controls import FormattedTextControl
+from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.layout.dimension import D
 from prompt_toolkit.layout.layout import Layout
 from prompt_toolkit.layout.margins import Margin
@@ -105,11 +108,12 @@ from prompt_toolkit.widgets import (
 )
 
 APP_NAME = "Carriage"
-APP_VERSION = "1.02"
+APP_VERSION = "1.06"
 
 WRAP_COLUMN = 80
 TAB_WIDTH = 4
 AUTOSAVE_INTERVAL_SECONDS = 30
+RECOVERY_FORMAT_VERSION = 1
 TABLE_SENTINEL = "\u2063"  # zero-width INVISIBLE SEPARATOR; never written to disk
 TABLE_PLACEHOLDER_RE = re.compile(rf"^\[\[Table (\d+)\]\]{TABLE_SENTINEL}$")
 MAX_TABLE_EDITOR_COLUMNS = 6
@@ -159,10 +163,22 @@ class EditorState:
         self.auto_wrap = True
         self.auto_save = True
         self.saved_text = ""
+        # Fingerprint of the exact on-disk bytes last opened or successfully
+        # written by Carriage. A save must still see this same version before
+        # it is allowed to replace the file.
+        self.disk_snapshot = None
+        # Avoid repeatedly opening the same autosave-conflict warning every
+        # 30 seconds while an externally changed file remains unresolved.
+        self.autosave_conflict = False
         # True while an external interactive process (aspell) has the file
         # open on disk - autosave pauses during this window to avoid racing
         # with whatever that process writes back.
         self.external_process_running = False
+        # Hidden crash-recovery state for an untitled document. Recovery is
+        # deliberately separate from the user's document pathname and is
+        # removed after a successful Save, New, Open, or clean discard/quit.
+        self.recovery_path = None
+        self.recovery_error = False
         self.tables = {}
 
     def is_modified(self, current_text):
@@ -177,14 +193,12 @@ state = EditorState()
 
 
 def _center_padding_widths(columns):
-    """Return padding that centers prose in the space left of the scrollbar.
+    """Return padding that centers an honest 80-column prose viewport.
 
     The scrollbar owns the far-right terminal column and is excluded from the
-    centering calculation. The prose column is centered within the remaining
-    width. When that usable width is odd, the extra margin cell goes on the
-    right, immediately before the scrollbar. On narrow terminals, padding
-    collapses to zero and the editor uses all space available to the left of
-    the scrollbar.
+    centering calculation. On wide terminals, the prose area is exactly
+    WRAP_COLUMN cells wide. Narrow terminals use all available space to the
+    left of the scrollbar.
     """
     scrollbar_width = 1
     available = max(1, columns - scrollbar_width)
@@ -620,6 +634,68 @@ class ProseMarkdownLexer(Lexer):
         return get_line
 
 
+class FullWidthSafeBufferControl(BufferControl):
+    """Avoid phantom blank rows after exactly full-width logical lines.
+
+    prompt_toolkit appends one synthetic space to every BufferControl line so
+    the terminal cursor can occupy the position just after the final character.
+    With soft wrapping enabled, an 80-character line in an 80-column window
+    therefore becomes 81 display cells and the synthetic cell wraps onto an
+    otherwise blank screen row.
+
+    Keep prompt_toolkit's normal behavior except when that synthetic cell is
+    the *only* thing that would create another wrapped row. In that case, omit
+    the cell for rendering. If the editing cursor is at the end of that line,
+    display it on the final real character instead. Buffer positions and file
+    contents are unchanged.
+    """
+
+    def create_content(self, width, height, preview_search=False):
+        content = super().create_content(width, height, preview_search)
+        if width <= 0:
+            return content
+
+        original_get_line = content.get_line
+        cache = {}
+
+        def adjusted_line(row):
+            if row in cache:
+                return cache[row]
+
+            fragments = original_get_line(row)
+            if not fragments or fragments[-1][:2] != ("", " "):
+                cache[row] = fragments
+                return fragments
+
+            real_fragments = fragments[:-1]
+            real_width = sum(get_cwidth(fragment[1]) for fragment in real_fragments)
+
+            # Only suppress the synthetic cursor cell when it alone would
+            # create a new wrapped row. Empty lines keep the normal cursor cell.
+            if real_width > 0 and real_width % width == 0:
+                fragments = real_fragments
+
+            cache[row] = fragments
+            return fragments
+
+        content.get_line = adjusted_line
+
+        cursor = content.cursor_position
+        cursor_line = original_get_line(cursor.y)
+        if cursor_line and cursor_line[-1][:2] == ("", " "):
+            real_fragments = cursor_line[:-1]
+            real_width = sum(get_cwidth(fragment[1]) for fragment in real_fragments)
+            real_char_count = sum(len(fragment[1]) for fragment in real_fragments)
+            if (
+                real_width > 0
+                and real_width % width == 0
+                and cursor.x == real_char_count
+            ):
+                content.cursor_position = cursor._replace(x=max(0, cursor.x - 1))
+
+        return content
+
+
 text_area = TextArea(
     text="",
     lexer=ProseMarkdownLexer(),
@@ -627,13 +703,15 @@ text_area = TextArea(
     scrollbar=True,
     style="class:editor",
 )
+text_area.control.__class__ = FullWidthSafeBufferControl
 text_area.window.__class__ = ScrollableWindow
 text_area.window.on_scrollbar_interact = _on_scrollbar_interact
 
-# Keep the prose itself at the editor's 80-column writing width on wide
-# terminals, but leave the TextArea window full-width so its scrollbar remains
-# flush against the terminal's far-right edge. These margins collapse when the
-# terminal is too narrow to display 80 prose columns plus the scrollbar.
+# Keep the visible prose area exactly 80 columns on wide terminals. The custom
+# BufferControl above prevents prompt_toolkit's synthetic end-of-line cursor
+# cell from manufacturing a blank wrapped row when a physical line fills all
+# 80 columns. The TextArea window remains full-width so the scrollbar stays
+# flush against the terminal's far-right edge.
 _scrollbar_margin = text_area.window.right_margins[-1]
 text_area.window.left_margins = [CenterPaddingMargin("left")]
 text_area.window.right_margins = [
@@ -769,10 +847,428 @@ def with_unsaved_changes_check(action):
 # File operations
 # ---------------------------------------------------------------------------
 
+_MISSING_DISK_SNAPSHOT = ("missing", None)
+_SAVE_OK = "ok"
+_SAVE_CONFLICT = "conflict"
+_SAVE_ERROR = "error"
+_SAVE_READ_ONLY = "read_only"
+
+
+def _canonical_path(path):
+    """Return the concrete path Carriage will read from or replace."""
+    return os.path.realpath(os.path.abspath(path))
+
+
+def _same_document_path(first, second):
+    """Return True when two pathnames identify the same source file."""
+    if not first or not second:
+        return False
+
+    first_real = _canonical_path(first)
+    second_real = _canonical_path(second)
+    if os.path.normcase(first_real) == os.path.normcase(second_real):
+        return True
+
+    # realpath catches symlink aliases. samefile also catches hard links when
+    # both directory entries currently exist.
+    try:
+        return os.path.samefile(first_real, second_real)
+    except (FileNotFoundError, OSError):
+        return False
+
+
+def _snapshot_bytes(raw_bytes):
+    return ("file", hashlib.sha256(raw_bytes).hexdigest())
+
+
+def _disk_snapshot(path):
+    """Fingerprint the exact bytes currently stored at path.
+
+    A missing path is a meaningful version: it lets a first save detect that
+    another program created the destination after Carriage chose it.
+    """
+    target_path = _canonical_path(path)
+    try:
+        file_stat = os.stat(target_path)
+    except FileNotFoundError:
+        return _MISSING_DISK_SNAPSHOT
+
+    if not stat.S_ISREG(file_stat.st_mode):
+        raise OSError(f"Not a regular file: {target_path}")
+
+    digest = hashlib.sha256()
+    with open(target_path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return ("file", digest.hexdigest())
+
+
+def _read_utf8_file_with_snapshot(path):
+    """Read one UTF-8 file and fingerprint exactly the bytes that were read."""
+    target_path = _canonical_path(path)
+    with open(target_path, "rb") as f:
+        raw = f.read()
+    content = raw.decode("utf-8")
+    # Match the universal-newline behavior Carriage used before v1.03 while
+    # keeping the fingerprint tied to the exact source bytes.
+    content = content.replace("\r\n", "\n").replace("\r", "\n")
+    return content, _snapshot_bytes(raw)
+
+
+def _path_is_read_only(path):
+    """Return True when an existing regular file should not be replaced.
+
+    Check the mode bits as well as os.access(). The explicit mode-bit test is
+    important when Carriage is run by a privileged account: a 0444 document is
+    still intentionally read-only even if that account could technically
+    replace it through the containing directory.
+    """
+    target_path = _canonical_path(path)
+    try:
+        file_stat = os.stat(target_path)
+    except FileNotFoundError:
+        return False
+
+    if not stat.S_ISREG(file_stat.st_mode):
+        raise OSError(f"Not a regular file: {target_path}")
+
+    write_bits = stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH
+    return not bool(file_stat.st_mode & write_bits) or not os.access(target_path, os.W_OK)
+
+
+def _recovery_directory():
+    """Return the per-user directory used for hidden crash-recovery state."""
+    base = os.environ.get("XDG_STATE_HOME")
+    if not base:
+        base = os.path.join(os.path.expanduser("~"), ".local", "state")
+    return os.path.join(base, "carriage", "recovery")
+
+
+def _table_recovery_record(table):
+    return {
+        "headers": list(table.headers),
+        "rows": [list(row) for row in table.rows],
+        "alignments": list(table.alignments),
+        "original_lines": None if table.original_lines is None else list(table.original_lines),
+        "dirty": bool(table.dirty),
+    }
+
+
+def _recovery_payload():
+    """Capture editor state without requiring the document to materialize.
+
+    Recovery deliberately stores the visible buffer and table objects
+    separately. That means it can preserve work even if an interrupted table
+    operation has temporarily made normal Markdown materialization impossible.
+    """
+    return {
+        "format": RECOVERY_FORMAT_VERSION,
+        "pid": os.getpid(),
+        "visible_text": text_area.text,
+        "tables": {
+            str(number): _table_recovery_record(table)
+            for number, table in state.tables.items()
+        },
+    }
+
+
+def _ensure_recovery_path():
+    directory = _recovery_directory()
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(directory, 0o700)
+    except OSError:
+        # A pre-existing XDG state directory may live on a filesystem where
+        # chmod is unsupported. The recovery file itself is still forced 0600.
+        pass
+
+    if state.recovery_path is None:
+        token = os.urandom(6).hex()
+        state.recovery_path = os.path.join(
+            directory, f"untitled-{os.getpid()}-{token}.json"
+        )
+    return state.recovery_path
+
+
+def _write_recovery_snapshot():
+    """Atomically persist the current untitled document for crash recovery."""
+    if state.path is not None or not state.is_modified(text_area.text):
+        _clear_recovery_file()
+        return
+
+    recovery_path = _ensure_recovery_path()
+    directory = os.path.dirname(recovery_path)
+    temp_path = None
+    fd = None
+    payload = json.dumps(
+        _recovery_payload(),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+    try:
+        fd, temp_path = tempfile.mkstemp(
+            prefix=".recovery-",
+            suffix=".tmp",
+            dir=directory,
+            text=True,
+        )
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+            fd = None
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, recovery_path)
+        temp_path = None
+        try:
+            dir_fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        except OSError:
+            dir_fd = None
+        if dir_fd is not None:
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if temp_path is not None:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+
+
+def _clear_recovery_file():
+    recovery_path = state.recovery_path
+    state.recovery_path = None
+    state.recovery_error = False
+    if recovery_path is None:
+        return
+    try:
+        os.unlink(recovery_path)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        # A failed cleanup is safer than deleting anything else. A stale file
+        # can simply be offered again on a future launch.
+        pass
+
+
+def _read_recovery_payload(path):
+    with open(path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    if payload.get("format") != RECOVERY_FORMAT_VERSION:
+        raise ValueError("Unsupported Carriage recovery format.")
+    if not isinstance(payload.get("visible_text"), str):
+        raise ValueError("Recovery file does not contain document text.")
+    if not isinstance(payload.get("tables"), dict):
+        raise ValueError("Recovery file contains invalid table data.")
+    return payload
+
+
+def _process_is_running(pid):
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _stale_recovery_files():
+    """Return newest-first recovery files whose creating process is gone."""
+    directory = _recovery_directory()
+    try:
+        names = os.listdir(directory)
+    except FileNotFoundError:
+        return []
+    except OSError:
+        return []
+
+    stale = []
+    for name in names:
+        if not (name.startswith("untitled-") and name.endswith(".json")):
+            continue
+        path = os.path.join(directory, name)
+        try:
+            payload = _read_recovery_payload(path)
+            pid = payload.get("pid")
+            if _process_is_running(pid):
+                continue
+            modified = os.stat(path).st_mtime
+        except (OSError, ValueError, json.JSONDecodeError):
+            # Corrupt recovery files are left untouched rather than deleted
+            # automatically; they may still be useful for manual inspection.
+            continue
+        stale.append((modified, path))
+    stale.sort(reverse=True)
+    return [path for _, path in stale]
+
+
+def _restore_recovery_file(path):
+    payload = _read_recovery_payload(path)
+    restored_tables = {}
+    for raw_number, raw_table in payload["tables"].items():
+        number = int(raw_number)
+        if not isinstance(raw_table, dict):
+            raise ValueError("Recovery file contains invalid table data.")
+        restored_tables[number] = TableData(
+            headers=list(raw_table.get("headers", [])),
+            rows=[list(row) for row in raw_table.get("rows", [])],
+            alignments=list(raw_table.get("alignments", [])),
+            original_lines=(
+                None
+                if raw_table.get("original_lines") is None
+                else list(raw_table.get("original_lines"))
+            ),
+            dirty=bool(raw_table.get("dirty", False)),
+        )
+
+    state.tables = restored_tables
+    text_area.buffer.reset(Document(text=payload["visible_text"]))
+    state.path = None
+    state.saved_text = ""
+    state.disk_snapshot = None
+    state.autosave_conflict = False
+    state.recovery_path = path
+    state.recovery_error = False
+
+    # Claim the restored journal for this process immediately so a second
+    # concurrently running Carriage instance will not offer it as stale.
+    _write_recovery_snapshot()
+
+
+def _offer_stale_recovery():
+    recoveries = _stale_recovery_files()
+    if not recoveries:
+        return
+
+    recovery_path = recoveries[0]
+    extra = len(recoveries) - 1
+    suffix = (
+        ""
+        if extra == 0
+        else f"\n\n{extra} older recovery file{'s' if extra != 1 else ''} will remain available."
+    )
+
+    def restore_handler():
+        close_dialog()
+        try:
+            _restore_recovery_file(recovery_path)
+        except (OSError, ValueError, json.JSONDecodeError) as e:
+            show_message("Recovery error", str(e))
+
+    def discard_handler():
+        close_dialog()
+        try:
+            os.unlink(recovery_path)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            show_message("Recovery error", str(e))
+            return
+        _offer_stale_recovery()
+
+    restore_button = Button(text="Restore", handler=restore_handler)
+    discard_button = Button(text="Discard", handler=discard_handler)
+    later_button = Button(text="Later", handler=close_dialog)
+    dialog = Dialog(
+        title="Recover untitled document?",
+        body=Label(
+            text=(
+                "Carriage found an untitled document recovery from an earlier "
+                "session that did not close normally. Restore it?" + suffix
+            )
+        ),
+        buttons=[restore_button, discard_button, later_button],
+        width=D(preferred=78),
+    )
+    show_dialog(dialog, focus=restore_button)
+
+
+def _show_read_only_save(on_saved=None):
+    """Route a normal Save away from a source marked read-only."""
+
+    def save_as_handler():
+        close_dialog()
+        do_save_as(on_saved)
+
+    save_as_button = Button(text="Save As...", handler=save_as_handler)
+    cancel_button = Button(text="Cancel", handler=close_dialog)
+    dialog = Dialog(
+        title="Read-only file",
+        body=Label(
+            text=(
+                "The current file is marked read-only. Carriage will not replace it.\n\n"
+                "Use Save As to write your changes to a different file."
+            )
+        ),
+        buttons=[save_as_button, cancel_button],
+        width=D(preferred=76),
+    )
+    show_dialog(dialog, focus=save_as_button)
+
+
+def _show_save_conflict(disk_snapshot, on_saved=None):
+    """Offer safe choices when the current file changed outside Carriage."""
+
+    def save_as_handler():
+        close_dialog()
+        do_save_as(on_saved)
+
+    def overwrite_handler():
+        close_dialog()
+        result = _write_file(state.path, expected_snapshot=disk_snapshot)
+        if result == _SAVE_OK and on_saved:
+            on_saved()
+
+    save_as_button = Button(text="Save As...", handler=save_as_handler)
+    overwrite_button = Button(text="Overwrite", handler=overwrite_handler)
+    cancel_button = Button(text="Cancel", handler=close_dialog)
+    dialog = Dialog(
+        title="File changed on disk",
+        body=Label(
+            text=(
+                "This file has been changed, replaced, or deleted outside Carriage "
+                "since it was opened or last saved.\n\n"
+                "Save As keeps both versions. Overwrite replaces the current disk "
+                "version with the text in Carriage."
+            )
+        ),
+        buttons=[save_as_button, overwrite_button, cancel_button],
+        width=D(preferred=78),
+    )
+    show_dialog(dialog, focus=cancel_button)
+
+
+def _confirm_replace(title, text, on_replace):
+    replace_button = Button(
+        text="Replace", handler=lambda: (close_dialog(), on_replace())
+    )
+    cancel_button = Button(text="Cancel", handler=close_dialog)
+    dialog = Dialog(
+        title=title,
+        body=Label(text=text),
+        buttons=[replace_button, cancel_button],
+        width=D(preferred=74),
+    )
+    show_dialog(dialog, focus=cancel_button)
+
+
 def do_new():
+    _clear_recovery_file()
     text_area.buffer.reset(Document(text=""))
     state.path = None
     state.saved_text = ""
+    state.disk_snapshot = None
+    state.autosave_conflict = False
     state.tables = {}
 
 
@@ -785,30 +1281,57 @@ def do_open():
             show_message("Not found", f"No such file:\n{path}")
             return
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                content = f.read()
+            content, disk_snapshot = _read_utf8_file_with_snapshot(path)
         except (OSError, UnicodeError) as e:
             show_message("Error opening file", str(e))
             return
+        _clear_recovery_file()
         visible = _collapse_tables_from_source(content)
         text_area.buffer.reset(Document(text=visible))
         state.path = path
         state.saved_text = content
+        state.disk_snapshot = disk_snapshot
+        state.autosave_conflict = False
 
     show_input_dialog("Open File", "Path:", state.path or "", cb)
 
 
-def _write_file(path):
+def _write_file(path, expected_snapshot, report_conflict=True, report_read_only=True):
+    """Atomically save only if the destination is still the expected version."""
     try:
         content = _materialize_tables(text_area.text)
     except ValueError as e:
         show_message("Table error", str(e))
-        return False
-    target_path = os.path.realpath(path)
+        return _SAVE_ERROR
+
+    target_path = _canonical_path(path)
     directory = os.path.dirname(target_path) or "."
     temp_path = None
 
     try:
+        current_snapshot = _disk_snapshot(target_path)
+        if current_snapshot != expected_snapshot:
+            if report_conflict:
+                show_message(
+                    "File changed on disk",
+                    "The destination changed before Carriage could save it. "
+                    "Nothing was overwritten. Try Save again and choose how "
+                    "to resolve the conflict.",
+                )
+            return _SAVE_CONFLICT
+
+        if (
+            current_snapshot != _MISSING_DISK_SNAPSHOT
+            and _path_is_read_only(target_path)
+        ):
+            if report_read_only:
+                show_message(
+                    "Read-only file",
+                    "The destination is marked read-only. Nothing was overwritten. "
+                    "Choose Save As and use a different filename.",
+                )
+            return _SAVE_READ_ONLY
+
         try:
             existing_mode = stat.S_IMODE(os.stat(target_path).st_mode)
         except FileNotFoundError:
@@ -831,11 +1354,36 @@ def _write_file(path):
                 os.umask(current_umask)
                 os.fchmod(fd, 0o666 & ~current_umask)
 
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
                 fd = None  # fdopen owns and closes the descriptor now.
                 f.write(content)
                 f.flush()
                 os.fsync(f.fileno())
+
+            # Recheck after the complete temporary file has been written. If
+            # another program changed the destination while this save was in
+            # progress, leave that version untouched.
+            if _disk_snapshot(target_path) != expected_snapshot:
+                if report_conflict:
+                    show_message(
+                        "File changed on disk",
+                        "The destination changed while Carriage was saving. "
+                        "Nothing was overwritten. Try Save again and choose "
+                        "how to resolve the conflict.",
+                    )
+                return _SAVE_CONFLICT
+
+            if (
+                expected_snapshot != _MISSING_DISK_SNAPSHOT
+                and _path_is_read_only(target_path)
+            ):
+                if report_read_only:
+                    show_message(
+                        "Read-only file",
+                        "The destination became read-only while Carriage was saving. "
+                        "Nothing was overwritten. Choose Save As and use a different filename.",
+                    )
+                return _SAVE_READ_ONLY
 
             # The temporary file is in the destination directory, so this
             # replacement is atomic on the same filesystem. The existing file
@@ -853,29 +1401,91 @@ def _write_file(path):
 
         state.saved_text = content
         state.path = path
-        return True
+        state.disk_snapshot = _snapshot_bytes(content.encode("utf-8"))
+        state.autosave_conflict = False
+        _clear_recovery_file()
+        return _SAVE_OK
     except (OSError, UnicodeError) as e:
         show_message("Error saving file", str(e))
-        return False
+        return _SAVE_ERROR
 
 
 def do_save(on_saved=None):
     if state.path is None:
         do_save_as(on_saved)
-    elif _write_file(state.path) and on_saved:
+        return
+
+    try:
+        if _path_is_read_only(state.path):
+            _show_read_only_save(on_saved)
+            return
+        disk_snapshot = _disk_snapshot(state.path)
+    except OSError as e:
+        show_message("Error checking file", str(e))
+        return
+
+    if state.disk_snapshot is None:
+        # This can only occur for an unusual state created by older code or a
+        # future caller. Fail safe by treating the version visible right now
+        # as the one that must remain unchanged during this save.
+        state.disk_snapshot = disk_snapshot
+
+    if disk_snapshot != state.disk_snapshot:
+        _show_save_conflict(disk_snapshot, on_saved)
+        return
+
+    result = _write_file(state.path, expected_snapshot=state.disk_snapshot)
+    if result == _SAVE_OK and on_saved:
         on_saved()
 
 
 def do_save_as(on_saved=None):
     def cb(raw_path):
         path = os.path.expanduser(raw_path.strip())
-        if path and _write_file(path) and on_saved:
-            on_saved()
+        if not path:
+            return
+
+        # Entering the current document's pathname should use ordinary Save,
+        # including its external-change conflict handling.
+        if state.path is not None and _same_document_path(path, state.path):
+            do_save(on_saved)
+            return
+
+        try:
+            destination_snapshot = _disk_snapshot(path)
+            if (
+                destination_snapshot != _MISSING_DISK_SNAPSHOT
+                and _path_is_read_only(path)
+            ):
+                show_message(
+                    "Read-only destination",
+                    "That file is marked read-only, so Carriage will not replace it. "
+                    "Choose a different Save As filename.",
+                )
+                return
+        except OSError as e:
+            show_message("Error checking destination", str(e))
+            return
+
+        def write_destination():
+            result = _write_file(path, expected_snapshot=destination_snapshot)
+            if result == _SAVE_OK and on_saved:
+                on_saved()
+
+        if destination_snapshot != _MISSING_DISK_SNAPSHOT:
+            _confirm_replace(
+                "Replace existing file?",
+                f"A file already exists at:\n{path}\n\nReplace it with the current document?",
+                write_destination,
+            )
+        else:
+            write_destination()
 
     show_input_dialog("Save As", "Path:", state.path or "", cb)
 
 
 def do_quit():
+    _clear_recovery_file()
     get_app().exit()
 
 
@@ -1364,15 +1974,45 @@ def _table_placeholder(table_number):
     return f"[[Table {table_number}]]{TABLE_SENTINEL}"
 
 
+def _unescape_markdown_table_cell(text):
+    """Decode only the pipe-escaping scheme used by Carriage tables.
+
+    An escaped literal pipe is encoded with an odd run of backslashes. Carriage
+    uses 2n+1 backslashes to represent n literal backslashes immediately before
+    a literal pipe. Backslashes elsewhere remain source text and are never
+    normalized, so Markdown escapes such as ``\\*`` keep their meaning.
+    """
+    result = []
+    i = 0
+    while i < len(text):
+        if text[i] != "\\":
+            result.append(text[i])
+            i += 1
+            continue
+
+        j = i
+        while j < len(text) and text[j] == "\\":
+            j += 1
+        count = j - i
+        if j < len(text) and text[j] == "|" and count % 2 == 1:
+            result.append("\\" * ((count - 1) // 2))
+            result.append("|")
+            i = j + 1
+        else:
+            result.append("\\" * count)
+            i = j
+    return "".join(result)
+
+
 def _table_cells_from_line(line):
-    """Split one pipe-table row into trimmed cells."""
+    """Split one pipe-table row into trimmed, decoded cells."""
     stripped = line.strip()
     cells = _split_unescaped_pipes(stripped)
     if stripped.startswith("|"):
         cells = cells[1:]
     if stripped.endswith("|"):
         cells = cells[:-1]
-    return [cell.strip().replace(r"\|", "|") for cell in cells]
+    return [_unescape_markdown_table_cell(cell.strip()) for cell in cells]
 
 
 def _alignment_from_separator_cell(cell):
@@ -1416,13 +2056,33 @@ def _parse_pipe_table(block_lines):
 
 
 def _markdown_cell_text(text):
-    """Serialize one editable cell onto a single Markdown table row."""
-    # The dedicated editor visually wraps long text, but pipe-table cells stay
-    # one physical Markdown line. Normalize accidental embedded newlines to
-    # spaces and escape literal pipes.
+    """Serialize a cell while preserving literal backslashes and pipes."""
     compact = " ".join(str(text).splitlines()).strip()
-    return compact.replace("|", r"\|")
-
+    result = []
+    i = 0
+    while i < len(compact):
+        if compact[i] == "\\":
+            j = i
+            while j < len(compact) and compact[j] == "\\":
+                j += 1
+            count = j - i
+            if j < len(compact) and compact[j] == "|":
+                # 2n+1 is always odd, so the following pipe cannot become a
+                # table delimiter, and the parser can recover exactly n
+                # literal backslashes before it.
+                result.append("\\" * (2 * count + 1))
+                result.append("|")
+                i = j + 1
+            else:
+                result.append("\\" * count)
+                i = j
+            continue
+        if compact[i] == "|":
+            result.append("\\|")
+        else:
+            result.append(compact[i])
+        i += 1
+    return "".join(result)
 
 def _separator_for_alignment(alignment):
     return {
@@ -2657,17 +3317,87 @@ async def _autosave_loop():
         await asyncio.sleep(AUTOSAVE_INTERVAL_SECONDS)
         if not state.auto_save:
             continue
-        if state.path is None:
-            continue
         if state.external_process_running:
             continue
         if current_float is not None:
             # Do not write behind Open/Save/Export dialogs, and prevent a
-            # persistent autosave failure from stacking repeated error modals.
+            # persistent background-write failure from stacking error modals.
             continue
+
+        if state.path is None:
+            if not state.is_modified(text_area.text):
+                _clear_recovery_file()
+                continue
+            try:
+                _write_recovery_snapshot()
+            except (OSError, UnicodeError, TypeError, ValueError) as e:
+                if not state.recovery_error:
+                    state.recovery_error = True
+                    show_message(
+                        "Recovery unavailable",
+                        "Carriage could not update the crash-recovery copy for this "
+                        f"untitled document.\n\n{e}",
+                    )
+            else:
+                state.recovery_error = False
+            get_app().invalidate()
+            continue
+
         if not state.is_modified(text_area.text):
             continue
-        _write_file(state.path)
+
+        try:
+            if _path_is_read_only(state.path):
+                if not state.autosave_conflict:
+                    state.autosave_conflict = True
+                    show_message(
+                        "Autosave paused",
+                        "The current file is marked read-only. Autosave will not "
+                        "replace it. Use Save As to write your changes elsewhere.",
+                    )
+                continue
+            disk_snapshot = _disk_snapshot(state.path)
+        except OSError as e:
+            if not state.autosave_conflict:
+                state.autosave_conflict = True
+                show_message(
+                    "Autosave paused",
+                    f"Carriage could not verify the file on disk, so it did not save.\n\n{e}",
+                )
+            continue
+
+        if state.disk_snapshot is None or disk_snapshot != state.disk_snapshot:
+            if not state.autosave_conflict:
+                state.autosave_conflict = True
+                show_message(
+                    "Autosave paused",
+                    "The file changed, was replaced, or was deleted outside Carriage. "
+                    "Autosave will not overwrite that version. Use Save to choose "
+                    "Save As, Overwrite, or Cancel.",
+                )
+            continue
+
+        state.autosave_conflict = False
+        result = _write_file(
+            state.path,
+            expected_snapshot=state.disk_snapshot,
+            report_conflict=False,
+            report_read_only=False,
+        )
+        if result == _SAVE_CONFLICT and not state.autosave_conflict:
+            state.autosave_conflict = True
+            show_message(
+                "Autosave paused",
+                "The file changed while autosave was running. Nothing was overwritten. "
+                "Use Save to choose how to resolve the conflict.",
+            )
+        elif result == _SAVE_READ_ONLY and not state.autosave_conflict:
+            state.autosave_conflict = True
+            show_message(
+                "Autosave paused",
+                "The file became read-only while autosave was running. Nothing was "
+                "overwritten. Use Save As to write your changes elsewhere.",
+            )
         get_app().invalidate()
 
 
@@ -2678,6 +3408,140 @@ async def _autosave_loop():
 def _default_export_path(ext):
     base = os.path.splitext(state.path)[0] if state.path else "untitled"
     return base + "." + ext
+
+
+def _pandoc_args_define_output(args):
+    """Return True if custom arguments try to choose their own output path."""
+    for arg in args:
+        if arg == "--output" or arg.startswith("--output="):
+            return True
+        if arg == "-o" or (arg.startswith("-o") and len(arg) > 2):
+            return True
+    return False
+
+
+def _perform_pandoc_export(out_path, source_text, extra_args, expected_snapshot):
+    """Run Pandoc into a staging file, then safely replace the destination."""
+    target_path = _canonical_path(out_path)
+    directory = os.path.dirname(target_path) or "."
+    basename = os.path.basename(target_path)
+    stem, extension = os.path.splitext(basename)
+    temp_path = None
+    fd = None
+
+    try:
+        # Confirmation is tied to a specific destination version. If it
+        # changed while the user was deciding, do not overwrite the new one.
+        if _disk_snapshot(target_path) != expected_snapshot:
+            show_message(
+                "Export destination changed",
+                "The output file changed before export began. Nothing was overwritten. "
+                "Choose the export path again to review the current destination.",
+            )
+            return False
+
+        try:
+            existing_mode = stat.S_IMODE(os.stat(target_path).st_mode)
+        except FileNotFoundError:
+            existing_mode = None
+
+        fd, temp_path = tempfile.mkstemp(
+            prefix=f".{stem or basename}.",
+            suffix=extension or ".tmp",
+            dir=directory,
+        )
+        if existing_mode is not None:
+            os.fchmod(fd, existing_mode)
+        else:
+            current_umask = os.umask(0)
+            os.umask(current_umask)
+            os.fchmod(fd, 0o666 & ~current_umask)
+        os.close(fd)
+        fd = None
+
+        # Keep the real destination out of Pandoc's hands entirely. The
+        # staging filename retains the requested extension so Pandoc can infer
+        # PDF/DOCX/ODT/HTML/plain output exactly as before.
+        cmd = ["pandoc", "-f", "markdown"] + list(extra_args or []) + ["-o", temp_path]
+        subprocess.run(
+            cmd,
+            input=source_text,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        # Flush Pandoc's completed output before making it visible at the
+        # destination pathname.
+        with open(temp_path, "rb") as f:
+            os.fsync(f.fileno())
+
+        # Recheck immediately before replacement. This cannot eliminate the
+        # tiny OS-level interval between check and rename, but it prevents the
+        # practical race where a destination changes during a long export.
+        if _disk_snapshot(target_path) != expected_snapshot:
+            show_message(
+                "Export destination changed",
+                "The output file changed while Pandoc was running. The newer file was "
+                "left untouched; the staged export was discarded.",
+            )
+            return False
+
+        os.replace(temp_path, target_path)
+        temp_path = None
+        show_message("Export complete", f"Wrote {out_path}")
+        return True
+    except subprocess.CalledProcessError as e:
+        show_message("Pandoc error", (e.stderr or str(e)).strip())
+        return False
+    except (OSError, UnicodeError) as e:
+        show_message("Pandoc error", str(e))
+        return False
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if temp_path is not None:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+
+
+def _request_pandoc_export(out_path, source_text, extra_args=None):
+    """Validate/confirm an export destination before Pandoc is run."""
+    if state.path is not None and _same_document_path(out_path, state.path):
+        show_message(
+            "Unsafe export path",
+            "The export destination is the Markdown file currently open in Carriage. "
+            "Choose a different output filename so the source document cannot be replaced.",
+        )
+        return
+
+    try:
+        destination_snapshot = _disk_snapshot(out_path)
+    except OSError as e:
+        show_message("Error checking export destination", str(e))
+        return
+
+    def perform():
+        _perform_pandoc_export(
+            out_path,
+            source_text,
+            extra_args or [],
+            expected_snapshot=destination_snapshot,
+        )
+
+    if destination_snapshot != _MISSING_DISK_SNAPSHOT:
+        _confirm_replace(
+            "Replace existing export?",
+            f"A file already exists at:\n{out_path}\n\nReplace it with this export?",
+            perform,
+        )
+    else:
+        perform()
 
 
 def export_via_pandoc(fmt_label, ext, extra_args=None):
@@ -2698,20 +3562,7 @@ def export_via_pandoc(fmt_label, ext, extra_args=None):
         except ValueError as e:
             show_message("Table error", str(e))
             return
-        cmd = ["pandoc", "-f", "markdown", "-o", out_path] + (extra_args or [])
-        try:
-            subprocess.run(
-                cmd,
-                input=source_text,
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            show_message("Export complete", f"Wrote {out_path}")
-        except subprocess.CalledProcessError as e:
-            show_message("Pandoc error", (e.stderr or str(e)).strip())
-        except OSError as e:
-            show_message("Pandoc error", str(e))
+        _request_pandoc_export(out_path, source_text, extra_args or [])
 
     show_input_dialog(
         f"Export as {fmt_label}", "Output path:", _default_export_path(ext), do_export
@@ -2736,6 +3587,14 @@ def do_custom_export():
             show_message("Invalid pandoc arguments", str(e))
             return
 
+        if _pandoc_args_define_output(extra):
+            show_message(
+                "Invalid pandoc arguments",
+                "Do not use -o or --output in Extra pandoc arguments. Use the "
+                "Output path field above so Carriage can protect that destination.",
+            )
+            return
+
         close_dialog()
         if not out_path:
             return
@@ -2747,16 +3606,7 @@ def do_custom_export():
         except ValueError as e:
             show_message("Table error", str(e))
             return
-        cmd = ["pandoc", "-f", "markdown", "-o", out_path] + extra
-        try:
-            subprocess.run(
-                cmd, input=source_text, check=True, capture_output=True, text=True
-            )
-            show_message("Export complete", f"Wrote {out_path}")
-        except subprocess.CalledProcessError as e:
-            show_message("Pandoc error", (e.stderr or str(e)).strip())
-        except OSError as e:
-            show_message("Pandoc error", str(e))
+        _request_pandoc_export(out_path, source_text, extra)
 
     dialog = Dialog(
         title="Custom pandoc export",
@@ -2789,8 +3639,7 @@ def do_run_aspell():
         return
 
     def proceed():
-        if _write_file(state.path):
-            _launch_aspell()
+        do_save(on_saved=_launch_aspell)
 
     if state.is_modified(text_area.text):
         confirm(
@@ -2822,16 +3671,18 @@ def _launch_aspell():
         finally:
             state.external_process_running = False
 
-        # aspell edits the file on disk directly - reload it into the buffer.
+        # aspell edits the file on disk directly - reload it into the buffer
+        # and make that exact edited version the new conflict-detection baseline.
         try:
-            with open(state.path, "r", encoding="utf-8") as f:
-                content = f.read()
+            content, disk_snapshot = _read_utf8_file_with_snapshot(state.path)
         except (OSError, UnicodeError) as e:
             show_message("Error reloading file", str(e))
             return
         visible = _collapse_tables_from_source(content)
         text_area.buffer.reset(Document(text=visible))
         state.saved_text = content
+        state.disk_snapshot = disk_snapshot
+        state.autosave_conflict = False
 
     get_app().create_background_task(run_and_reload())
 
@@ -3742,11 +4593,13 @@ application = Application(
 )
 
 
-def _start_background_tasks(startup_error=None):
+def _start_background_tasks(startup_error=None, offer_recovery=False):
     application.create_background_task(_autosave_loop())
     if startup_error is not None:
         title, message = startup_error
         show_message(title, message)
+    elif offer_recovery:
+        _offer_stale_recovery()
 
 
 def main():
@@ -3756,8 +4609,7 @@ def main():
         path = os.path.expanduser(sys.argv[1])
         if os.path.exists(path):
             try:
-                with open(path, "r", encoding="utf-8") as f:
-                    content = f.read()
+                content, disk_snapshot = _read_utf8_file_with_snapshot(path)
             except (OSError, UnicodeError) as e:
                 # Start the editor rather than crashing before the UI exists;
                 # display the error as soon as the application is running.
@@ -3766,11 +4618,15 @@ def main():
                 text_area.text = _collapse_tables_from_source(content)
                 state.path = path
                 state.saved_text = content
+                state.disk_snapshot = disk_snapshot
         else:
             state.path = path  # new file at this path on first save
+            state.disk_snapshot = _MISSING_DISK_SNAPSHOT
 
     application.run(
-        pre_run=lambda: _start_background_tasks(startup_error)
+        pre_run=lambda: _start_background_tasks(
+            startup_error, offer_recovery=(len(sys.argv) == 1)
+        )
     )
 
 
