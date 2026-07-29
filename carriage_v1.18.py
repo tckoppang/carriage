@@ -57,7 +57,7 @@ Optional:
   aspell and an appropriate dictionary package, for spell checking.
 
 Usage:
-  ./carriage_v1.12.py [file.md]
+  ./carriage_v1.18.py [file.md]
 """
 
 import asyncio
@@ -113,7 +113,7 @@ from prompt_toolkit.widgets import (
 )
 
 APP_NAME = "Carriage"
-APP_VERSION = "1.12"
+APP_VERSION = "1.18"
 
 WRAP_COLUMN = 80
 TAB_WIDTH = 4
@@ -572,16 +572,17 @@ def _on_scrollbar_interact(row_in_window, window_height):
 # ---------------------------------------------------------------------------
 
 # Highlighting is deliberately narrower than Carriage's editing logic. It is
-# visual only: ATX/Setext headings and inline bold/italic emphasis get styled,
-# while the underlying buffer remains untouched. Fenced code blocks are left
+# visual only: ATX headings and inline bold/italic emphasis get styled, while
+# the underlying buffer remains untouched. Fenced code blocks are left
 # unhighlighted so prose markers inside code do not masquerade as Markdown.
 _HIGHLIGHT_ATX_RE = re.compile(r"^\s{0,3}#{1,6}(?:\s|$)")
-_HIGHLIGHT_SETEXT_RE = re.compile(r"^\s{0,3}(?:=+|-+)\s*$")
 _HIGHLIGHT_FENCE_RE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
 
 # Order matters: triple emphasis before bold, then italic. The patterns are
-# intentionally conservative and line-local; Carriage is not trying to be a
-# complete Markdown parser merely to color prose.
+# intentionally conservative; Carriage is not trying to be a complete Markdown
+# parser merely to color prose. DOTALL is deliberate: hard-wrapped prose can
+# place the opening emphasis delimiter on one physical line and the closing
+# delimiter on a later physical line within the same paragraph/list item.
 _HIGHLIGHT_INLINE_RE = re.compile(
     r"(?P<strong_em>"
     r"(?<!\\)\*\*\*(?=\S).+?(?<=\S)(?<!\\)\*\*\*"
@@ -594,7 +595,13 @@ _HIGHLIGHT_INLINE_RE = re.compile(
     r"|(?P<em>"
     r"(?<![\\*])\*(?!\*)(?=\S).+?(?<=\S)(?<!\\)\*(?!\*)"
     r"|(?<![\w\\])_(?!_)(?=\S).+?(?<=\S)_(?![\w_])"
-    r")"
+    r")",
+    re.DOTALL,
+)
+
+_HIGHLIGHT_LIST_ITEM_RE = re.compile(r"^\s{0,3}(?:[-*+]|\d+[.)])\s+")
+_HIGHLIGHT_THEMATIC_BREAK_RE = re.compile(
+    r"^\s{0,3}(?:(?:\*[ \t]*){3,}|(?:_[ \t]*){3,}|(?:-[ \t]*){3,})$"
 )
 
 
@@ -624,6 +631,14 @@ def _highlight_fenced_lines(lines):
     return protected
 
 
+def _highlight_style_for_match(match):
+    if match.lastgroup == "strong_em":
+        return "class:markdown.bold-italic"
+    if match.lastgroup == "strong":
+        return "class:markdown.bold"
+    return "class:markdown.italic"
+
+
 def _highlight_inline_markdown(line):
     """Return prompt_toolkit fragments for bold/italic spans in one line."""
     fragments = []
@@ -632,15 +647,7 @@ def _highlight_inline_markdown(line):
     for match in _HIGHLIGHT_INLINE_RE.finditer(line):
         if match.start() > pos:
             fragments.append(("", line[pos:match.start()]))
-
-        if match.lastgroup == "strong_em":
-            style_name = "class:markdown.bold-italic"
-        elif match.lastgroup == "strong":
-            style_name = "class:markdown.bold"
-        else:
-            style_name = "class:markdown.italic"
-
-        fragments.append((style_name, match.group(0)))
+        fragments.append((_highlight_style_for_match(match), match.group(0)))
         pos = match.end()
 
     if pos < len(line):
@@ -649,48 +656,104 @@ def _highlight_inline_markdown(line):
     return fragments or [("", line)]
 
 
+def _highlight_inline_markdown_block(block_lines):
+    """Highlight emphasis across physical wraps inside one prose block.
+
+    prompt_toolkit lexers return fragments one physical line at a time, but
+    Markdown emphasis may legitimately span the newlines Carriage inserts when
+    hard-wrapping prose. Join one logical prose block for matching, then project
+    the resulting style spans back onto the original physical lines.
+    """
+    if not block_lines:
+        return []
+
+    combined = "\n".join(block_lines)
+    styles = [""] * len(combined)
+
+    for match in _HIGHLIGHT_INLINE_RE.finditer(combined):
+        style_name = _highlight_style_for_match(match)
+        for index in range(match.start(), match.end()):
+            if combined[index] != "\n":
+                styles[index] = style_name
+
+    rendered = []
+    offset = 0
+    for line in block_lines:
+        fragments = []
+        if not line:
+            rendered.append([("", "")])
+            offset += 1
+            continue
+
+        line_styles = styles[offset:offset + len(line)]
+        run_start = 0
+        current_style = line_styles[0] if line_styles else ""
+        for index in range(1, len(line)):
+            if line_styles[index] != current_style:
+                fragments.append((current_style, line[run_start:index]))
+                run_start = index
+                current_style = line_styles[index]
+        fragments.append((current_style, line[run_start:]))
+        rendered.append(fragments)
+        offset += len(line) + 1
+
+    return rendered
+
+
+def _highlight_special_line(line, row, fenced_lines):
+    """Return fixed fragments for structural lines, or None for prose."""
+    if row in fenced_lines:
+        return [("", line)]
+    if TABLE_PLACEHOLDER_RE.match(line):
+        return [("class:markdown.table-ref", line)]
+    if _HIGHLIGHT_ATX_RE.match(line):
+        return [("class:markdown.heading", line)]
+    if not line.strip() or _HIGHLIGHT_THEMATIC_BREAK_RE.match(line):
+        return [("", line)]
+    return None
+
+
 class ProseMarkdownLexer(Lexer):
     """Minimal, non-destructive highlighting for prose-oriented Markdown."""
 
     def lex_document(self, document):
         lines = document.lines
         fenced_lines = _highlight_fenced_lines(lines)
-        setext_text_lines = {
-            row - 1
-            for row, line in enumerate(lines)
-            if row > 0
-            and row not in fenced_lines
-            and _HIGHLIGHT_SETEXT_RE.match(line)
-            and lines[row - 1].strip()
-        }
-        setext_underline_lines = {
-            row
-            for row, line in enumerate(lines)
-            if row > 0
-            and row not in fenced_lines
-            and _HIGHLIGHT_SETEXT_RE.match(line)
-            and lines[row - 1].strip()
-        }
+        rendered = [None] * len(lines)
+        row = 0
+
+        while row < len(lines):
+            fixed = _highlight_special_line(lines[row], row, fenced_lines)
+            if fixed is not None:
+                rendered[row] = fixed
+                row += 1
+                continue
+
+            start = row
+            starts_list_item = bool(_HIGHLIGHT_LIST_ITEM_RE.match(lines[row]))
+            row += 1
+
+            # A hard-wrapped paragraph is one highlighting block. A list item
+            # and its continuation lines are also one block, but the next list
+            # marker starts a new block so unmatched emphasis cannot leak from
+            # one item into another.
+            while row < len(lines):
+                if _highlight_special_line(lines[row], row, fenced_lines) is not None:
+                    break
+                if _HIGHLIGHT_LIST_ITEM_RE.match(lines[row]):
+                    break
+                if not starts_list_item and _HIGHLIGHT_LIST_ITEM_RE.match(lines[row]):
+                    break
+                row += 1
+
+            block_fragments = _highlight_inline_markdown_block(lines[start:row])
+            for index, fragments in enumerate(block_fragments, start=start):
+                rendered[index] = fragments
 
         def get_line(lineno):
             if lineno < 0 or lineno >= len(lines):
                 return []
-
-            line = lines[lineno]
-            if lineno in fenced_lines:
-                return [("", line)]
-
-            if TABLE_PLACEHOLDER_RE.match(line):
-                return [("class:markdown.table-ref", line)]
-
-            if (
-                _HIGHLIGHT_ATX_RE.match(line)
-                or lineno in setext_text_lines
-                or lineno in setext_underline_lines
-            ):
-                return [("class:markdown.heading", line)]
-
-            return _highlight_inline_markdown(line)
+            return rendered[lineno] or [("", lines[lineno])]
 
         return get_line
 
@@ -1720,7 +1783,6 @@ _ATX_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}(?:\s|$)")
 _LIST_ITEM_RE = re.compile(r"^(\s{0,3}(?:[-*+]|\d+[.)])\s+)")
 _REFERENCE_DEF_RE = re.compile(r"^\s{0,3}\[[^\]]+\]:\s*\S")
 _DEFINITION_MARKER_RE = re.compile(r"^\s{0,3}[:~]\s+\S")
-_SETEXT_UNDERLINE_RE = re.compile(r"^\s{0,3}(?:=+|-+)\s*$")
 _FENCE_OPEN_RE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
 _YAML_OPEN_RE = re.compile(r"^---\s*$")
 _YAML_CLOSE_RE = re.compile(r"^(?:---|\.\.\.)\s*$")
@@ -1965,15 +2027,6 @@ def _definition_list_start(lines, index):
     )
 
 
-def _setext_heading_start(lines, index):
-    return (
-        index + 1 < len(lines)
-        and bool(lines[index].strip())
-        and not _is_thematic_break(lines[index])
-        and bool(_SETEXT_UNDERLINE_RE.match(lines[index + 1]))
-    )
-
-
 def _nonblank_run_end(lines, index):
     i = index
     while i < len(lines) and lines[i].strip():
@@ -2079,8 +2132,6 @@ def _run_is_plain_prose(lines, row):
             or _LIST_ITEM_RE.match(line)
             or line.lstrip().startswith(">")
             or _is_thematic_break(line)
-            or _SETEXT_UNDERLINE_RE.match(line)
-            or _setext_heading_start(lines, i)
         ):
             return False
     return True
@@ -2524,64 +2575,32 @@ def _collect_definition_list(lines, index):
     return lines[index:end], end
 
 
-def _list_block_extent(lines, index):
-    """Return (end, complex) for the list block beginning at index.
+def _simple_list_continuation_text(line, base_indent, marker_prefix):
+    """Return prose from a supported continuation line, or None if complex.
 
-    A simple list is a contiguous run with no blank lines and with every item
-    marker at the same indentation. Blank-separated items/paragraphs, nested
-    markers, or indented continuation blocks make the list complex and opaque.
+    Carriage live-wraps list items with a hanging indent exactly as wide as the
+    item's marker prefix. Markdown also permits a lazy continuation at the
+    list's base indentation. Reflow accepts both forms so text produced by
+    live wrapping can always be normalized later, while other indentation is
+    still treated conservatively as potentially nested or code-like syntax.
     """
-    first = _LIST_ITEM_RE.match(lines[index])
-    if not first:
-        return index + 1, True
+    leading_spaces = len(line) - len(line.lstrip(" "))
+    hanging_indent = len(marker_prefix)
 
-    base_indent = len(lines[index]) - len(lines[index].lstrip(" "))
-    i = index
-    complex_list = False
-
-    while i < len(lines):
-        line = lines[i]
-        if not line.strip():
-            # A blank line belongs to this list only when what follows still
-            # looks list-owned: another item or an indented continuation.
-            j = i
-            while j < len(lines) and not lines[j].strip():
-                j += 1
-            if j >= len(lines):
-                return i, complex_list
-
-            next_line = lines[j]
-            next_match = _LIST_ITEM_RE.match(next_line)
-            next_indent = len(next_line) - len(next_line.lstrip(" "))
-            if next_match or next_indent > base_indent:
-                complex_list = True
-                i = j
-                continue
-            return i, complex_list
-
-        match = _LIST_ITEM_RE.match(line)
-        if match:
-            indent = len(line) - len(line.lstrip(" "))
-            if indent != base_indent:
-                complex_list = True
-        elif i > index:
-            indent = len(line) - len(line.lstrip(" "))
-            if indent > base_indent:
-                # Any explicitly indented continuation is structurally
-                # ambiguous enough that preserving the whole list is safer.
-                complex_list = True
-
-        i += 1
-
-    return i, complex_list
+    if leading_spaces == hanging_indent:
+        return line[hanging_indent:]
+    if leading_spaces == base_indent:
+        return line[base_indent:]
+    return None
 
 
 def _collect_simple_list(lines, index, width):
-    """
-    Reflow a flat prose list. Return None when the list looks complex.
+    """Reflow a contiguous flat prose list, or return None if it is complex.
 
-    Complex, nested, or otherwise structural lists are deliberately left to
-    the caller's opaque fallback.
+    A supported item may span physical lines. Continuations can either use
+    Carriage's hanging indent or Markdown's lazy base indentation. Nested list
+    markers, code-like indentation, block structures, and blank-separated
+    multi-paragraph items remain opaque.
     """
     end = _nonblank_run_end(lines, index)
     i = index
@@ -2594,26 +2613,49 @@ def _collect_simple_list(lines, index, width):
             return None, end
         if len(lines[i]) - len(lines[i].lstrip(" ")) != base_indent:
             return None, end
+
         marker = match.group(1)
         body = [lines[i][len(marker):]]
         i += 1
 
-        while i < end and not _LIST_ITEM_RE.match(lines[i]):
-            candidate = lines[i]
+        while i < end:
+            next_item = _LIST_ITEM_RE.match(lines[i])
+            if next_item is not None:
+                # A marker at the same indentation begins the next flat item;
+                # any differently indented marker makes this a nested/complex
+                # list that Carriage should preserve verbatim.
+                next_indent = len(lines[i]) - len(lines[i].lstrip(" "))
+                if next_indent != base_indent:
+                    return None, end
+                break
+
+            raw_candidate = lines[i]
+            candidate = _simple_list_continuation_text(
+                raw_candidate, base_indent, marker
+            )
+            if candidate is None:
+                return None, end
+
+            # Evaluate structure after removing only the recognized list
+            # continuation indent. This prevents a legitimate hanging indent
+            # (including four spaces for markers such as "12. ") from being
+            # mistaken for an indented code block.
             if (
                 _ATX_HEADING_RE.match(candidate)
                 or candidate.lstrip().startswith(">")
                 or _fence_marker(candidate)
-                or _is_indented_code(candidate)
                 or _is_strong_html_start(candidate)
                 or _REFERENCE_DEF_RE.match(candidate)
                 or _DEFINITION_MARKER_RE.match(candidate)
                 or _OTHER_LIST_RE.match(candidate)
                 or _is_thematic_break(candidate)
-                or _SETEXT_UNDERLINE_RE.match(candidate)
+                or _generic_fence_marker(candidate)
+                or _looks_structural_or_ambiguous(candidate)
             ):
                 return None, end
-            # Keep the raw line so two-space/backslash hard breaks survive.
+
+            # Keep the content's trailing spaces/backslash intact so explicit
+            # Markdown hard breaks survive the reflow.
             body.append(candidate)
             i += 1
 
@@ -2688,7 +2730,6 @@ def _clear_supported_start(lines, index):
         or line.lstrip().startswith(">")
         or _fence_marker(line)
         or _is_thematic_break(line)
-        or _setext_heading_start(lines, index)
     )
 
 
@@ -2702,6 +2743,40 @@ def _should_insert_missing_blank(previous_kind, current_kind):
     if previous_kind in {"opaque", "yaml"} or current_kind in {"opaque", "yaml"}:
         return False
     return previous_kind != current_kind or current_kind != "prose"
+
+
+def _simple_list_autowrap_context(lines, row):
+    """Return (item_start, marker_prefix) for a simple live-wrapped list item.
+
+    The first physical line begins with a normal Markdown bullet/number marker.
+    Continuation lines created by Carriage use a hanging indent exactly as wide
+    as that marker prefix. Restricting continuation detection to that exact
+    indent prevents unrelated prose, nested structures, and indented code from
+    being pulled into live list wrapping.
+    """
+    if not (0 <= row < len(lines)):
+        return None
+
+    direct = _LIST_ITEM_RE.match(lines[row])
+    if direct is not None:
+        return row, direct.group(1)
+
+    start = row - 1
+    while start >= 0 and lines[start].strip():
+        match = _LIST_ITEM_RE.match(lines[start])
+        if match is not None:
+            marker_prefix = match.group(1)
+            continuation_width = len(marker_prefix)
+            for candidate in lines[start + 1 : row + 1]:
+                if not candidate.strip() or _LIST_ITEM_RE.match(candidate):
+                    return None
+                leading_spaces = len(candidate) - len(candidate.lstrip(" "))
+                if leading_spaces != continuation_width:
+                    return None
+            return start, marker_prefix
+        start -= 1
+
+    return None
 
 
 def _on_text_insert(buf):
@@ -2736,14 +2811,24 @@ def _on_text_insert(buf):
     if yaml_end is not None and row < yaml_end:
         return
 
-    # Validate structure before editing. Splitting and forwarding overflow
-    # below cannot turn a plain-prose run into a structural Markdown block, so
-    # these comparatively expensive checks do not need to be repeated for
-    # every generated line of a large paste.
+    # Validate structure before editing. Simple list items have their own
+    # hanging-indent wrapping path; everything else still has to pass the
+    # conservative plain-prose test. This keeps live wrapping useful for the
+    # common list case without making complex Markdown containers editable as
+    # prose by accident.
     if _row_in_multiline_opaque_block(lines, row):
         return
-    if not _run_is_plain_prose(lines, row):
-        return
+
+    list_context = _simple_list_autowrap_context(lines, row)
+    if list_context is None:
+        if not _run_is_plain_prose(lines, row):
+            return
+        list_item_start = None
+        list_marker_prefix = None
+        continuation_prefix = None
+    else:
+        list_item_start, list_marker_prefix = list_context
+        continuation_prefix = " " * len(list_marker_prefix)
 
     changed = False
     seen_states = set()
@@ -2764,7 +2849,20 @@ def _on_text_insert(buf):
         # still sliced below so any hard-break marker remains attached to the
         # final overflow segment where it belongs.
         break_at = searchable_line.rfind(" ", 0, WRAP_COLUMN + 1)
-        if break_at <= 0:
+
+        # For list items, the marker or hanging indent is structural syntax,
+        # not a valid word boundary. A single long token after the marker may
+        # exceed the target width rather than leaving a dangling "-"/"1." line.
+        if list_item_start is not None:
+            content_start = (
+                len(list_marker_prefix)
+                if row == list_item_start
+                else len(continuation_prefix)
+            )
+        else:
+            content_start = 0
+
+        if break_at <= content_start:
             # Long tokens such as URLs are intentionally left intact rather
             # than split merely to satisfy the writing width.
             break
@@ -2776,7 +2874,12 @@ def _on_text_insert(buf):
         has_hard_break = hard_break_marker is not None
 
         lines[row] = head
-        if next_exists and next_line.strip() and not has_hard_break:
+        if list_item_start is not None:
+            # Never merge overflow into the next physical line of a list. It
+            # could be the next item. Insert a hanging-indented continuation
+            # instead, preserving list boundaries during live typing/paste.
+            lines.insert(row + 1, continuation_prefix + tail)
+        elif next_exists and next_line.strip() and not has_hard_break:
             lines[row + 1] = tail + " " + next_line
         else:
             # When the original line ends in an explicit Markdown hard break,
@@ -2793,6 +2896,8 @@ def _on_text_insert(buf):
 
         row += 1
         col -= break_at + 1
+        if list_item_start is not None:
+            col += len(continuation_prefix)
 
     if not changed:
         return
@@ -2871,15 +2976,23 @@ def reflow_text(full_text, width=WRAP_COLUMN):
             _append_reflow_block(blocks, gap, "opaque", block)
             continue
 
+        # Lists get their own structural validation before the generic opaque
+        # run check. Carriage's live list wrapping intentionally creates
+        # hanging-indented continuation lines, which the generic prose guard
+        # quite correctly regards as ambiguous outside a list context.
+        if _LIST_ITEM_RE.match(line):
+            wrapped, end = _collect_simple_list(lines, i, width)
+            if wrapped is None:
+                _append_reflow_block(blocks, gap, "opaque", lines[i:end])
+            else:
+                _append_reflow_block(blocks, gap, "list", wrapped)
+            i = end
+            continue
+
         run_end = _nonblank_run_end(lines, i)
         if _run_has_opaque_signal(lines, i, run_end):
             _append_reflow_block(blocks, gap, "opaque", lines[i:run_end])
             i = run_end
-            continue
-
-        if _setext_heading_start(lines, i):
-            _append_reflow_block(blocks, gap, "heading", [line, lines[i + 1]])
-            i += 2
             continue
 
         if _ATX_HEADING_RE.match(line):
@@ -2887,24 +3000,9 @@ def reflow_text(full_text, width=WRAP_COLUMN):
             i += 1
             continue
 
-        if _is_thematic_break(line) or _SETEXT_UNDERLINE_RE.match(line):
+        if _is_thematic_break(line):
             _append_reflow_block(blocks, gap, "structure", [line])
             i += 1
-            continue
-
-        if _LIST_ITEM_RE.match(line):
-            block_end, complex_list = _list_block_extent(lines, i)
-            if complex_list:
-                _append_reflow_block(blocks, gap, "opaque", lines[i:block_end])
-                i = block_end
-                continue
-
-            wrapped, end = _collect_simple_list(lines, i, width)
-            if wrapped is None:
-                _append_reflow_block(blocks, gap, "opaque", lines[i:end])
-            else:
-                _append_reflow_block(blocks, gap, "list", wrapped)
-            i = end
             continue
 
         if line.lstrip().startswith(">"):
@@ -4338,14 +4436,6 @@ def _current_section_title(doc):
             current = title
             continue
 
-        if (
-            row + 1 < len(lines)
-            and row + 1 not in fenced_lines
-            and _HIGHLIGHT_SETEXT_RE.match(lines[row + 1])
-            and lines[row].strip()
-        ):
-            current = lines[row].strip()
-
     return current
 
 
@@ -4372,14 +4462,6 @@ def _document_heading_rows(doc):
         if _heading_title(line) is not None:
             rows.append(row)
             continue
-
-        if (
-            row + 1 < len(lines)
-            and row + 1 not in fenced_lines
-            and _HIGHLIGHT_SETEXT_RE.match(lines[row + 1])
-            and line.strip()
-        ):
-            rows.append(row)
 
     return rows
 
@@ -4416,12 +4498,7 @@ def do_go_previous_section():
     # From a heading itself, jump to the previous heading instead.
     target = None
     current_title = _heading_title(doc.lines[cursor_row]) if doc.lines else None
-    on_setext_title = (
-        cursor_row + 1 < len(doc.lines)
-        and _HIGHLIGHT_SETEXT_RE.match(doc.lines[cursor_row + 1])
-        and doc.lines[cursor_row].strip()
-    )
-    strict = current_title is not None or on_setext_title
+    strict = current_title is not None
 
     for row in headings:
         if row < cursor_row or (row == cursor_row and not strict):
@@ -4794,6 +4871,29 @@ def _(event):
     col = event.current_buffer.document.cursor_position_col
     spaces = TAB_WIDTH - (col % TAB_WIDTH)
     event.current_buffer.insert_text(" " * spaces)
+
+
+@kb.add("backspace", filter=editor_focused & Condition(lambda: text_area.buffer.selection_state is not None))
+def _(event):
+    # prompt_toolkit's default backward-delete behavior does not consistently
+    # replace an active selection. In the prose editor, Backspace should match
+    # Delete: when text is selected, remove the selection as one edit. Leave
+    # ordinary Backspace behavior untouched when there is no selection.
+    event.current_buffer.cut_selection()
+
+
+@kb.add("enter", filter=editor_focused)
+def _(event):
+    # Keep Return deliberately literal in the prose editor. prompt_toolkit's
+    # default newline binding copies the current line's leading margin, which
+    # makes list entry look as though Carriage is trying to continue the list.
+    # Carriage does not auto-create list markers or indentation: Return starts
+    # at column zero on the next physical line. If text is selected, replace
+    # the selection with that newline, as a normal editor would.
+    buf = event.current_buffer
+    if buf.selection_state is not None:
+        buf.cut_selection()
+    buf.insert_text("\n")
 
 
 def _move_editor_cursor_across_lines(delta):
