@@ -5,7 +5,7 @@ Carriage - A prose-first Markdown editor for the terminal.
 Carriage is designed primarily for writing and revising prose in Markdown files.
 It provides a full-screen prompt_toolkit interface with mouse support, menus,
 keyboard shortcuts, autosave, spell checking, and Pandoc export. F10 or
-Ctrl+Space activates the menu bar; while it is active, number keys 1 through 7
+Ctrl+Space activates the menu bar; while it is active, number keys 1 through 6
 jump directly among the top-level menus.
 A dedicated Go menu provides document and section navigation without changing
 the text.
@@ -15,7 +15,7 @@ Explicit Markdown hard breaks are preserved, and long tokens such as URLs are
 left intact rather than split. Text that looks structural or ambiguous is left
 alone instead of being reformatted speculatively.
 
-Format > Reflow Document (Ctrl+J) cleans up prose across the document. It
+Edit > Reflow Document (Ctrl+J) cleans up prose across the document. It
 rewraps ordinary paragraphs, preserves explicit hard breaks, and handles only
 simple flat lists and simple single-level blockquotes. Code, tables, YAML,
 raw block HTML, complex containers, delimiter-style blocks, and other
@@ -23,9 +23,10 @@ structural-looking regions are treated as opaque and copied unchanged.
 
 File operations include New, Open, Save, and Save As. Saves and autosaves use
 a temporary file followed by atomic replacement so a failed write does not
-truncate the existing file. Autosave runs every 30 seconds for named files;
-modified untitled documents receive a private crash-recovery snapshot on the
-same interval. Background writes pause while aspell or a modal dialog is active.
+truncate the existing file. Autosave runs every 30 seconds for named files.
+Independently, every modified document receives a private crash-recovery
+snapshot on the same interval, including in-progress table-editor work. Source
+autosaves pause while aspell or a modal dialog is active; recovery does not.
 
 The Tools menu can hand a saved document to aspell in Markdown mode and reload
 the edited file afterward. The Export menu sends the current buffer to Pandoc
@@ -56,7 +57,7 @@ Optional:
   aspell and an appropriate dictionary package, for spell checking.
 
 Usage:
-  ./carriage_v1.06.py [file.md]
+  ./carriage_v1.10.py [file.md]
 """
 
 import asyncio
@@ -72,6 +73,7 @@ import sys
 import tempfile
 import textwrap
 import stat
+from html.parser import HTMLParser
 from dataclasses import dataclass, field
 
 from prompt_toolkit.application import Application
@@ -108,12 +110,12 @@ from prompt_toolkit.widgets import (
 )
 
 APP_NAME = "Carriage"
-APP_VERSION = "1.06"
+APP_VERSION = "1.10"
 
 WRAP_COLUMN = 80
 TAB_WIDTH = 4
 AUTOSAVE_INTERVAL_SECONDS = 30
-RECOVERY_FORMAT_VERSION = 1
+RECOVERY_FORMAT_VERSION = 2
 TABLE_SENTINEL = "\u2063"  # zero-width INVISIBLE SEPARATOR; never written to disk
 TABLE_PLACEHOLDER_RE = re.compile(rf"^\[\[Table (\d+)\]\]{TABLE_SENTINEL}$")
 MAX_TABLE_EDITOR_COLUMNS = 6
@@ -174,9 +176,11 @@ class EditorState:
         # open on disk - autosave pauses during this window to avoid racing
         # with whatever that process writes back.
         self.external_process_running = False
-        # Hidden crash-recovery state for an untitled document. Recovery is
-        # deliberately separate from the user's document pathname and is
-        # removed after a successful Save, New, Open, or clean discard/quit.
+        # Hidden crash-recovery state for the current working document.
+        # Recovery is deliberately independent of ordinary autosave: it protects
+        # named and untitled documents, including an in-progress table-editor
+        # draft, and is removed after a successful Save, New, Open, or clean
+        # discard/quit.
         self.recovery_path = None
         self.recovery_error = False
         self.tables = {}
@@ -904,10 +908,31 @@ def _disk_snapshot(path):
 
 
 def _read_utf8_file_with_snapshot(path):
-    """Read one UTF-8 file and fingerprint exactly the bytes that were read."""
+    """Read one regular UTF-8 file and fingerprint exactly the bytes read.
+
+    Open the path nonblocking where the platform supports it, then validate
+    the opened descriptor with fstat() before reading. This closes the unsafe
+    gap where a FIFO, device, directory, or a path swapped to one of those
+    could otherwise block or stream unbounded data during File > Open.
+    """
     target_path = _canonical_path(path)
-    with open(target_path, "rb") as f:
-        raw = f.read()
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
+
+    fd = os.open(target_path, flags)
+    try:
+        file_stat = os.fstat(fd)
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise OSError(f"Not a regular file: {target_path}")
+
+        with os.fdopen(fd, "rb") as f:
+            fd = None  # fdopen owns and closes the descriptor now.
+            raw = f.read()
+    finally:
+        if fd is not None:
+            os.close(fd)
+
     content = raw.decode("utf-8")
     # Match the universal-newline behavior Carriage used before v1.03 while
     # keeping the fingerprint tied to the exact source bytes.
@@ -954,21 +979,98 @@ def _table_recovery_record(table):
     }
 
 
-def _recovery_payload():
-    """Capture editor state without requiring the document to materialize.
+def _table_from_recovery_record(raw_table):
+    if not isinstance(raw_table, dict):
+        raise ValueError("Recovery file contains invalid table data.")
+    return TableData(
+        headers=list(raw_table.get("headers", [])),
+        rows=[list(row) for row in raw_table.get("rows", [])],
+        alignments=list(raw_table.get("alignments", [])),
+        original_lines=(
+            None
+            if raw_table.get("original_lines") is None
+            else list(raw_table.get("original_lines"))
+        ),
+        dirty=bool(raw_table.get("dirty", False)),
+    )
 
-    Recovery deliberately stores the visible buffer and table objects
-    separately. That means it can preserve work even if an interrupted table
-    operation has temporarily made normal Markdown materialization impossible.
+
+def _table_content_key(table):
+    """Return the editable table content, excluding bookkeeping metadata."""
+    return (
+        tuple(table.headers),
+        tuple(tuple(row) for row in table.rows),
+        tuple(table.alignments),
+    )
+
+
+def _active_table_draft():
+    """Return a snapshot of the active table editor without committing it.
+
+    The text currently present in an actively edited cell is folded into the
+    snapshot using the same newline normalization as a real cell commit. The
+    live table-editor session is never mutated by crash recovery.
     """
+    session = current_table_editor
+    if session is None:
+        return None
+
+    working = copy.deepcopy(session.working)
+    if session.editing and session.cell_editor is not None:
+        rows = [working.headers] + working.rows
+        if (
+            0 <= session.selected_row < len(rows)
+            and 0 <= session.selected_col < working.column_count
+        ):
+            rows[session.selected_row][session.selected_col] = " ".join(
+                session.cell_editor.text.splitlines()
+            )
+    return session.table_number, working
+
+
+def _has_recoverable_changes():
+    """Return True when RAM contains work newer than the saved document."""
+    if state.is_modified(text_area.text):
+        return True
+
+    draft = _active_table_draft()
+    if draft is None:
+        return False
+    table_number, working = draft
+    committed = state.tables.get(table_number)
+    return committed is None or _table_content_key(working) != _table_content_key(committed)
+
+
+def _recovery_payload():
+    """Capture all recoverable editor state, including an active table draft."""
+    tables = {
+        str(number): _table_recovery_record(table)
+        for number, table in state.tables.items()
+    }
+
+    draft = _active_table_draft()
+    had_table_draft = False
+    if draft is not None:
+        table_number, working = draft
+        committed = state.tables.get(table_number)
+        if committed is None or _table_content_key(working) != _table_content_key(committed):
+            working.dirty = True
+            tables[str(table_number)] = _table_recovery_record(working)
+            had_table_draft = True
+
+    source_path = _canonical_path(state.path) if state.path is not None else None
+    disk_snapshot = None if state.disk_snapshot is None else list(state.disk_snapshot)
+
     return {
         "format": RECOVERY_FORMAT_VERSION,
         "pid": os.getpid(),
+        "source_path": source_path,
+        "saved_text": state.saved_text,
+        "disk_snapshot": disk_snapshot,
+        "cursor_position": text_area.buffer.cursor_position,
         "visible_text": text_area.text,
-        "tables": {
-            str(number): _table_recovery_record(table)
-            for number, table in state.tables.items()
-        },
+        "tables": tables,
+        "had_table_draft": had_table_draft,
     }
 
 
@@ -985,14 +1087,14 @@ def _ensure_recovery_path():
     if state.recovery_path is None:
         token = os.urandom(6).hex()
         state.recovery_path = os.path.join(
-            directory, f"untitled-{os.getpid()}-{token}.json"
+            directory, f"recovery-{os.getpid()}-{token}.json"
         )
     return state.recovery_path
 
 
 def _write_recovery_snapshot():
-    """Atomically persist the current untitled document for crash recovery."""
-    if state.path is not None or not state.is_modified(text_area.text):
+    """Atomically persist the current working document for crash recovery."""
+    if not _has_recoverable_changes():
         _clear_recovery_file()
         return
 
@@ -1059,14 +1161,24 @@ def _clear_recovery_file():
 def _read_recovery_payload(path):
     with open(path, "r", encoding="utf-8") as f:
         payload = json.load(f)
-    if payload.get("format") != RECOVERY_FORMAT_VERSION:
+
+    # v1 is the untitled-only format written by Carriage 1.06. Keep accepting
+    # it so upgrading Carriage cannot strand an existing recovery file.
+    version = payload.get("format")
+    if version not in (1, RECOVERY_FORMAT_VERSION):
         raise ValueError("Unsupported Carriage recovery format.")
     if not isinstance(payload.get("visible_text"), str):
         raise ValueError("Recovery file does not contain document text.")
     if not isinstance(payload.get("tables"), dict):
         raise ValueError("Recovery file contains invalid table data.")
-    return payload
 
+    if version == 1:
+        payload.setdefault("source_path", None)
+        payload.setdefault("saved_text", "")
+        payload.setdefault("disk_snapshot", None)
+        payload.setdefault("cursor_position", len(payload["visible_text"]))
+        payload.setdefault("had_table_draft", False)
+    return payload
 
 def _process_is_running(pid):
     if not isinstance(pid, int) or pid <= 0:
@@ -1082,8 +1194,12 @@ def _process_is_running(pid):
     return True
 
 
-def _stale_recovery_files():
-    """Return newest-first recovery files whose creating process is gone."""
+def _stale_recovery_files(source_path=None):
+    """Return newest-first recoveries whose creating process is gone.
+
+    When source_path is supplied, return only journals for that named document.
+    A normal bare launch leaves source_path unset and can offer any recovery.
+    """
     directory = _recovery_directory()
     try:
         names = os.listdir(directory)
@@ -1092,9 +1208,13 @@ def _stale_recovery_files():
     except OSError:
         return []
 
+    expected_source = _canonical_path(source_path) if source_path else None
     stale = []
     for name in names:
-        if not (name.startswith("untitled-") and name.endswith(".json")):
+        if not (
+            name.endswith(".json")
+            and (name.startswith("recovery-") or name.startswith("untitled-"))
+        ):
             continue
         path = os.path.join(directory, name)
         try:
@@ -1102,6 +1222,14 @@ def _stale_recovery_files():
             pid = payload.get("pid")
             if _process_is_running(pid):
                 continue
+
+            recovery_source = payload.get("source_path")
+            if expected_source is not None:
+                if not recovery_source:
+                    continue
+                if os.path.normcase(_canonical_path(recovery_source)) != os.path.normcase(expected_source):
+                    continue
+
             modified = os.stat(path).st_mtime
         except (OSError, ValueError, json.JSONDecodeError):
             # Corrupt recovery files are left untouched rather than deleted
@@ -1117,25 +1245,33 @@ def _restore_recovery_file(path):
     restored_tables = {}
     for raw_number, raw_table in payload["tables"].items():
         number = int(raw_number)
-        if not isinstance(raw_table, dict):
-            raise ValueError("Recovery file contains invalid table data.")
-        restored_tables[number] = TableData(
-            headers=list(raw_table.get("headers", [])),
-            rows=[list(row) for row in raw_table.get("rows", [])],
-            alignments=list(raw_table.get("alignments", [])),
-            original_lines=(
-                None
-                if raw_table.get("original_lines") is None
-                else list(raw_table.get("original_lines"))
-            ),
-            dirty=bool(raw_table.get("dirty", False)),
-        )
+        restored_tables[number] = _table_from_recovery_record(raw_table)
 
     state.tables = restored_tables
-    text_area.buffer.reset(Document(text=payload["visible_text"]))
-    state.path = None
-    state.saved_text = ""
-    state.disk_snapshot = None
+    visible_text = payload["visible_text"]
+    cursor_position = payload.get("cursor_position", len(visible_text))
+    if not isinstance(cursor_position, int):
+        cursor_position = len(visible_text)
+    cursor_position = max(0, min(len(visible_text), cursor_position))
+    text_area.buffer.reset(
+        Document(text=visible_text, cursor_position=cursor_position)
+    )
+
+    source_path = payload.get("source_path")
+    state.path = source_path if isinstance(source_path, str) and source_path else None
+    saved_text = payload.get("saved_text", "")
+    state.saved_text = saved_text if isinstance(saved_text, str) else ""
+
+    raw_snapshot = payload.get("disk_snapshot")
+    if (
+        isinstance(raw_snapshot, list)
+        and len(raw_snapshot) == 2
+        and isinstance(raw_snapshot[0], str)
+    ):
+        state.disk_snapshot = tuple(raw_snapshot)
+    else:
+        state.disk_snapshot = None
+
     state.autosave_conflict = False
     state.recovery_path = path
     state.recovery_error = False
@@ -1145,18 +1281,39 @@ def _restore_recovery_file(path):
     _write_recovery_snapshot()
 
 
-def _offer_stale_recovery():
-    recoveries = _stale_recovery_files()
+def _offer_stale_recovery(source_path=None):
+    recoveries = _stale_recovery_files(source_path)
     if not recoveries:
         return
 
     recovery_path = recoveries[0]
+    try:
+        payload = _read_recovery_payload(recovery_path)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return
+
+    recovery_source = payload.get("source_path")
+    if recovery_source:
+        document_label = os.path.basename(recovery_source) or recovery_source
+        description = (
+            f'Carriage found unsaved work for "{document_label}" from an earlier '
+            "session that did not close normally. Restore it?"
+        )
+    else:
+        description = (
+            "Carriage found an untitled document recovery from an earlier "
+            "session that did not close normally. Restore it?"
+        )
+
+    if payload.get("had_table_draft"):
+        description += "\n\nThe recovery includes an in-progress table edit."
+
     extra = len(recoveries) - 1
-    suffix = (
-        ""
-        if extra == 0
-        else f"\n\n{extra} older recovery file{'s' if extra != 1 else ''} will remain available."
-    )
+    if extra:
+        description += (
+            f"\n\n{extra} older recovery file{'s' if extra != 1 else ''} "
+            "will remain available."
+        )
 
     def restore_handler():
         close_dialog()
@@ -1174,24 +1331,18 @@ def _offer_stale_recovery():
         except OSError as e:
             show_message("Recovery error", str(e))
             return
-        _offer_stale_recovery()
+        _offer_stale_recovery(source_path)
 
     restore_button = Button(text="Restore", handler=restore_handler)
     discard_button = Button(text="Discard", handler=discard_handler)
     later_button = Button(text="Later", handler=close_dialog)
     dialog = Dialog(
-        title="Recover untitled document?",
-        body=Label(
-            text=(
-                "Carriage found an untitled document recovery from an earlier "
-                "session that did not close normally. Restore it?" + suffix
-            )
-        ),
+        title="Recover document?",
+        body=Label(text=description),
         buttons=[restore_button, discard_button, later_button],
         width=D(preferred=78),
     )
     show_dialog(dialog, focus=restore_button)
-
 
 def _show_read_only_save(on_saved=None):
     """Route a normal Save away from a source marked read-only."""
@@ -1883,7 +2034,13 @@ def _collect_fenced_block(lines, index):
 
 
 def _collect_html_block(lines, index):
-    """Collect unmistakable raw HTML verbatim; do not parse HTML content."""
+    """Collect unmistakable raw HTML verbatim; do not reflow its contents.
+
+    Block-level elements are tracked through the matching close of the outer
+    element, including nested elements with the same tag name. This is still
+    boundary detection rather than HTML formatting: Carriage preserves the
+    collected source text exactly as written.
+    """
     first = lines[index]
     raw_match = _RAW_HTML_TAG_RE.match(first)
     if raw_match:
@@ -1925,29 +2082,55 @@ def _collect_html_block(lines, index):
             index += 1
         return block, index
 
-    # For an unmistakable block-level opening tag, preserve through its first
-    # matching close even across blank lines. This is boundary detection only;
-    # the editor does not inspect or format the HTML body. Void/self-closing
-    # tags are single-line opaque blocks.
     block_match = _BLOCK_HTML_TAG_RE.match(first)
     if block_match:
         stripped_first = first.lstrip()
-        tag = block_match.group("tag")
+        tag = block_match.group("tag").lower()
         void_tags = {"base", "basefont", "col", "frame", "hr", "link", "param", "track"}
-        if stripped_first.startswith("</") or tag.lower() in void_tags or re.search(r"/\s*>\s*$", first):
+        if (
+            stripped_first.startswith("</")
+            or tag in void_tags
+            or re.search(r"/\s*>\s*$", first)
+        ):
             return [first], index + 1
 
-        close_re = re.compile(rf"</{re.escape(tag)}\s*>", re.IGNORECASE)
-        block = [first]
-        index += 1
-        if close_re.search(first):
-            return block, index
+        class _OuterTagTracker(HTMLParser):
+            def __init__(self, target_tag):
+                super().__init__(convert_charrefs=False)
+                self.target_tag = target_tag
+                self.depth = 0
+                self.seen_start = False
+
+            def handle_starttag(self, found_tag, attrs):
+                if found_tag.lower() == self.target_tag:
+                    self.seen_start = True
+                    self.depth += 1
+
+            def handle_startendtag(self, found_tag, attrs):
+                # A self-closing nested tag does not change the outer depth.
+                pass
+
+            def handle_endtag(self, found_tag):
+                if found_tag.lower() == self.target_tag and self.seen_start:
+                    self.depth = max(0, self.depth - 1)
+
+        tracker = _OuterTagTracker(tag)
+        block = []
         while index < len(lines):
-            block.append(lines[index])
-            if close_re.search(lines[index]):
-                index += 1
-                break
+            line = lines[index]
+            block.append(line)
+            try:
+                # Feed incrementally so quoted attributes, comments, and tags
+                # split across source lines are handled by the stdlib parser.
+                tracker.feed(line + "\n")
+            except Exception:
+                # Malformed HTML should be preserved rather than exposed to
+                # prose reflow. Treat the remainder of the document as opaque.
+                block.extend(lines[index + 1:])
+                return block, len(lines)
             index += 1
+            if tracker.seen_start and tracker.depth == 0:
+                break
         return block, index
 
     return [first], index + 1
@@ -2456,47 +2639,69 @@ def _should_insert_missing_blank(previous_kind, current_kind):
 
 
 def _on_text_insert(buf):
-    """Hard-wrap ordinary paragraph prose only."""
+    """Hard-wrap ordinary paragraph prose after typing or a paste.
+
+    Validate the affected nonblank run once, then perform all required line
+    splits in memory and replace the Buffer document once. This preserves the
+    old incremental wrapping behavior while allowing a large one-shot paste to
+    wrap completely without the former 20-line ceiling or quadratic document
+    reconstruction on every wrapped line.
+    """
     if not state.auto_wrap:
         return
 
-    for _ in range(20):
-        doc = buf.document
-        row = doc.cursor_position_row
-        col = doc.cursor_position_col
-        lines = doc.lines
-        line = lines[row]
+    doc = buf.document
+    row = doc.cursor_position_row
+    col = doc.cursor_position_col
+    lines = list(doc.lines)
+    line = lines[row]
 
+    hard_break_marker = _hard_break_marker(line)
+    searchable_line = _strip_hard_break_marker(line, hard_break_marker)
+
+    # Markdown hard-break markers are syntax, not prose content. In
+    # particular, the two trailing spaces must never be considered word
+    # boundaries. A line whose prose is still within the target width is left
+    # alone even if its hard-break marker makes the physical line longer.
+    if len(searchable_line) <= WRAP_COLUMN:
+        return
+
+    yaml_end = _yaml_front_matter_end(lines)
+    if yaml_end is not None and row < yaml_end:
+        return
+
+    # Validate structure before editing. Splitting and forwarding overflow
+    # below cannot turn a plain-prose run into a structural Markdown block, so
+    # these comparatively expensive checks do not need to be repeated for
+    # every generated line of a large paste.
+    if _row_in_multiline_opaque_block(lines, row):
+        return
+    if not _run_is_plain_prose(lines, row):
+        return
+
+    changed = False
+    seen_states = set()
+
+    while True:
+        line = lines[row]
         hard_break_marker = _hard_break_marker(line)
         searchable_line = _strip_hard_break_marker(line, hard_break_marker)
-
-        # Markdown hard-break markers are syntax, not prose content. In
-        # particular, the two trailing spaces must never be considered word
-        # boundaries: doing so can create an empty overflow line exactly when
-        # the physical line first crosses WRAP_COLUMN. A line whose prose is
-        # still within the target width is left alone even if its hard-break
-        # marker makes the physical line one or two characters longer.
         if len(searchable_line) <= WRAP_COLUMN:
-            return
+            break
 
-        yaml_end = _yaml_front_matter_end(lines)
-        if yaml_end is not None and row < yaml_end:
-            return
-
-        # A whole nonblank run must be plain prose before auto-wrap touches it.
-        # Multiline opaque regions are checked separately so blank lines inside
-        # fenced code or raw block HTML do not accidentally re-enable wrapping.
-        if _row_in_multiline_opaque_block(lines, row):
-            return
-        if not _run_is_plain_prose(lines, row):
-            return
+        wrap_state = (row, col, line)
+        if wrap_state in seen_states:
+            break
+        seen_states.add(wrap_state)
 
         # Search only the prose portion of the line. The original line is
         # still sliced below so any hard-break marker remains attached to the
         # final overflow segment where it belongs.
         break_at = searchable_line.rfind(" ", 0, WRAP_COLUMN + 1)
         if break_at <= 0:
-            return
+            # Long tokens such as URLs are intentionally left intact rather
+            # than split merely to satisfy the writing width.
+            break
 
         head = line[:break_at]
         tail = line[break_at + 1:]
@@ -2504,25 +2709,34 @@ def _on_text_insert(buf):
         next_line = lines[row + 1] if next_exists else ""
         has_hard_break = hard_break_marker is not None
 
-        new_lines = list(lines)
-        new_lines[row] = head
+        lines[row] = head
         if next_exists and next_line.strip() and not has_hard_break:
-            new_lines[row + 1] = tail + " " + next_line
+            lines[row + 1] = tail + " " + next_line
         else:
             # When the original line ends in an explicit Markdown hard break,
             # its overflow must stay on a line of its own so the two spaces or
             # trailing backslash remain at the physical line boundary.
-            new_lines.insert(row + 1, tail)
+            lines.insert(row + 1, tail)
 
-        new_text = "\n".join(new_lines)
+        changed = True
         if col <= break_at:
-            new_row, new_col = row, col
-        else:
-            new_row, new_col = row + 1, col - break_at - 1
+            # The cursor remains on the completed head line. This matches the
+            # previous incremental behavior: auto-wrap follows overflow only
+            # when the insertion point itself moved into that overflow.
+            break
 
-        tmp = Document(text=new_text)
-        new_cursor = tmp.translate_row_col_to_index(new_row, new_col)
-        buf.document = Document(text=new_text, cursor_position=new_cursor)
+        row += 1
+        col -= break_at + 1
+
+    if not changed:
+        return
+
+    new_text = "\n".join(lines)
+    tmp = Document(text=new_text)
+    row = min(row, tmp.line_count - 1)
+    col = min(col, len(tmp.lines[row]))
+    new_cursor = tmp.translate_row_col_to_index(row, col)
+    buf.document = Document(text=new_text, cursor_position=new_cursor)
 
 
 text_area.buffer.on_text_insert += _on_text_insert
@@ -2917,14 +3131,17 @@ def _insert_table_editor_column(where):
 
 
 def _delete_table_editor_column():
-    """Delete the selected column, while keeping at least one column."""
+    """Delete the selected column, while keeping at least two columns."""
     session = current_table_editor
     if session is None:
         return
 
     _commit_table_editor_cell(session)
-    if session.working.column_count <= 1:
-        show_message("Last column", "A table must contain at least one column.")
+    if session.working.column_count <= 2:
+        show_message(
+            "Minimum columns",
+            "A table must contain at least two columns.",
+        )
         return
 
     delete_at = session.selected_col
@@ -3315,35 +3532,46 @@ def do_insert_table():
 async def _autosave_loop():
     while True:
         await asyncio.sleep(AUTOSAVE_INTERVAL_SECONDS)
-        if not state.auto_save:
-            continue
-        if state.external_process_running:
-            continue
-        if current_float is not None:
-            # Do not write behind Open/Save/Export dialogs, and prevent a
-            # persistent background-write failure from stacking error modals.
-            continue
 
-        if state.path is None:
-            if not state.is_modified(text_area.text):
-                _clear_recovery_file()
-                continue
+        # Crash recovery is independent of normal autosave. It runs for every
+        # modified document, even when autosave is disabled, the source file is
+        # conflicted/read-only, or a modal (including the table editor) is open.
+        if _has_recoverable_changes():
             try:
                 _write_recovery_snapshot()
             except (OSError, UnicodeError, TypeError, ValueError) as e:
-                if not state.recovery_error:
+                # Do not stack a warning over another modal. Leave the flag
+                # clear in that case so the warning can be shown on a later
+                # pass after the modal closes.
+                if current_float is None and not state.recovery_error:
                     state.recovery_error = True
                     show_message(
                         "Recovery unavailable",
-                        "Carriage could not update the crash-recovery copy for this "
-                        f"untitled document.\n\n{e}",
+                        "Carriage could not update the crash-recovery copy for "
+                        f"this document.\n\n{e}",
                     )
             else:
                 state.recovery_error = False
+        else:
+            _clear_recovery_file()
+
+        # Everything below this point concerns the user's actual source file.
+        if not state.auto_save:
             get_app().invalidate()
             continue
-
+        if state.path is None:
+            get_app().invalidate()
+            continue
+        if state.external_process_running:
+            get_app().invalidate()
+            continue
+        if current_float is not None:
+            # Source autosave must not write behind Open/Save/Export dialogs or
+            # commit a table-editor draft that the user has not saved yet.
+            get_app().invalidate()
+            continue
         if not state.is_modified(text_area.text):
+            get_app().invalidate()
             continue
 
         try:
@@ -3353,8 +3581,10 @@ async def _autosave_loop():
                     show_message(
                         "Autosave paused",
                         "The current file is marked read-only. Autosave will not "
-                        "replace it. Use Save As to write your changes elsewhere.",
+                        "replace it. Your working copy is still protected by crash "
+                        "recovery. Use Save As to write your changes elsewhere.",
                     )
+                get_app().invalidate()
                 continue
             disk_snapshot = _disk_snapshot(state.path)
         except OSError as e:
@@ -3362,8 +3592,10 @@ async def _autosave_loop():
                 state.autosave_conflict = True
                 show_message(
                     "Autosave paused",
-                    f"Carriage could not verify the file on disk, so it did not save.\n\n{e}",
+                    "Carriage could not verify the file on disk, so it did not "
+                    f"save. Your working copy is still protected by crash recovery.\n\n{e}",
                 )
+            get_app().invalidate()
             continue
 
         if state.disk_snapshot is None or disk_snapshot != state.disk_snapshot:
@@ -3372,9 +3604,11 @@ async def _autosave_loop():
                 show_message(
                     "Autosave paused",
                     "The file changed, was replaced, or was deleted outside Carriage. "
-                    "Autosave will not overwrite that version. Use Save to choose "
-                    "Save As, Overwrite, or Cancel.",
+                    "Autosave will not overwrite that version. Your working copy is "
+                    "still protected by crash recovery. Use Save to choose Save As, "
+                    "Overwrite, or Cancel.",
                 )
+            get_app().invalidate()
             continue
 
         state.autosave_conflict = False
@@ -3389,14 +3623,16 @@ async def _autosave_loop():
             show_message(
                 "Autosave paused",
                 "The file changed while autosave was running. Nothing was overwritten. "
-                "Use Save to choose how to resolve the conflict.",
+                "Your working copy is still protected by crash recovery. Use Save to "
+                "choose how to resolve the conflict.",
             )
         elif result == _SAVE_READ_ONLY and not state.autosave_conflict:
             state.autosave_conflict = True
             show_message(
                 "Autosave paused",
                 "The file became read-only while autosave was running. Nothing was "
-                "overwritten. Use Save As to write your changes elsewhere.",
+                "overwritten. Your working copy is still protected by crash recovery. "
+                "Use Save As to write your changes elsewhere.",
             )
         get_app().invalidate()
 
@@ -3799,7 +4035,7 @@ KEYBINDING_ROWS = [
     ("Ctrl+End", "Go to end of document"),
     ("Alt+Up", "Go to previous section"),
     ("Alt+Down", "Go to next section"),
-    ("1-7", "Jump to File/Edit/Go/Format/Export/Tools/Help"),
+    ("1-6", "Jump to File/Edit/Go/Export/Tools/Help"),
     ("Tab", "Indent to next tab stop; on [[Table N]], open table"),
     ("Esc", "Close menu or dialog"),
 ]
@@ -4174,7 +4410,7 @@ def _status_section_width(terminal_columns):
     fixed_other_width = (
         4  # progress field ("100%")
         + 15  # word-count field
-        + 15  # wrap/save field
+        + 20  # wrap/save field ("wrap:off save:paused")
         + 20  # command hint
         + (3 * 4)  # four " | " separators
         + 2  # outer padding
@@ -4201,7 +4437,12 @@ def get_statusbar_text():
     section = _current_section_title(doc)
     progress = _document_progress(doc)
     wrap_status = "on" if state.auto_wrap else "off"
-    save_status = "on" if state.auto_save else "off"
+    if not state.auto_save:
+        save_status = "off"
+    elif state.autosave_conflict or state.recovery_error:
+        save_status = "paused"
+    else:
+        save_status = "on"
 
     try:
         terminal_columns = get_app().output.get_size().columns
@@ -4243,7 +4484,63 @@ body = HSplit(
     ]
 )
 
-menu_container = MenuContainer(
+class EdgeAlignedMenuContainer(MenuContainer):
+    """MenuContainer whose selection includes its leading separator cell.
+
+    prompt_toolkit inserts one unselected space before every top-level menu
+    item. For the first item, that leaves a one-cell strip of menu-bar
+    background between the bar's left edge and the selected highlight. Keep
+    the inter-item spacing, but treat that separator as part of the selected
+    item and anchor its submenu at the same left edge.
+    """
+
+    def _get_menu_fragments(self):
+        focused = get_app().layout.has_focus(self.window)
+
+        # Match MenuContainer's normal behavior: once focus leaves the menu
+        # bar, reset the next opening to the first top-level item.
+        if not focused:
+            self.selected_menu = [0]
+
+        def one_item(index, item):
+            def mouse_handler(mouse_event):
+                hover = mouse_event.event_type == MouseEventType.MOUSE_MOVE
+                if (
+                    mouse_event.event_type == MouseEventType.MOUSE_DOWN
+                    or hover and focused
+                ):
+                    app = get_app()
+                    if not hover:
+                        if app.layout.has_focus(self.window):
+                            if self.selected_menu == [index]:
+                                app.layout.focus_last()
+                        else:
+                            app.layout.focus(self.window)
+                    self.selected_menu = [index]
+
+            selected = index == self.selected_menu[0] and focused
+            style_name = (
+                "class:menu-bar.selected-item"
+                if selected
+                else "class:menu-bar"
+            )
+
+            # Anchor the submenu at the left edge of the complete selected
+            # block, including the separator cell. This makes File line up
+            # exactly with the left edge of the menu bar.
+            if selected:
+                yield ("[SetMenuPosition]", "", mouse_handler)
+
+            yield (style_name, " ", mouse_handler)
+            yield (style_name, item.text, mouse_handler)
+
+        result = []
+        for index, item in enumerate(self.menu_items):
+            result.extend(one_item(index, item))
+        return result
+
+
+menu_container = EdgeAlignedMenuContainer(
     body=body,
     menu_items=[
         MenuItem(
@@ -4266,6 +4563,10 @@ menu_container = MenuContainer(
                 MenuItem("Cut          Ctrl+W", handler=do_cut),
                 MenuItem("Copy         Alt+W", handler=do_copy),
                 MenuItem("Paste        Ctrl+Y", handler=do_paste),
+                MenuItem("-", disabled=True),
+                MenuItem("Reflow Document   Ctrl+J", handler=do_reflow_document),
+                MenuItem("Toggle Auto-Wrap", handler=do_toggle_autowrap),
+                MenuItem("Toggle Auto-Save", handler=do_toggle_autosave),
             ],
         ),
         MenuItem(
@@ -4276,14 +4577,6 @@ menu_container = MenuContainer(
                 MenuItem("-", disabled=True),
                 MenuItem("Previous Section     Alt+Up", handler=do_go_previous_section),
                 MenuItem("Next Section         Alt+Down", handler=do_go_next_section),
-            ],
-        ),
-        MenuItem(
-            "  Format  ",
-            children=[
-                MenuItem("Reflow Document   Ctrl+J", handler=do_reflow_document),
-                MenuItem("Toggle Auto-Wrap", handler=do_toggle_autowrap),
-                MenuItem("Toggle Auto-Save", handler=do_toggle_autosave),
             ],
         ),
         MenuItem(
@@ -4498,7 +4791,6 @@ for _key, _index in (
     ("4", 3),
     ("5", 4),
     ("6", 5),
-    ("7", 6),
 ):
     kb.add(_key, filter=menu_focused)(
         lambda event, index=_index: _select_top_level_menu(index)
@@ -4593,12 +4885,14 @@ application = Application(
 )
 
 
-def _start_background_tasks(startup_error=None, offer_recovery=False):
+def _start_background_tasks(startup_error=None, recovery_source_path=None, offer_any_recovery=False):
     application.create_background_task(_autosave_loop())
     if startup_error is not None:
         title, message = startup_error
         show_message(title, message)
-    elif offer_recovery:
+    elif recovery_source_path is not None:
+        _offer_stale_recovery(recovery_source_path)
+    elif offer_any_recovery:
         _offer_stale_recovery()
 
 
@@ -4625,7 +4919,9 @@ def main():
 
     application.run(
         pre_run=lambda: _start_background_tasks(
-            startup_error, offer_recovery=(len(sys.argv) == 1)
+            startup_error,
+            recovery_source_path=(state.path if len(sys.argv) > 1 else None),
+            offer_any_recovery=(len(sys.argv) == 1),
         )
     )
 
