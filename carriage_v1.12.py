@@ -57,7 +57,7 @@ Optional:
   aspell and an appropriate dictionary package, for spell checking.
 
 Usage:
-  ./carriage_v1.10.py [file.md]
+  ./carriage_v1.12.py [file.md]
 """
 
 import asyncio
@@ -81,6 +81,7 @@ from prompt_toolkit.cursor_shapes import CursorShape, SimpleCursorShapeConfig
 from prompt_toolkit.output.color_depth import ColorDepth
 from prompt_toolkit.application.current import get_app
 from prompt_toolkit.document import Document
+from prompt_toolkit.data_structures import Point
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.filters.app import buffer_has_focus
 from prompt_toolkit.key_binding import KeyBindings
@@ -94,10 +95,12 @@ from prompt_toolkit.layout.containers import (
     WindowAlign,
 )
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
+from prompt_toolkit.layout.processors import Processor, Transformation
+from prompt_toolkit.layout.utils import explode_text_fragments
 from prompt_toolkit.layout.dimension import D
 from prompt_toolkit.layout.layout import Layout
 from prompt_toolkit.layout.margins import Margin
-from prompt_toolkit.mouse_events import MouseButton, MouseEventType
+from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
 from prompt_toolkit.styles import Style
 from prompt_toolkit.utils import get_cwidth
 from prompt_toolkit.widgets import (
@@ -110,7 +113,7 @@ from prompt_toolkit.widgets import (
 )
 
 APP_NAME = "Carriage"
-APP_VERSION = "1.10"
+APP_VERSION = "1.12"
 
 WRAP_COLUMN = 80
 TAB_WIDTH = 4
@@ -197,19 +200,26 @@ state = EditorState()
 
 
 def _center_padding_widths(columns):
-    """Return padding that centers an honest 80-column prose viewport.
+    """Return padding for 80 text columns plus a private cursor gutter.
 
-    The scrollbar owns the far-right terminal column and is excluded from the
-    centering calculation. On wide terminals, the prose area is exactly
-    WRAP_COLUMN cells wide. Narrow terminals use all available space to the
-    left of the scrollbar.
+    On wide terminals, Carriage reserves one extra display cell immediately
+    after the 80-column prose area. Real text never occupies that cell; it is
+    available only for the insertion point after character 80. This keeps soft
+    wrapping honestly at 80 columns without a phantom blank row.
+
+    The scrollbar owns the far-right terminal column. On terminals too narrow
+    to provide the extra cursor cell, the editor uses all available width.
     """
     scrollbar_width = 1
     available = max(1, columns - scrollbar_width)
-    prose_width = min(WRAP_COLUMN, available)
-    spare = max(0, available - prose_width)
-    left = spare // 2
-    right = spare - left
+    if available <= WRAP_COLUMN:
+        return 0, 0
+
+    # Center the 80 text columns. The 81st content cell is a blank cursor
+    # gutter taken from the right-side breathing room.
+    left = max(0, (available - WRAP_COLUMN) // 2)
+    content_width = WRAP_COLUMN + 1
+    right = max(0, available - left - content_width)
     return left, right
 
 
@@ -371,6 +381,53 @@ class ScrollableWindow(Window):
         super()._write_to_screen_at_index(
             screen, mouse_handlers, write_position, parent_style, erase_bg
         )
+
+        # prompt_toolkit 3.0.52 shortens a Window's content mouse-handler range
+        # by the *left* margin width as well as the right margin width. With
+        # Carriage's centered prose margin, that made the final ~left-margin
+        # number of text columns unclickable. Reinstall the content handler over
+        # the actual rendered content rectangle using WindowRenderInfo's exact
+        # coordinates and source/display map.
+        info = self.render_info
+        if info is not None:
+            yx_to_rowcol = {v: k for k, v in info._rowcol_to_yx.items()}
+            content_x_min = info._x_offset
+            content_x_max = info._x_offset + info.window_width
+            content_y_min = write_position.ypos
+            content_y_max = write_position.ypos + write_position.height
+
+            def content_handler(mouse_event):
+                y = min(content_y_max - 1, mouse_event.position.y)
+                x = mouse_event.position.x
+
+                # Search left from blank cells to the nearest rendered source
+                # position, matching prompt_toolkit's normal click behavior.
+                while x >= content_x_min:
+                    rowcol = yx_to_rowcol.get((y, x))
+                    if rowcol is not None:
+                        row, col = rowcol
+                        result = self.content.mouse_handler(
+                            MouseEvent(
+                                position=Point(x=col, y=row),
+                                event_type=mouse_event.event_type,
+                                button=mouse_event.button,
+                                modifiers=mouse_event.modifiers,
+                            )
+                        )
+                        if result == NotImplemented:
+                            return self._mouse_handler(mouse_event)
+                        return result
+                    x -= 1
+
+                return self._mouse_handler(mouse_event)
+
+            mouse_handlers.set_mouse_handler_for_range(
+                x_min=content_x_min,
+                x_max=content_x_max,
+                y_min=content_y_min,
+                y_max=content_y_max,
+                handler=content_handler,
+            )
 
         if self.on_scrollbar_interact is None or not self.right_margins:
             return
@@ -638,66 +695,74 @@ class ProseMarkdownLexer(Lexer):
         return get_line
 
 
-class FullWidthSafeBufferControl(BufferControl):
-    """Avoid phantom blank rows after exactly full-width logical lines.
+class WrapBoundarySpacerProcessor(Processor):
+    """Keep real text wrapping at 80 while reserving an end-cursor cell.
 
-    prompt_toolkit appends one synthetic space to every BufferControl line so
-    the terminal cursor can occupy the position just after the final character.
-    With soft wrapping enabled, an 80-character line in an 80-column window
-    therefore becomes 81 display cells and the synthetic cell wraps onto an
-    otherwise blank screen row.
+    prompt_toolkit adds a synthetic trailing space to every buffer line so the
+    cursor can sit after the final character. Carriage gives the content one
+    extra display cell for that purpose. For source lines longer than 80
+    characters, this processor inserts a blank boundary cell after each group
+    of 80 characters so the next real character begins on the next screen row.
 
-    Keep prompt_toolkit's normal behavior except when that synthetic cell is
-    the *only* thing that would create another wrapped row. In that case, omit
-    the cell for rendering. If the editing cursor is at the end of that line,
-    display it on the final real character instead. Buffer positions and file
-    contents are unchanged.
+    The blank boundary cells have explicit source/display mappings, which keeps
+    mouse clicks and cursor movement aligned with the underlying buffer.
     """
 
-    def create_content(self, width, height, preview_search=False):
-        content = super().create_content(width, height, preview_search)
-        if width <= 0:
-            return content
+    def apply_transformation(self, ti):
+        if ti.width <= WRAP_COLUMN:
+            return Transformation(ti.fragments)
 
-        original_get_line = content.get_line
-        cache = {}
+        fragments = explode_text_fragments(ti.fragments)
+        source_length = len(fragments)
+        if source_length <= WRAP_COLUMN:
+            return Transformation(ti.fragments)
 
-        def adjusted_line(row):
-            if row in cache:
-                return cache[row]
+        result = []
+        source_to_display_map = {}
+        display_to_source_map = {}
+        display_pos = 0
 
-            fragments = original_get_line(row)
-            if not fragments or fragments[-1][:2] != ("", " "):
-                cache[row] = fragments
-                return fragments
+        for source_pos, fragment in enumerate(fragments):
+            if source_pos and source_pos % WRAP_COLUMN == 0:
+                result.append(("", " "))
+                display_to_source_map[display_pos] = source_pos
+                display_pos += 1
 
-            real_fragments = fragments[:-1]
-            real_width = sum(get_cwidth(fragment[1]) for fragment in real_fragments)
+            source_to_display_map[source_pos] = display_pos
+            display_to_source_map[display_pos] = source_pos
+            result.append(fragment)
+            display_pos += 1
 
-            # Only suppress the synthetic cursor cell when it alone would
-            # create a new wrapped row. Empty lines keep the normal cursor cell.
-            if real_width > 0 and real_width % width == 0:
-                fragments = real_fragments
+        source_to_display_map[source_length] = display_pos
+        display_to_source_map[display_pos] = source_length
 
-            cache[row] = fragments
-            return fragments
+        def source_to_display(position):
+            return source_to_display_map.get(position, display_pos)
 
-        content.get_line = adjusted_line
+        def display_to_source(position):
+            position = min(position, display_pos)
+            while position >= 0:
+                if position in display_to_source_map:
+                    return display_to_source_map[position]
+                position -= 1
+            return 0
 
-        cursor = content.cursor_position
-        cursor_line = original_get_line(cursor.y)
-        if cursor_line and cursor_line[-1][:2] == ("", " "):
-            real_fragments = cursor_line[:-1]
-            real_width = sum(get_cwidth(fragment[1]) for fragment in real_fragments)
-            real_char_count = sum(len(fragment[1]) for fragment in real_fragments)
-            if (
-                real_width > 0
-                and real_width % width == 0
-                and cursor.x == real_char_count
-            ):
-                content.cursor_position = cursor._replace(x=max(0, cursor.x - 1))
+        return Transformation(
+            result,
+            source_to_display=source_to_display,
+            display_to_source=display_to_source,
+        )
 
-        return content
+
+class FullWidthSafeBufferControl(BufferControl):
+    """Focus and position the prose editor on the same mouse click."""
+
+    def mouse_handler(self, mouse_event):
+        if mouse_event.event_type == MouseEventType.MOUSE_DOWN:
+            app = get_app()
+            if app.layout.current_control is not self:
+                app.layout.current_control = self
+        return super().mouse_handler(mouse_event)
 
 
 text_area = TextArea(
@@ -705,17 +770,18 @@ text_area = TextArea(
     lexer=ProseMarkdownLexer(),
     wrap_lines=True,
     scrollbar=True,
+    focus_on_click=True,
+    input_processors=[WrapBoundarySpacerProcessor()],
     style="class:editor",
 )
 text_area.control.__class__ = FullWidthSafeBufferControl
 text_area.window.__class__ = ScrollableWindow
 text_area.window.on_scrollbar_interact = _on_scrollbar_interact
 
-# Keep the visible prose area exactly 80 columns on wide terminals. The custom
-# BufferControl above prevents prompt_toolkit's synthetic end-of-line cursor
-# cell from manufacturing a blank wrapped row when a physical line fills all
-# 80 columns. The TextArea window remains full-width so the scrollbar stays
-# flush against the terminal's far-right edge.
+# Keep real prose at exactly 80 display columns on wide terminals. The Window
+# receives one additional private cursor cell, while WrapBoundarySpacerProcessor
+# forces real source text to wrap after every 80 characters. The TextArea
+# window remains full-width so the scrollbar stays flush right.
 _scrollbar_margin = text_area.window.right_margins[-1]
 text_area.window.left_margins = [CenterPaddingMargin("left")]
 text_area.window.right_margins = [
