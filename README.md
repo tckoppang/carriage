@@ -3,8 +3,11 @@
 </p>
 
 <p>
-  <h1 align="center">Carriage</h1>
-  <strong align="center">A prose-first Markdown editor for the terminal.</strong>
+  <h1 align="center" style="font-family:serif">Carriage</h1>
+</p>
+
+<p align="center">
+  <strong>A prose-first Markdown editor for the terminal.</strong>
 </p>
 
 Carriage is built around writing documents rather than editing source code. It gives ordinary prose a focused 80-column writing area, keeps Markdown structure out of the way where practical, and leaves the document on disk as ordinary, portable Markdown.
