@@ -1,9 +1,9 @@
 <p align="center">
-  <img src="assets/carriage-logo.svg" width="400" alt="Carriage Logo">
+  <img src="assets/carriage-logo.svg" width="350" alt="Carriage Logo">
 </p>
 
 <p>
-  <h1 align="center" style="font-family:serif">Carriage</h1>
+  <h1 align="center">Carriage</h1>
 </p>
 
 <p align="center">
