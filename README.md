@@ -3,6 +3,7 @@
 </p>
 
 <p align="center">
+  <h2>Carriage</h2>
   <strong>A prose-first Markdown editor for the terminal.</strong>
 </p>
 
