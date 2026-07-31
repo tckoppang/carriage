@@ -77,6 +77,8 @@ import textwrap
 import threading
 import time
 import stat
+import string
+from html import unescape as _html_unescape
 from html.parser import HTMLParser
 from dataclasses import dataclass, field
 
@@ -127,7 +129,7 @@ from prompt_toolkit.widgets import (
 )
 
 APP_NAME = "Carriage"
-APP_VERSION = "1.129"
+APP_VERSION = "1.140"
 
 DEFAULT_WRAP_COLUMN = 80
 DEFAULT_SCROLLBAR_VISIBLE = True
@@ -169,6 +171,7 @@ def _check_prompt_toolkit_compatibility():
         )
 
 
+@lru_cache(maxsize=4096)
 def _display_char_width(char):
     """Return the terminal-cell width prompt_toolkit will actually render.
 
@@ -185,7 +188,11 @@ def _display_char_width(char):
 
 def _display_text_width(text):
     """Return rendered terminal-cell width using prompt_toolkit semantics."""
-    return sum(_display_char_width(char) for char in text or "")
+    width_of = _display_char_width
+    total = 0
+    for char in text or "":
+        total += width_of(char)
+    return total
 
 
 DEFAULT_SPELLCHECK_COMMAND = ["aspell", "--mode=markdown", "check", "{file}"]
@@ -261,9 +268,19 @@ def _fallback_parse_toml(text):
     return result
 
 
+class _ConfigTomlError(ValueError):
+    """Configuration parse error with enough context for a useful warning."""
+
+    def __init__(self, message, *, fallback_parser=False):
+        super().__init__(message)
+        self.fallback_parser = bool(fallback_parser)
+
+
 def _read_toml_file(path):
     with open(path, "rb") as f:
         data = f.read()
+    text = data.decode("utf-8")
+
     try:
         import tomllib
     except ImportError:
@@ -271,58 +288,167 @@ def _read_toml_file(path):
             import tomli as tomllib
         except ImportError:
             tomllib = None
+
     if tomllib is not None:
-        return tomllib.loads(data.decode("utf-8"))
-    return _fallback_parse_toml(data.decode("utf-8"))
+        try:
+            return tomllib.loads(text)
+        except ValueError as e:
+            raise _ConfigTomlError(str(e)) from e
+
+    try:
+        return _fallback_parse_toml(text)
+    except (ValueError, json.JSONDecodeError) as e:
+        raise _ConfigTomlError(
+            "The configuration uses TOML syntax that Carriage's built-in "
+            "Python 3.10 fallback parser cannot read. Install the optional "
+            "'tomli' package or use the syntax produced by Carriage's generated "
+            f"config.toml. Parser detail: {e}",
+            fallback_parser=True,
+        ) from e
 
 
-def _validate_config(raw):
-    """Return validated settings, using defaults for missing/invalid values."""
+def _config_diagnostic(diagnostics, message):
+    if diagnostics is not None:
+        diagnostics.append(str(message))
+
+
+def _validate_config(raw, diagnostics=None):
+    """Return valid settings and report only values that were ignored.
+
+    Missing settings remain defaults without a warning. A syntactically valid
+    configuration can therefore contain one bad value without discarding the
+    other valid settings.
+    """
     cfg = _default_config()
     if not isinstance(raw, dict):
+        _config_diagnostic(
+            diagnostics,
+            "The configuration root is not a TOML table; all settings use defaults.",
+        )
         return cfg
 
-    editor = raw.get("editor", {})
-    interface = raw.get("interface", {})
-    tools = raw.get("tools", {})
-    editor = editor if isinstance(editor, dict) else {}
-    interface = interface if isinstance(interface, dict) else {}
-    tools = tools if isinstance(tools, dict) else {}
+    known_tables = {"editor", "interface", "tools"}
+    for key in raw:
+        if key not in known_tables:
+            _config_diagnostic(
+                diagnostics,
+                f"Unrecognized top-level setting or table {key!r} was ignored.",
+            )
 
-    width = editor.get("prose_width")
-    if isinstance(width, int) and not isinstance(width, bool) and MIN_WRAP_COLUMN <= width <= MAX_WRAP_COLUMN:
-        cfg["prose_width"] = width
+    sections = {}
+    for section_name in ("editor", "interface", "tools"):
+        section = raw.get(section_name, {})
+        if isinstance(section, dict):
+            sections[section_name] = section
+        else:
+            sections[section_name] = {}
+            if section_name in raw:
+                _config_diagnostic(
+                    diagnostics,
+                    f"[{section_name}] must be a TOML table; that section was ignored.",
+                )
 
+    editor = sections["editor"]
+    interface = sections["interface"]
+    tools = sections["tools"]
+
+    known_editor = {"prose_width"}
+    known_interface = {"scrollbar", "statusbar", "mouse", "hard_break_marker"}
+    known_tools = {"pandoc", "spellcheck_command"}
+    for section_name, section, known in (
+        ("editor", editor, known_editor),
+        ("interface", interface, known_interface),
+        ("tools", tools, known_tools),
+    ):
+        for key in section:
+            if key not in known:
+                _config_diagnostic(
+                    diagnostics,
+                    f"Unrecognized setting {section_name}.{key} was ignored.",
+                )
+
+    if "prose_width" in editor:
+        width = editor["prose_width"]
+        if (
+            isinstance(width, int)
+            and not isinstance(width, bool)
+            and MIN_WRAP_COLUMN <= width <= MAX_WRAP_COLUMN
+        ):
+            cfg["prose_width"] = width
+        else:
+            _config_diagnostic(
+                diagnostics,
+                f"editor.prose_width must be an integer from {MIN_WRAP_COLUMN} "
+                f"to {MAX_WRAP_COLUMN}; using {cfg['prose_width']}.",
+            )
 
     for key in ("scrollbar", "statusbar", "mouse", "hard_break_marker"):
-        value = interface.get(key)
+        if key not in interface:
+            continue
+        value = interface[key]
         if isinstance(value, bool):
             cfg[key] = value
+        else:
+            _config_diagnostic(
+                diagnostics,
+                f"interface.{key} must be true or false; using {cfg[key]!r}.",
+            )
 
-    pandoc = tools.get("pandoc")
-    if isinstance(pandoc, str) and pandoc.strip():
-        cfg["pandoc"] = pandoc.strip()
+    if "pandoc" in tools:
+        pandoc = tools["pandoc"]
+        if isinstance(pandoc, str) and pandoc.strip():
+            cfg["pandoc"] = pandoc.strip()
+        else:
+            _config_diagnostic(
+                diagnostics,
+                f"tools.pandoc must be a non-empty string; using {cfg['pandoc']!r}.",
+            )
 
-    spellcheck = tools.get("spellcheck_command")
-    if (
-        isinstance(spellcheck, list)
-        and spellcheck
-        and all(isinstance(arg, str) and arg for arg in spellcheck)
-        and "{file}" not in spellcheck[0]
-        and any("{file}" in arg for arg in spellcheck)
-    ):
-        cfg["spellcheck_command"] = list(spellcheck)
+    if "spellcheck_command" in tools:
+        spellcheck = tools["spellcheck_command"]
+        if (
+            isinstance(spellcheck, list)
+            and spellcheck
+            and all(isinstance(arg, str) and arg for arg in spellcheck)
+            and "{file}" not in spellcheck[0]
+            and any("{file}" in arg for arg in spellcheck)
+        ):
+            cfg["spellcheck_command"] = list(spellcheck)
+        else:
+            _config_diagnostic(
+                diagnostics,
+                "tools.spellcheck_command must be a non-empty array of non-empty "
+                "strings, with {file} in an argument after the executable; using "
+                "the default spell-check command.",
+            )
 
     return cfg
 
 
 def _load_config():
-    """Load Carriage's TOML configuration, falling back to defaults."""
+    """Load configuration and retain diagnostics for one startup warning."""
+    diagnostics = []
+    path = _config_path()
     try:
-        raw = _read_toml_file(_config_path())
-    except (OSError, UnicodeError, ValueError):
-        return _default_config()
-    return _validate_config(raw)
+        raw = _read_toml_file(path)
+    except FileNotFoundError:
+        return _default_config(), diagnostics
+    except UnicodeError as e:
+        diagnostics.append(
+            f"The configuration is not valid UTF-8 ({e}); all settings use defaults."
+        )
+        return _default_config(), diagnostics
+    except _ConfigTomlError as e:
+        diagnostics.append(f"Could not parse config.toml: {e}")
+        diagnostics.append("Because the TOML could not be parsed safely, all settings use defaults.")
+        return _default_config(), diagnostics
+    except OSError as e:
+        diagnostics.append(
+            f"Could not read config.toml ({e}); all settings use defaults."
+        )
+        return _default_config(), diagnostics
+
+    return _validate_config(raw, diagnostics), diagnostics
 
 
 def _toml_string(value):
@@ -356,40 +482,29 @@ def _serialize_config_toml(config):
 
 
 def _write_config(config):
-    """Atomically write a complete validated Carriage configuration."""
+    """Durably write a complete validated Carriage configuration."""
     path = _config_path()
     directory = os.path.dirname(path)
     os.makedirs(directory, exist_ok=True)
-    payload = _validate_config(config)
-    fd, temp_path = tempfile.mkstemp(prefix=".config-", suffix=".tmp", dir=directory)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
-            fd = None
-            f.write(_serialize_config_toml(payload))
+    payload = _serialize_config_toml(_validate_config(config))
+
+    def write_staged(temp_path):
+        with open(temp_path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(payload)
             f.flush()
-            os.fsync(f.fileno())
-        os.replace(temp_path, path)
-        temp_path = None
-        try:
-            dir_fd = os.open(directory, os.O_RDONLY)
-        except OSError:
-            dir_fd = None
-        if dir_fd is not None:
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
-    finally:
-        if fd is not None:
-            os.close(fd)
-        if temp_path is not None:
-            try:
-                os.unlink(temp_path)
-            except OSError:
-                pass
+
+    _durable_atomic_replace(
+        path,
+        write_staged,
+        temp_prefix=".config-",
+        temp_suffix=".tmp",
+        new_file_mode=_new_file_mode_from_umask(),
+        preserve_existing_metadata=True,
+        reject_hardlinks=True,
+    )
 
 
-_CONFIG = _load_config()
+_CONFIG, _CONFIG_DIAGNOSTICS = _load_config()
 WRAP_COLUMN = _CONFIG["prose_width"]
 SCROLLBAR_VISIBLE = _CONFIG["scrollbar"]
 STATUSBAR_DEFAULT_VISIBLE = _CONFIG["statusbar"]
@@ -879,6 +994,9 @@ class EditorState:
         # True while the configured interactive spell checker has the file open
         # on disk. The checker works only on an explicitly saved source file.
         self.external_process_running = False
+        # Pandoc exports run in a worker thread so the editor remains responsive.
+        # Only one Pandoc export may own the destination/export state at a time.
+        self.pandoc_export_running = False
         # Hidden durable working-state protection. The recovery journal tracks
         # unsaved named and untitled documents, including in-progress table and
         # footnote drafts, without changing the Markdown source file. It is
@@ -1099,7 +1217,7 @@ def _prose_layout_widths(columns):
     insertion point at column 80. Narrow terminals gracefully reduce or remove
     the hanging gutter rather than taking space away from prose.
     """
-    scrollbar_width = 1
+    scrollbar_width = 1 if SCROLLBAR_VISIBLE else 0
     available = max(1, columns - scrollbar_width)
     if available <= WRAP_COLUMN:
         return 0, 0, 0
@@ -1330,7 +1448,15 @@ class ScrollableWindow(Window):
     manual_scroll_active = False
 
     def invalidate_rendered_height_cache(self):
-        """Discard cached soft-wrap geometry after source/layout changes."""
+        """Invalidate document geometry while retaining reusable line heights.
+
+        Text edits can alter structural interpretation beyond the edited row
+        (for example lazy blockquotes, list runs, or footnote numbering), so
+        Carriage deliberately rebuilds the cheap height/prefix arrays after a
+        change.  The expensive prompt_toolkit line measurement is retained in a
+        dependency-keyed cache and reused only when every width-affecting input
+        for that logical row is unchanged.
+        """
         self._height_cache_generation = getattr(self, "_height_cache_generation", 0) + 1
         self._height_cache_key = None
         self._height_cache_heights = None
@@ -1343,13 +1469,38 @@ class ScrollableWindow(Window):
         except Exception:
             return None
 
-    def _rendered_height_geometry(self, ui_content=None, width=None):
-        """Return cached (heights, prefix sums) for the current soft layout.
+    def _rendered_height_line_key(self, full_text, row, width, columns):
+        """Return all known inputs that can change one logical row's height.
 
-        A wheel tick must not ask prompt_toolkit to measure every logical line.
-        Heights are therefore computed once per text/layout generation and then
-        reused until document text or terminal geometry changes. ``prefix[n]``
-        is the rendered-row offset at the start of logical line ``n``.
+        Styling alone is intentionally absent: color/bold/italic do not change
+        terminal cell width.  Structural layout, compact footnote labels, hard-
+        break display substitution, source text, viewport width, and terminal
+        columns do.  Full-document parsing may therefore change this key for an
+        untouched source line, which is how dependent rows are invalidated
+        without assuming that an edit affects only one physical line.
+        """
+        lines = _source_lines(full_text)
+        line = lines[row] if 0 <= row < len(lines) else ""
+        row_layout = _display_row_layout(full_text, row)
+        footnote_spans = tuple(_footnote_display_spans(full_text, row))
+        hard_break_span = _hard_break_display_span(full_text, row)
+        return (
+            line,
+            int(width),
+            columns,
+            row_layout,
+            footnote_spans,
+            hard_break_span,
+        )
+
+    def _rendered_height_geometry(self, ui_content=None, width=None):
+        """Return cached ``(heights, prefix)`` for the current soft layout.
+
+        Whole-document geometry is rebuilt after text/layout changes, but line
+        heights are reused from the previous rendered geometry whenever their
+        complete render-dependency key is unchanged.  This keeps structural
+        invalidation conservative while avoiding a prompt_toolkit transformation
+        pass for every unaffected line after each keystroke.
         """
         info = self.render_info
         if ui_content is None:
@@ -1364,7 +1515,8 @@ class ScrollableWindow(Window):
             return None, None
 
         generation = getattr(self, "_height_cache_generation", 0)
-        key = (generation, width, self._height_cache_columns(), ui_content.line_count)
+        columns = self._height_cache_columns()
+        key = (generation, width, columns, ui_content.line_count)
         if (
             getattr(self, "_height_cache_key", None) == key
             and getattr(self, "_height_cache_heights", None) is not None
@@ -1372,16 +1524,40 @@ class ScrollableWindow(Window):
         ):
             return self._height_cache_heights, self._height_cache_prefix
 
-        heights = [
-            max(1, ui_content.get_height_for_line(i, width, self.get_line_prefix))
-            for i in range(ui_content.line_count)
-        ]
+        try:
+            full_text = self.content.buffer.text
+        except (AttributeError, TypeError):
+            full_text = text_area.buffer.text
+
+        previous_line_heights = getattr(self, "_height_line_cache", None) or {}
+        current_line_heights = {}
+        heights = []
+        for row in range(ui_content.line_count):
+            line_key = self._rendered_height_line_key(
+                full_text, row, width, columns
+            )
+            line_height = current_line_heights.get(line_key)
+            if line_height is None:
+                line_height = previous_line_heights.get(line_key)
+            if line_height is None:
+                line_height = max(
+                    1,
+                    ui_content.get_height_for_line(
+                        row, width, self.get_line_prefix
+                    ),
+                )
+            current_line_heights[line_key] = line_height
+            heights.append(line_height)
+
         prefix = [0]
         total = 0
         for line_height in heights:
             total += line_height
             prefix.append(total)
 
+        # Retain only keys used by the current geometry.  This gives edits one
+        # generation of reuse without accumulating stale source lines forever.
+        self._height_line_cache = current_line_heights
         self._height_cache_key = key
         self._height_cache_heights = heights
         self._height_cache_prefix = prefix
@@ -2349,7 +2525,7 @@ class ProseLayoutProcessor(Processor):
                 display_pos += 1
 
         body_width = max(1, min(WRAP_COLUMN, ti.width - gutter - 1))
-        source_line = "".join(char for _style, char in fragments)
+        source_line = ti.document.lines[ti.lineno]
         dash_glue_positions = _dash_standin_glue_positions(
             source_line, prefix_width, body_width
         )
@@ -2373,7 +2549,8 @@ class ProseLayoutProcessor(Processor):
             """Measure the next visual prose unit, including glued dash gaps."""
             width = 0
             found = False
-            for _style, text, src_start, src_end in units[unit_index:]:
+            for index in range(unit_index, len(units)):
+                _style, text, src_start, src_end = units[index]
                 for offset, char in enumerate(text):
                     source_index = min(
                         src_start + offset,
@@ -2447,6 +2624,20 @@ class ProseLayoutProcessor(Processor):
 
         source_to_display_map[source_length] = display_pos
         display_to_source_map[display_pos] = source_length
+
+        # A folded footnote definition is displayed as one atomic compact
+        # label even though its source contains the hidden identifier plus a
+        # trailing sentinel. Make the canonical visible end (immediately before
+        # that sentinel) map to the end of the displayed label. This keeps the
+        # cursor out of hidden source while still giving the object two normal
+        # visual boundaries for Left/Right, Home/End, and vertical navigation.
+        if (
+            source_line.endswith(FOOTNOTE_SENTINEL)
+            and any(len(span) >= 5 and span[4] for span in spans)
+        ):
+            visible_end = max(0, source_length - 1)
+            source_to_display_map[visible_end] = display_pos
+            display_to_source_map[display_pos] = visible_end
 
         def source_to_display(position):
             position = max(0, min(position, source_length))
@@ -2788,11 +2979,16 @@ text_area.window._height_cache_generation = 0
 text_area.window._height_cache_key = None
 text_area.window._height_cache_heights = None
 text_area.window._height_cache_prefix = None
+text_area.window._height_line_cache = {}
 # Preferred rendered-screen column for repeated Up/Down navigation. Unlike
 # Buffer.preferred_column, this is measured in visual cells after Carriage's
 # display transformations and soft wrapping.
 text_area.window._vertical_preferred_x = None
 text_area.window._visual_vertical_move_in_progress = False
+# Visual cursor geometry is expensive on very long logical paragraphs. Cache
+# only rows actually visited by navigation; text edits clear these caches.
+text_area.window._visual_positions_cache = {}
+text_area.window._visual_candidates_cache = {}
 # Alt+Up/Alt+Down can pin a target heading to the first visible editor row.
 # The anchor survives repaints but is cleared by any subsequent ordinary
 # cursor movement, edit, or manual viewport scroll.
@@ -2870,6 +3066,8 @@ def _editor_text_changed(_buffer=None):
     text_area.window._section_top_anchor_row = None
     text_area.window._vertical_preferred_x = None
     text_area.window.invalidate_rendered_height_cache()
+    text_area.window._visual_positions_cache.clear()
+    text_area.window._visual_candidates_cache.clear()
     _working_state_changed()
 
 
@@ -3035,8 +3233,9 @@ def show_transient_status(message, duration=3.0):
     """Show a nonmodal full-width notice on the status-bar line."""
     state.transient_status_generation += 1
     generation = state.transient_status_generation
+    effective_duration = max(0.1, float(duration))
     state.transient_status_message = str(message)
-    state.transient_status_expires_at = time.monotonic() + max(0.1, float(duration))
+    state.transient_status_expires_at = time.monotonic() + effective_duration
 
     try:
         get_app().invalidate()
@@ -3051,11 +3250,18 @@ def show_transient_status(message, duration=3.0):
         loop = asyncio.get_running_loop()
     except RuntimeError:
         return
-    loop.call_later(duration, _clear_transient_status_message, generation)
+    loop.call_later(
+        effective_duration, _clear_transient_status_message, generation
+    )
 
 
-def show_message(title, text):
-    ok_button = Button(text="OK", handler=close_dialog)
+def show_message(title, text, on_close=None):
+    def ok_handler():
+        close_dialog()
+        if on_close is not None:
+            on_close()
+
+    ok_button = Button(text="OK", handler=ok_handler)
     dialog = Dialog(
         title=title,
         body=_dialog_prose(text, width=64),
@@ -3314,15 +3520,13 @@ def _apply_replacement_metadata(fd, source_stat, source_xattrs):
     if (temp_uid, temp_gid) != (source_uid, source_gid):
         if not hasattr(os, "fchown"):
             raise OSError(
-                "Carriage cannot preserve this file's owner/group on this platform. "
-                "Use Save As to write a new file instead."
+                "Carriage cannot preserve this file's owner/group on this platform during atomic replacement."
             )
         try:
             os.fchown(fd, source_uid, source_gid)
         except OSError as e:
             raise OSError(
-                "Carriage cannot preserve this file's owner/group during atomic save. "
-                "Use Save As to write a new file instead."
+                "Carriage cannot preserve this file's owner/group during atomic replacement."
             ) from e
 
     os.fchmod(fd, stat.S_IMODE(source_stat.st_mode))
@@ -3338,9 +3542,128 @@ def _apply_replacement_metadata(fd, source_stat, source_xattrs):
             os.setxattr(fd, name, value)
         except OSError as e:
             raise OSError(
-                f"Carriage cannot preserve extended attribute {name!r} during atomic save. "
-                "Use Save As to write a new file instead."
+                f"Carriage cannot preserve extended attribute {name!r} during atomic replacement."
             ) from e
+
+
+class _AtomicReplaceCancelled(Exception):
+    """Internal signal that a staged replacement failed final validation."""
+
+    def __init__(self, result):
+        super().__init__(str(result))
+        self.result = result
+
+
+class _AtomicReplaceDurabilityError(OSError):
+    """The replacement is visible, but its directory rename was not fsynced."""
+
+    def __init__(self, target_path, error):
+        super().__init__(str(error))
+        self.target_path = target_path
+        self.original_error = error
+
+
+class _AtomicReplaceHardLinkError(OSError):
+    """Atomic replacement would sever an existing hard-link relationship."""
+
+
+def _durable_atomic_replace(
+    target_path,
+    write_staged,
+    *,
+    temp_prefix=None,
+    temp_suffix=".tmp",
+    new_file_mode,
+    preserve_existing_metadata=True,
+    reject_hardlinks=False,
+    validate_before_replace=None,
+):
+    """Write ``target_path`` through one durable same-directory replacement.
+
+    ``write_staged`` receives a private temporary pathname and must completely
+    produce the replacement contents there. Carriage then applies the final
+    destination metadata, fsyncs the staged inode, performs any caller-supplied
+    last-moment validation, atomically replaces the destination, and fsyncs the
+    containing directory.
+
+    Callers retain policy decisions such as conflict/read-only messages and
+    recovery behavior. This helper owns only the filesystem replacement
+    invariant so Save, exports, and config writes cannot quietly drift apart.
+    Recovery journals deliberately keep their separate generation/locking path.
+    """
+    target_path = _canonical_path(target_path)
+    directory = os.path.dirname(target_path) or "."
+    basename = os.path.basename(target_path)
+    prefix = temp_prefix if temp_prefix is not None else f".{basename}."
+    temp_path = None
+    fd = None
+
+    try:
+        fd, temp_path = tempfile.mkstemp(
+            prefix=prefix,
+            suffix=temp_suffix,
+            dir=directory,
+        )
+        # The writer should see a normal private staging pathname. Close the
+        # descriptor returned by mkstemp first; the 0600 inode remains in place.
+        os.close(fd)
+        fd = None
+        write_staged(temp_path)
+
+        try:
+            existing_stat = os.stat(target_path)
+        except FileNotFoundError:
+            existing_stat = None
+
+        existing_xattrs = {}
+        if existing_stat is not None:
+            if not stat.S_ISREG(existing_stat.st_mode):
+                raise OSError(f"Not a regular file: {target_path}")
+            if reject_hardlinks and existing_stat.st_nlink > 1:
+                raise _AtomicReplaceHardLinkError(
+                    "Atomic replacement would break an existing hard-link relationship."
+                )
+            if preserve_existing_metadata:
+                existing_xattrs = _read_extended_attributes(target_path)
+
+        # Apply final metadata only after the staged contents are complete.
+        # This keeps the temporary inode private while a writer such as Pandoc
+        # is still using it, even when the destination's final mode is read-only.
+        with open(temp_path, "rb") as staged:
+            if existing_stat is not None and preserve_existing_metadata:
+                _apply_replacement_metadata(
+                    staged.fileno(), existing_stat, existing_xattrs
+                )
+            elif existing_stat is not None:
+                os.fchmod(staged.fileno(), stat.S_IMODE(existing_stat.st_mode))
+            else:
+                os.fchmod(staged.fileno(), new_file_mode)
+            os.fsync(staged.fileno())
+
+        if validate_before_replace is not None:
+            validation_result = validate_before_replace()
+            if validation_result is not None:
+                raise _AtomicReplaceCancelled(validation_result)
+
+        os.replace(temp_path, target_path)
+        temp_path = None
+        try:
+            _fsync_directory(directory)
+        except OSError as e:
+            # At this point the new inode is already visible at target_path.
+            # The caller must distinguish this from a pre-replacement failure.
+            raise _AtomicReplaceDurabilityError(target_path, e) from e
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if temp_path is not None:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
 
 
 def _recovery_directory():
@@ -4269,8 +4592,6 @@ def _write_file(path, expected_snapshot, report_conflict=True, report_read_only=
 
     content_bytes = content.encode("utf-8")
     target_path = _canonical_path(path)
-    directory = os.path.dirname(target_path) or "."
-    temp_path = None
 
     try:
         current_snapshot = _disk_snapshot(target_path)
@@ -4296,8 +4617,6 @@ def _write_file(path, expected_snapshot, report_conflict=True, report_read_only=
                 )
             return _SAVE_READ_ONLY
 
-        existing_stat = None
-        existing_xattrs = {}
         if current_snapshot != _MISSING_DISK_SNAPSHOT:
             existing_stat = os.stat(target_path)
             if existing_stat.st_nlink > 1:
@@ -4308,38 +4627,16 @@ def _write_file(path, expected_snapshot, report_conflict=True, report_read_only=
                     "Use Save As to write a separate file instead.",
                 )
                 return _SAVE_ERROR
-            existing_xattrs = _read_extended_attributes(target_path)
 
-        fd, temp_path = tempfile.mkstemp(
-            prefix=f".{os.path.basename(target_path)}.",
-            suffix=".tmp",
-            dir=directory,
-            text=True,
-        )
-
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
-                fd = None  # fdopen owns and closes the descriptor now.
-                # Keep mkstemp's private mode while writing. Only after the
-                # complete contents exist do we expose the replacement file's
-                # final permissions/ACL metadata, then fsync both together.
+        def write_staged(temp_path):
+            with open(temp_path, "w", encoding="utf-8", newline="") as f:
                 f.write(content)
                 f.flush()
-                if existing_stat is not None:
-                    _apply_replacement_metadata(
-                        f.fileno(), existing_stat, existing_xattrs
-                    )
-                else:
-                    # Match the permissions a normal open(..., "w") would use
-                    # for a newly created file, including the process umask.
-                    current_umask = os.umask(0)
-                    os.umask(current_umask)
-                    os.fchmod(f.fileno(), 0o666 & ~current_umask)
-                os.fsync(f.fileno())
 
-            # Recheck after the complete temporary file has been written. If
-            # another program changed the destination while this save was in
-            # progress, leave that version untouched.
+        def validate_before_replace():
+            # Recheck after the staged file is complete and its metadata has
+            # been prepared. If another program changed the destination while
+            # Save was in progress, the shared helper discards the stage.
             if _disk_snapshot(target_path) != expected_snapshot:
                 if report_conflict:
                     show_message(
@@ -4361,58 +4658,56 @@ def _write_file(path, expected_snapshot, report_conflict=True, report_read_only=
                         "Nothing was overwritten. Choose Save As and use a different filename.",
                     )
                 return _SAVE_READ_ONLY
+            return None
 
-            # The temporary file is in the destination directory, so this
-            # replacement is atomic on the same filesystem. The existing file
-            # stays untouched unless the complete new contents and preservable
-            # metadata were written successfully.
-            os.replace(temp_path, target_path)
-            temp_path = None
+        try:
+            _durable_atomic_replace(
+                target_path,
+                write_staged,
+                temp_suffix=".tmp",
+                new_file_mode=_new_file_mode_from_umask(),
+                preserve_existing_metadata=True,
+                reject_hardlinks=True,
+                validate_before_replace=validate_before_replace,
+            )
+        except _AtomicReplaceCancelled as cancelled:
+            return cancelled.result
+        except _AtomicReplaceHardLinkError:
+            show_message(
+                "Linked file",
+                "This file acquired multiple hard links while Carriage was saving. "
+                "Nothing was overwritten. Use Save As to write a separate file instead.",
+            )
+            return _SAVE_ERROR
+        except _AtomicReplaceDurabilityError as durability_error:
+            state.path = path
+            state.disk_snapshot = _snapshot_bytes(content_bytes)
 
-            # fsync() above made the new file contents durable. Now make the
-            # rename itself durable before Carriage reports a successful save
-            # or removes working-state recovery. If this fails, the new bytes are
-            # already visible at the destination, but a sudden crash could
-            # still lose the directory update. Keep the document modified and
-            # preserve a recovery copy so a later Save can retry safely.
+            recovery_detail = (
+                "The new file is visible on disk, but Carriage could not "
+                "confirm that the directory update is durable. The document "
+                "will remain marked modified and Save can be tried again."
+            )
             try:
-                _fsync_directory(directory)
-            except OSError as durability_error:
-                state.path = path
-                state.disk_snapshot = _snapshot_bytes(content_bytes)
-
-                recovery_detail = (
-                    "The new file is visible on disk, but Carriage could not "
-                    "confirm that the directory update is durable. The document "
-                    "will remain marked modified and Save can be tried again."
+                _write_recovery_snapshot()
+            except (OSError, UnicodeError, TypeError, ValueError) as recovery_error:
+                state.recovery_write_error_message = str(recovery_error)
+                _refresh_recovery_error_state()
+                recovery_detail += (
+                    "\n\nCarriage also could not update working-state recovery: "
+                    f"{recovery_error}"
                 )
-                try:
-                    _write_recovery_snapshot()
-                except (OSError, UnicodeError, TypeError, ValueError) as recovery_error:
-                    state.recovery_write_error_message = str(recovery_error)
-                    _refresh_recovery_error_state()
-                    recovery_detail += (
-                        "\n\nCarriage also could not update working-state recovery: "
-                        f"{recovery_error}"
-                    )
-                else:
-                    state.recovery_write_error_message = None
-                    _refresh_recovery_error_state()
-                    recovery_detail += "\n\nWorking-state recovery has been retained."
+            else:
+                state.recovery_write_error_message = None
+                _refresh_recovery_error_state()
+                recovery_detail += "\n\nWorking-state recovery has been retained."
 
-                show_message(
-                    "Save durability warning",
-                    f"{recovery_detail}\n\nDirectory flush error: {durability_error}",
-                )
-                return _SAVE_DURABILITY_ERROR
-        finally:
-            if fd is not None:
-                os.close(fd)
-            if temp_path is not None:
-                try:
-                    os.unlink(temp_path)
-                except OSError:
-                    pass
+            show_message(
+                "Save durability warning",
+                f"{recovery_detail}\n\nDirectory flush error: "
+                f"{durability_error.original_error}",
+            )
+            return _SAVE_DURABILITY_ERROR
 
         state.saved_text = content
         state.path = path
@@ -4423,7 +4718,6 @@ def _write_file(path, expected_snapshot, report_conflict=True, report_read_only=
     except (OSError, UnicodeError) as e:
         show_message("Error saving file", str(e))
         return _SAVE_ERROR
-
 
 def do_save(on_saved=None):
     if state.path is None:
@@ -4474,13 +4768,349 @@ def do_save(on_saved=None):
         on_saved()
 
 
-def _suggested_new_document_filename():
-    """Return a filename suggestion from the first ATX heading in an untitled document.
+_PORTABLE_FILENAME_INVALID_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f\x7f]+')
+_WINDOWS_RESERVED_FILENAME_RE = re.compile(
+    r"^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)", re.IGNORECASE
+)
+_MARKDOWN_ESCAPABLE_PUNCTUATION = frozenset(string.punctuation)
+_FILENAME_COMPONENT_MAX_BYTES = 240
+_FILENAME_NOUN_ENDING_LOOKBACK_WORDS = 8
+_FILENAME_LOW_INFORMATION_END_WORDS = frozenset(
+    """
+    a an the and or but nor for so yet as at by from in into of off on onto per
+    than through to toward towards under with within without about above after
+    before behind below between beyond during over across around this that these
+    those my your his her its our their some any each every either neither no not
+    is are was were am be been being do does did have has had can could may might
+    must shall should will would very more most less least much many few several
+    such other another
+    """.split()
+)
+_FILENAME_COMMON_MODIFIER_END_WORDS = frozenset(
+    """
+    new old great little large small long short high low early late current recent
+    final first second third last next previous important possible available
+    different similar general specific major minor primary secondary national
+    international local federal private military political economic social legal
+    technical historical historic modern northern southern eastern western central
+    middle upper lower inner outer former latter main overall additional extra
+    further entire whole single multiple various particular common basic advanced
+    simple complex complete partial detailed broad narrow
+    """.split()
+)
+_FILENAME_NOUNISH_SUFFIXES = (
+    "tion", "sion", "ment", "ness", "ity", "ism", "ist", "ship",
+    "ance", "ence", "hood", "dom", "age", "ery", "ure", "graphy",
+    "logy", "ics",
+)
+_FILENAME_MODIFIERISH_SUFFIXES = (
+    "ly", "ous", "ive", "able", "ible", "ful", "less", "ish", "ical",
+)
 
-    Use the shared Markdown block classifier so apparent headings inside YAML,
-    code, raw HTML, blockquotes, and other non-heading blocks are ignored. The
-    first recognized ATX heading qualifies regardless of level, and its visible
-    heading text is preserved as written rather than slugified.
+
+def _remove_source_ranges(text, ranges):
+    """Delete sorted/overlapping source ranges without disturbing other text."""
+    merged = _merge_source_ranges(ranges)
+    if not merged:
+        return text
+    result = []
+    cursor = 0
+    for start, end in merged:
+        start = max(cursor, max(0, start))
+        end = max(start, min(len(text), end))
+        result.append(text[cursor:start])
+        cursor = end
+    result.append(text[cursor:])
+    return "".join(result)
+
+
+def _strip_explicit_link_markup(text):
+    """Return inline source with explicit link/image syntax reduced to labels.
+
+    Only constructs that prove they are links/images by carrying an inline
+    destination or second reference label are changed. Plain bracketed prose is
+    kept byte-for-byte because Carriage does not resolve shortcut references
+    merely to propose a filename.
+    """
+    if "[" not in text or "]" not in text:
+        return text
+
+    escaped = _escaped_source_positions(text)
+    code_ranges = _inline_code_span_ranges(text)
+    remove = []
+    stack = []
+    code_index = 0
+    i = 0
+    n = len(text)
+
+    while i < n:
+        while code_index < len(code_ranges) and code_ranges[code_index][1] <= i:
+            code_index += 1
+        if code_index < len(code_ranges):
+            range_start, range_end = code_ranges[code_index]
+            if range_start <= i < range_end:
+                i = range_end
+                continue
+
+        if i in escaped:
+            i += 1
+            continue
+
+        char = text[i]
+        if char == "[":
+            stack.append(i)
+            i += 1
+            continue
+        if char != "]" or not stack:
+            i += 1
+            continue
+
+        open_index = stack.pop()
+        next_index = i + 1
+        destination_end = None
+        reference_end = None
+
+        if next_index < n and text[next_index] == "(":
+            destination_end = _scan_inline_link_destination(
+                text, next_index, escaped
+            )
+        else:
+            probe = next_index
+            while probe < n and text[probe] in " \t":
+                probe += 1
+            if probe < n and text[probe] == "[" and probe not in escaped:
+                reference_end = _scan_reference_label(text, probe, escaped)
+
+        if destination_end is None and reference_end is None:
+            i += 1
+            continue
+
+        remove.extend(((open_index, open_index + 1), (i, i + 1)))
+        if (
+            open_index > 0
+            and text[open_index - 1] == "!"
+            and open_index - 1 not in escaped
+        ):
+            remove.append((open_index - 1, open_index))
+        if destination_end is not None:
+            remove.append((next_index, destination_end))
+            i = destination_end
+        else:
+            # The optional whitespace and second reference label are syntax,
+            # not visible heading text.
+            remove.append((next_index, reference_end))
+            i = reference_end
+
+    return _remove_source_ranges(text, remove)
+
+
+def _strip_emphasis_markup(text):
+    """Remove recognized emphasis delimiters while preserving their content."""
+    if "*" not in text and "_" not in text:
+        return text
+    protected = _inline_code_span_ranges(text)
+    spans = _emphasis_spans_in_range(text, 0, len(text), protected=protected)
+    remove = []
+    for open_start, open_end, close_start, close_end, _marker, _count in spans:
+        remove.extend(((open_start, open_end), (close_start, close_end)))
+    return _remove_source_ranges(text, remove)
+
+
+def _render_inline_code_plain(text):
+    """Replace complete Markdown code spans with the text they display."""
+    ranges = _inline_code_span_ranges(text)
+    if not ranges:
+        return text
+    result = []
+    cursor = 0
+    for start, end in ranges:
+        result.append(text[cursor:start])
+        marker_end = start + 1
+        while marker_end < end and text[marker_end] == "`":
+            marker_end += 1
+        marker_len = marker_end - start
+        content = text[marker_end:end - marker_len]
+        content = re.sub(r"[ \t\n]+", " ", content)
+        if (
+            len(content) >= 2
+            and content.startswith(" ")
+            and content.endswith(" ")
+            and content.strip()
+        ):
+            content = content[1:-1]
+        result.append(content)
+        cursor = end
+    result.append(text[cursor:])
+    return "".join(result)
+
+
+def _unescape_markdown_punctuation(text):
+    """Remove Markdown backslash escaping for punctuation visible in headings."""
+    result = []
+    i = 0
+    while i < len(text):
+        if (
+            text[i] == "\\"
+            and i + 1 < len(text)
+            and text[i + 1] in _MARKDOWN_ESCAPABLE_PUNCTUATION
+        ):
+            result.append(text[i + 1])
+            i += 2
+            continue
+        result.append(text[i])
+        i += 1
+    return "".join(result)
+
+
+def _plain_heading_text(title):
+    """Return conservative human-visible text for one ATX heading title."""
+    text = _strip_explicit_link_markup(str(title))
+    text = _strip_emphasis_markup(text)
+    text = _render_inline_code_plain(text)
+
+    # Autolinks display their destination without angle brackets. Raw inline
+    # HTML tags themselves are not visible; their text content remains.
+    text = _AUTOLINK_RE.sub(lambda match: match.group(0)[1:-1], text)
+    text = re.sub(r"</?[A-Za-z][^>\n]*>", "", text)
+    text = _unescape_markdown_punctuation(text)
+    text = _html_unescape(text)
+    return " ".join(text.split()).strip()
+
+
+def _subtitle_colon_index(text):
+    """Return the first visible title/subtitle colon, ignoring URL schemes."""
+    for index, char in enumerate(text):
+        if char != ":":
+            continue
+
+        # A visible autolink can legitimately contribute ``https://...`` to a
+        # heading. Do not mistake that URI-scheme colon for a title/subtitle
+        # separator. Other colons follow the filename policy: the text before
+        # the first one is the title used for Save As.
+        token_start = index
+        while token_start > 0 and not text[token_start - 1].isspace():
+            token_start -= 1
+        scheme = text[token_start:index]
+        if (
+            text[index + 1:index + 3] == "//"
+            and re.fullmatch(r"[A-Za-z][A-Za-z0-9+.-]*", scheme)
+        ):
+            continue
+        return index
+    return None
+
+
+def _filename_terminal_word_score(token):
+    """Return a small heuristic score for a descriptive truncation endpoint.
+
+    Carriage intentionally does not add a part-of-speech dependency merely to
+    suggest a filename. Instead, favor words that are likely nouns/content
+    words, strongly favor common noun-forming suffixes, and avoid ending on
+    articles, prepositions, auxiliaries, adverbs, or obvious modifiers.
+    """
+    word = token.strip(" \t\r\n.,;!?()[]{}'\"-_–—")
+    if not word or not any(char.isalnum() for char in word):
+        return 0
+    lowered = word.casefold()
+    if lowered in _FILENAME_LOW_INFORMATION_END_WORDS:
+        return 0
+    if lowered in _FILENAME_COMMON_MODIFIER_END_WORDS:
+        return 1
+    if lowered.endswith(_FILENAME_NOUNISH_SUFFIXES):
+        return 4
+    if lowered.endswith(_FILENAME_MODIFIERISH_SUFFIXES):
+        return 1
+    # Gerunds/participles can themselves be nouns ("writing", "building"),
+    # so keep them preferable to a function word without calling them strong
+    # noun candidates.
+    if lowered.endswith(("ing", "ed")):
+        return 2
+    return 3
+
+
+def _truncate_filename_stem(
+    stem, extension, max_bytes=_FILENAME_COMPONENT_MAX_BYTES
+):
+    """Truncate at a useful word boundary while preserving the extension.
+
+    Prefer the nearest noun-like/content-word endpoint among the last few words
+    that fit. This keeps long generated names descriptive and, for ordinary
+    spaced prose, guarantees truncation never cuts through a word. A pathological
+    single token longer than the entire filesystem component budget falls back
+    to UTF-8-safe character truncation because no word boundary exists.
+    """
+    budget = max(1, int(max_bytes) - len(extension.encode("utf-8")))
+    if len(stem.encode("utf-8")) <= budget:
+        return stem
+
+    candidates = []
+    for match in re.finditer(r"\S+", stem):
+        end = match.end()
+        if len(stem[:end].encode("utf-8")) > budget:
+            break
+        candidates.append((end, _filename_terminal_word_score(match.group(0))))
+
+    if candidates:
+        window = candidates[-_FILENAME_NOUN_ENDING_LOOKBACK_WORDS:]
+        chosen_end = candidates[-1][0]
+        # Prefer the latest noun-like/content-word endpoint so the filename
+        # keeps as much of the title as possible. If none is available nearby,
+        # a gerund/participle is still preferable to ending on a function word
+        # or obvious modifier.
+        match = next(
+            (end for end, score in reversed(window) if score >= 3),
+            None,
+        )
+        if match is None:
+            match = next(
+                (end for end, score in reversed(window) if score >= 2),
+                None,
+            )
+        if match is not None:
+            chosen_end = match
+        return stem[:chosen_end].rstrip(" .,-;_–—")
+
+    # Extremely long unbroken tokens have no meaningful word boundary to use.
+    # Preserve as much UTF-8-safe text as the component limit permits.
+    return stem.encode("utf-8")[:budget].decode("utf-8", errors="ignore").rstrip(" .")
+
+
+def _portable_markdown_filename(title):
+    """Return a human-readable portable Markdown filename for heading text."""
+    filename = _plain_heading_text(title)
+    colon_index = _subtitle_colon_index(filename)
+    if colon_index is not None and filename[:colon_index].strip():
+        filename = filename[:colon_index].rstrip()
+    filename = _PORTABLE_FILENAME_INVALID_RE.sub("-", filename)
+    filename = " ".join(filename.split()).strip().rstrip(" .")
+    if not filename or filename in {".", ".."}:
+        return ""
+
+    if filename.lower().endswith(".md"):
+        stem, extension = filename[:-3], filename[-3:]
+    else:
+        stem, extension = filename, ".md"
+
+    stem = stem.rstrip(" .")
+    if not stem:
+        return ""
+    stem = _truncate_filename_stem(stem, extension)
+    if not stem:
+        return ""
+
+    candidate = stem + extension
+    if _WINDOWS_RESERVED_FILENAME_RE.match(candidate):
+        candidate = "_" + candidate
+    return candidate
+
+
+def _suggested_new_document_filename():
+    """Return a portable filename suggestion from the first real ATX heading.
+
+    The shared block classifier excludes apparent headings inside YAML, code,
+    raw HTML, blockquotes, and other non-heading blocks. Inline Markdown is
+    reduced conservatively to the text a reader sees, then only filename-unsafe
+    characters are neutralized; the title is not slugified.
     """
     if state.path is not None:
         return state.path
@@ -4491,16 +5121,7 @@ def _suggested_new_document_filename():
         title = _heading_title(block.source_lines[0])
         if not title:
             continue
-
-        # Keep the title human-readable. Only neutralize characters that can
-        # turn the suggestion into a path (or cannot occur in a pathname).
-        filename = title.replace("/", "-").replace("\\", "-").replace("\x00", "")
-        filename = filename.strip()
-        if not filename or filename in {".", ".."}:
-            return ""
-        if not filename.lower().endswith(".md"):
-            filename += ".md"
-        return filename
+        return _portable_markdown_filename(title)
 
     return ""
 
@@ -4551,6 +5172,12 @@ def do_save_as(on_saved=None):
 
 
 def do_quit():
+    if state.pandoc_export_running:
+        show_message(
+            "Export in progress",
+            "Pandoc is still exporting. Finish the export before quitting Carriage.",
+        )
+        return
     if not _clear_recovery_file():
         cleanup_detail = state.recovery_error_message or "Unknown recovery cleanup error."
         _reprotect_after_blocked_cleanup()
@@ -4796,7 +5423,18 @@ def _nonblank_run_end(lines, index):
 
 
 def _collect_fenced_block(lines, index):
+    """Collect a fenced block, preserving source if the caller is mistaken.
+
+    Normal callers establish ``_fence_marker(lines[index])`` first.  Keep this
+    helper defensive anyway: if parser assumptions ever diverge, treating the
+    current line as an opaque one-line block is safer than raising from
+    ``*marker`` and interrupting conversion/opening of an otherwise readable
+    document.
+    """
     marker = _fence_marker(lines[index])
+    if marker is None:
+        return [lines[index]], index + 1
+
     block = [lines[index]]
     index += 1
     while index < len(lines):
@@ -5534,18 +6172,79 @@ def _folded_placeholder_locked():
 text_area.buffer.read_only = Condition(_folded_placeholder_locked)
 
 
-def _shift_table_numbers_for_insert(insert_number):
-    """Make room for a new document-relative table number."""
-    if not state.tables:
-        return
+def _replace_buffer_document(buffer, document):
+    """Apply an internal document transformation regardless of UI read-only state.
 
-    new_tables = {}
-    for number in sorted(state.tables, reverse=True):
-        target = number + 1 if number >= insert_number else number
-        new_tables[target] = state.tables[number]
-    state.tables = new_tables
+    Folded objects deliberately make the main Buffer read-only while the caret
+    is on their compact labels.  Programmatic transformations are structural
+    editor operations, not character edits, so they must not depend on where
+    the caret happens to be or on a caller remembering a particular guard.
+    """
+    buffer.set_document(document, bypass_readonly=True)
+
+
+def _table_state_for_placeholders(document):
+    """Validate table-object/placeholder correspondence before renumbering.
+
+    Return the placeholder numbers in source order.  Renumbering is one of the
+    few operations that rewrites both the object mapping and several folded
+    labels at once, so detect any pre-existing drift *before* mutating either
+    side of that relationship.
+    """
+    placeholder_numbers = []
+    seen = set()
+    for line in document.lines:
+        match = TABLE_PLACEHOLDER_RE.match(line)
+        if match is None:
+            continue
+        number = int(match.group(1))
+        if number in seen:
+            raise ValueError(
+                f"Table {number} appears more than once in the folded document."
+            )
+        if number not in state.tables:
+            raise ValueError(
+                f"Table {number} has a folded reference but no table data."
+            )
+        seen.add(number)
+        placeholder_numbers.append(number)
+
+    missing = sorted(set(state.tables) - seen)
+    if missing:
+        label = ", ".join(f"Table {number}" for number in missing)
+        raise ValueError(
+            f"{label} has table data but no folded reference in the document."
+        )
+    return placeholder_numbers
+
+
+def _shift_table_numbers_for_insert(insert_number):
+    """Make room for a new document-relative table number atomically.
+
+    Return False without changing document/object state if the folded labels
+    and the committed table mapping have already drifted out of sync.
+    """
+    if not state.tables:
+        return True
 
     doc = text_area.buffer.document
+    try:
+        _table_state_for_placeholders(doc)
+    except ValueError as error:
+        show_message(
+            "Document object error",
+            f"Carriage cannot insert a table because its folded table state is "
+            f"inconsistent.\n\n{error}",
+        )
+        return False
+
+    # Build both sides of the renumbering before committing either one.  This
+    # prevents a malformed placeholder from leaving state.tables half-shifted.
+    new_tables = {}
+    for number, table in state.tables.items():
+        target = number + 1 if number >= insert_number else number
+        new_tables[target] = table
+
     row = doc.cursor_position_row
     col = doc.cursor_position_col
     changed = False
@@ -5553,19 +6252,33 @@ def _shift_table_numbers_for_insert(insert_number):
     for line in doc.lines:
         match = TABLE_PLACEHOLDER_RE.match(line)
         if match and int(match.group(1)) >= insert_number:
-            new_number = int(match.group(1)) + 1
-            line = _table_placeholder(new_number, state.tables[new_number].title)
+            old_number = int(match.group(1))
+            new_number = old_number + 1
+            table = state.tables[old_number]  # validated above
+            line = _table_placeholder(new_number, table.title)
             changed = True
         new_lines.append(line)
 
+    old_tables = state.tables
+    state.tables = new_tables
     if changed:
         new_text = "\n".join(new_lines)
         tmp = Document(text=new_text)
+        new_row = min(row, tmp.line_count - 1)
         new_cursor = tmp.translate_row_col_to_index(
-            min(row, tmp.line_count - 1),
-            min(col, len(tmp.lines[min(row, tmp.line_count - 1)])),
+            new_row, min(col, len(tmp.lines[new_row]))
         )
-        text_area.buffer.document = Document(new_text, cursor_position=new_cursor)
+        try:
+            _replace_buffer_document(
+                text_area.buffer,
+                Document(new_text, cursor_position=new_cursor),
+            )
+        except Exception:
+            # set_document() should be reliable here, but never leave one half
+            # of a structural table renumbering committed if it does fail.
+            state.tables = old_tables
+            raise
+    return True
 
 
 def _insert_table_placeholder(table_number):
@@ -5619,12 +6332,12 @@ def _refresh_table_placeholder(table_number):
     tmp = Document(text=new_text)
     new_row = min(row, tmp.line_count - 1)
     new_col = min(col, len(tmp.lines[new_row]))
-    text_area.buffer.set_document(
+    _replace_buffer_document(
+        text_area.buffer,
         Document(
             text=new_text,
             cursor_position=tmp.translate_row_col_to_index(new_row, new_col),
         ),
-        bypass_readonly=True,
     )
 
 
@@ -5691,9 +6404,9 @@ def _delete_table_object(table_number):
     tmp = Document(new_text)
     cursor_row = min(cursor_row, tmp.line_count - 1)
     cursor_col = min(doc.cursor_position_col, len(tmp.lines[cursor_row]))
-    buf.set_document(
+    _replace_buffer_document(
+        buf,
         Document(new_text, tmp.translate_row_col_to_index(cursor_row, cursor_col)),
-        bypass_readonly=True,
     )
     return True
 
@@ -8095,14 +8808,17 @@ def do_paste():
 
 
 def _ensure_config_file():
-    """Create config.toml on first launch without replacing an existing file."""
-    if os.path.exists(_config_path()):
-        return
+    """Create config.toml on first launch and return a warning on failure."""
+    path = _config_path()
+    if os.path.exists(path):
+        return None
     try:
         _write_config(_CONFIG)
-    except OSError:
-        # A read-only or unavailable config home must never prevent startup.
-        pass
+    except OSError as e:
+        # A read-only or unavailable config home must never prevent startup,
+        # but the writer should know that preferences cannot be persisted.
+        return f"Could not create config.toml ({e}). Settings will not persist."
+    return None
 
 
 def do_toggle_statusbar():
@@ -8516,6 +9232,41 @@ def _show_table_column_menu():
     )
 
 
+def _table_grid_cell_width(columns, terminal_width):
+    """Return a cell width that keeps the complete table grid on screen.
+
+    The grid needs three non-content cells per column (two cell-padding spaces
+    plus one vertical border) and one final outer border.  Earlier versions
+    forced an eight-character minimum even when the terminal could not contain
+    that grid, so a six-column table clipped on narrow screens.  Shrink the
+    display-only cells as far as one character when necessary; source table
+    contents are never changed.
+    """
+    columns = max(1, int(columns))
+    terminal_width = max(1, int(terminal_width))
+    available = min(120, max(1, terminal_width - 12))
+    border_and_padding = (3 * columns) + 1
+    return max(1, (available - border_and_padding) // columns)
+
+
+def _minimum_table_editor_terminal_width(columns):
+    """Return the narrowest terminal that can represent every grid column."""
+    columns = max(1, int(columns))
+    minimum_grid_width = (4 * columns) + 1  # one content cell + frame/padding
+    return minimum_grid_width + 12
+
+
+def _wrap_table_grid_cell(text, width):
+    """Wrap display-only table text so a long token cannot widen the grid."""
+    return textwrap.wrap(
+        str(text),
+        width=max(1, int(width)),
+        break_long_words=True,
+        break_on_hyphens=False,
+        replace_whitespace=False,
+    ) or [""]
+
+
 def _table_grid_geometry(session):
     """Return shared column geometry and border strings for the table editor."""
     columns = session.working.column_count
@@ -8523,8 +9274,7 @@ def _table_grid_geometry(session):
         terminal_width = get_app().output.get_size().columns
     except Exception:
         terminal_width = 100
-    available = max(50, min(120, terminal_width - 12))
-    cell_width = max(8, (available - columns - 1) // columns - 2)
+    cell_width = _table_grid_cell_width(columns, terminal_width)
     span = "─" * (cell_width + 2)
     return {
         "columns": columns,
@@ -8556,13 +9306,7 @@ def _table_grid_body_height(session):
     for row in rows:
         row_height = 1
         for cell in row:
-            wrapped = textwrap.wrap(
-                cell,
-                width=cell_width,
-                break_long_words=False,
-                break_on_hyphens=False,
-                replace_whitespace=False,
-            ) or [""]
+            wrapped = _wrap_table_grid_cell(cell, cell_width)
             row_height = max(row_height, len(wrapped))
         natural_height += row_height
 
@@ -8592,13 +9336,7 @@ def _table_grid_fragments(session):
     for row_number, row in enumerate(rows):
         wrapped_cells = []
         for cell in row:
-            wrapped = textwrap.wrap(
-                cell,
-                width=cell_width,
-                break_long_words=False,
-                break_on_hyphens=False,
-                replace_whitespace=False,
-            ) or [""]
+            wrapped = _wrap_table_grid_cell(cell, cell_width)
             wrapped_cells.append(wrapped)
 
         row_height = max(len(parts) for parts in wrapped_cells)
@@ -8680,6 +9418,20 @@ def open_table_editor(table_number):
             "Table too wide",
             f"The basic table editor currently supports up to {MAX_TABLE_EDITOR_COLUMNS} columns. "
             "This table will remain folded and unchanged.",
+        )
+        return
+
+    try:
+        terminal_width = get_app().output.get_size().columns
+    except Exception:
+        terminal_width = 100
+    minimum_width = _minimum_table_editor_terminal_width(table.column_count)
+    if terminal_width < minimum_width:
+        show_message(
+            "Terminal too narrow",
+            f"This {table.column_count}-column table needs a terminal at least "
+            f"{minimum_width} columns wide to show every column safely. "
+            "Widen the terminal and reopen the table editor.",
         )
         return
 
@@ -8954,7 +9706,8 @@ def do_insert_table():
         # Insertion can renumber existing tables and rewrite several folded
         # placeholders. Treat that whole transformation as one undoable edit.
         text_area.buffer.save_to_undo_stack()
-        _shift_table_numbers_for_insert(insert_number)
+        if not _shift_table_numbers_for_insert(insert_number):
+            return
         _set_committed_table(
             insert_number, _new_table_data(columns, rows, title=title)
         )
@@ -9043,7 +9796,9 @@ def _append_footnote_placeholder(identifier, cursor_position):
         new_text = text + "\n" + placeholder
     else:
         new_text = text + "\n\n" + placeholder
-    buf.document = Document(text=new_text, cursor_position=cursor_position)
+    _replace_buffer_document(
+        buf, Document(text=new_text, cursor_position=cursor_position)
+    )
 
 
 def _save_footnote_editor():
@@ -9182,7 +9937,9 @@ def do_insert_footnote():
     text = buf.text
     new_text = text[:pos] + reference + text[pos:]
     new_cursor = pos + len(reference)
-    buf.document = Document(text=new_text, cursor_position=new_cursor)
+    _replace_buffer_document(
+        buf, Document(text=new_text, cursor_position=new_cursor)
+    )
 
     _set_committed_footnote(
         identifier,
@@ -9248,7 +10005,7 @@ def _delete_footnote_object(identifier):
         )
     else:
         final_cursor = max(0, min(len(result), new_cursor))
-    buf.set_document(Document(result, final_cursor), bypass_readonly=True)
+    _replace_buffer_document(buf, Document(result, final_cursor))
     return True
 
 
@@ -9401,12 +10158,8 @@ def _default_wrapped_markdown_path():
 
 
 def _perform_text_export(out_path, content, expected_snapshot):
-    """Atomically write a text export without touching the working document."""
+    """Durably write a text export without touching the working document."""
     target_path = _canonical_path(out_path)
-    directory = os.path.dirname(target_path) or "."
-    basename = os.path.basename(target_path)
-    temp_path = None
-    fd = None
 
     try:
         if _disk_snapshot(target_path) != expected_snapshot:
@@ -9428,68 +10181,68 @@ def _perform_text_export(out_path, content, expected_snapshot):
             )
             return False
 
+        def write_staged(temp_path):
+            with open(temp_path, "w", encoding="utf-8", newline="") as f:
+                f.write(content)
+                f.flush()
+
+        def validate_before_replace():
+            if _disk_snapshot(target_path) != expected_snapshot:
+                return (
+                    "changed",
+                    "The output file changed while Carriage was exporting. The newer file "
+                    "was left untouched; the staged export was discarded.",
+                )
+            if (
+                expected_snapshot != _MISSING_DISK_SNAPSHOT
+                and _path_is_read_only(target_path)
+            ):
+                return (
+                    "read_only",
+                    "The export destination became read-only while Carriage was exporting. "
+                    "Nothing was overwritten.",
+                )
+            return None
+
         try:
-            existing_mode = stat.S_IMODE(os.stat(target_path).st_mode)
-        except FileNotFoundError:
-            existing_mode = None
-
-        fd, temp_path = tempfile.mkstemp(
-            prefix=f".{basename}.",
-            suffix=".tmp",
-            dir=directory,
-            text=True,
-        )
-        if existing_mode is not None:
-            os.fchmod(fd, existing_mode)
-        else:
-            current_umask = os.umask(0)
-            os.umask(current_umask)
-            os.fchmod(fd, 0o666 & ~current_umask)
-
-        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
-            fd = None
-            f.write(content)
-            f.flush()
-            os.fsync(f.fileno())
-
-        if _disk_snapshot(target_path) != expected_snapshot:
+            _durable_atomic_replace(
+                target_path,
+                write_staged,
+                temp_suffix=".tmp",
+                new_file_mode=_new_file_mode_from_umask(),
+                preserve_existing_metadata=True,
+                reject_hardlinks=True,
+                validate_before_replace=validate_before_replace,
+            )
+        except _AtomicReplaceCancelled as cancelled:
+            kind, message = cancelled.result
+            if kind == "changed":
+                show_message("Export destination changed", message)
+            else:
+                show_message("Read-only export destination", message)
+            return False
+        except _AtomicReplaceHardLinkError:
             show_message(
-                "Export destination changed",
-                "The output file changed while Carriage was exporting. The newer file "
-                "was left untouched; the staged export was discarded.",
+                "Linked export destination",
+                "The export destination has multiple hard links. Atomic replacement would "
+                "break that link relationship, so nothing was overwritten. Choose a "
+                "different export filename.",
+            )
+            return False
+        except _AtomicReplaceDurabilityError as e:
+            show_message(
+                "Export durability warning",
+                "The exported file is visible on disk, but Carriage could not confirm "
+                "that the directory update is durable. A sudden system crash could lose "
+                f"the rename.\n\nDirectory flush error: {e.original_error}",
             )
             return False
 
-        if (
-            expected_snapshot != _MISSING_DISK_SNAPSHOT
-            and _path_is_read_only(target_path)
-        ):
-            show_message(
-                "Read-only export destination",
-                "The export destination became read-only while Carriage was exporting. "
-                "Nothing was overwritten.",
-            )
-            return False
-
-        os.replace(temp_path, target_path)
-        temp_path = None
         show_message("Export complete", f"Wrote {out_path}")
         return True
     except (OSError, UnicodeError) as e:
         show_message("Export error", str(e))
         return False
-    finally:
-        if fd is not None:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-        if temp_path is not None:
-            try:
-                os.unlink(temp_path)
-            except OSError:
-                pass
-
 
 def _request_text_export(out_path, content):
     """Validate and confirm a text export destination before writing it."""
@@ -9562,123 +10315,212 @@ def _pandoc_args_define_output(args):
     return False
 
 
-def _perform_pandoc_export(out_path, source_text, extra_args, expected_snapshot):
-    """Run Pandoc into a staging file, then safely replace the destination."""
+def _new_file_mode_from_umask():
+    """Return the normal 0666-based creation mode on the UI thread.
+
+    ``os.umask`` is process-global, so Pandoc's worker thread must never toggle
+    it while the editor may be saving or doing other filesystem work. Capture
+    the intended mode before the background task starts and pass it in instead.
+    """
+    current_umask = os.umask(0)
+    os.umask(current_umask)
+    return 0o666 & ~current_umask
+
+
+def _perform_pandoc_export_worker(
+    out_path, source_text, extra_args, expected_snapshot, new_file_mode
+):
+    """Run one Pandoc export without touching prompt_toolkit UI state.
+
+    This function is deliberately safe to execute in a worker thread. It works
+    only from immutable call arguments plus filesystem state and returns a
+    ``(status, message)`` tuple for the UI coroutine to present afterward.
+    ``source_text`` is the materialized document snapshot captured before the
+    export was requested, so edits made while Pandoc runs cannot change the
+    bytes being exported.
+    """
     target_path = _canonical_path(out_path)
-    directory = os.path.dirname(target_path) or "."
     basename = os.path.basename(target_path)
     stem, extension = os.path.splitext(basename)
-    temp_path = None
-    fd = None
 
     try:
         # Confirmation is tied to a specific destination version. If it
         # changed while the user was deciding, do not overwrite the new one.
         if _disk_snapshot(target_path) != expected_snapshot:
-            show_message(
-                "Export destination changed",
+            return (
+                "destination_changed_before",
                 "The output file changed before export began. Nothing was overwritten. "
                 "Choose the export path again to review the current destination.",
             )
-            return False
 
         if (
             expected_snapshot != _MISSING_DISK_SNAPSHOT
             and _path_is_read_only(target_path)
         ):
-            show_message(
-                "Read-only export destination",
+            return (
+                "read_only_before",
                 "The export destination is marked read-only. Nothing was overwritten. "
                 "Choose a different filename.",
             )
-            return False
 
-        try:
-            existing_mode = stat.S_IMODE(os.stat(target_path).st_mode)
-        except FileNotFoundError:
-            existing_mode = None
-
-        fd, temp_path = tempfile.mkstemp(
-            prefix=f".{stem or basename}.",
-            suffix=extension or ".tmp",
-            dir=directory,
-        )
-        if existing_mode is not None:
-            os.fchmod(fd, existing_mode)
-        else:
-            current_umask = os.umask(0)
-            os.umask(current_umask)
-            os.fchmod(fd, 0o666 & ~current_umask)
-        os.close(fd)
-        fd = None
-
-        # Keep the real destination out of Pandoc's hands entirely. The
-        # staging filename retains the requested extension so Pandoc can infer
-        # PDF/DOCX/ODT/HTML/plain output exactly as before.
         pandoc = _configured_pandoc()
         if pandoc is None:
-            raise OSError(f"Configured Pandoc executable not found: {PANDOC_EXECUTABLE}")
-        cmd = [pandoc, "-f", "markdown"] + list(extra_args or []) + ["-o", temp_path]
-        subprocess.run(
-            cmd,
-            input=source_text,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-
-        # Flush Pandoc's completed output before making it visible at the
-        # destination pathname.
-        with open(temp_path, "rb") as f:
-            os.fsync(f.fileno())
-
-        # Recheck immediately before replacement. This cannot eliminate the
-        # tiny OS-level interval between check and rename, but it prevents the
-        # practical race where a destination changes during a long export.
-        if _disk_snapshot(target_path) != expected_snapshot:
-            show_message(
-                "Export destination changed",
-                "The output file changed while Pandoc was running. The newer file was "
-                "left untouched; the staged export was discarded.",
+            return (
+                "pandoc_error",
+                f"Configured Pandoc executable not found: {PANDOC_EXECUTABLE}",
             )
-            return False
 
-        if (
-            expected_snapshot != _MISSING_DISK_SNAPSHOT
-            and _path_is_read_only(target_path)
-        ):
-            show_message(
-                "Read-only export destination",
-                "The export destination became read-only while Pandoc was running. "
-                "Nothing was overwritten.",
+        def write_staged(temp_path):
+            # Keep the real destination out of Pandoc's hands entirely. The
+            # staging filename retains the requested extension so Pandoc can
+            # infer PDF/DOCX/ODT/HTML/plain output exactly as before.
+            cmd = [pandoc, "-f", "markdown"] + list(extra_args or []) + ["-o", temp_path]
+            subprocess.run(
+                cmd,
+                input=source_text,
+                check=True,
+                capture_output=True,
+                text=True,
             )
-            return False
 
-        os.replace(temp_path, target_path)
-        temp_path = None
-        show_message("Export complete", f"Wrote {out_path}")
-        return True
-    except subprocess.CalledProcessError as e:
-        show_message("Pandoc error", (e.stderr or str(e)).strip())
-        return False
+        def validate_before_replace():
+            # Recheck immediately before replacement. This cannot eliminate the
+            # tiny OS-level interval between check and rename, but it prevents
+            # the practical race where a destination changes during a long export.
+            if _disk_snapshot(target_path) != expected_snapshot:
+                return (
+                    "destination_changed_during",
+                    "The output file changed while Pandoc was running. The newer file was "
+                    "left untouched; the staged export was discarded.",
+                )
+            if (
+                expected_snapshot != _MISSING_DISK_SNAPSHOT
+                and _path_is_read_only(target_path)
+            ):
+                return (
+                    "read_only_during",
+                    "The export destination became read-only while Pandoc was running. "
+                    "Nothing was overwritten.",
+                )
+            return None
+
+        try:
+            _durable_atomic_replace(
+                target_path,
+                write_staged,
+                temp_prefix=f".{stem or basename}.",
+                temp_suffix=extension or ".tmp",
+                new_file_mode=new_file_mode,
+                preserve_existing_metadata=True,
+                reject_hardlinks=True,
+                validate_before_replace=validate_before_replace,
+            )
+        except subprocess.CalledProcessError as e:
+            return ("pandoc_error", (e.stderr or str(e)).strip())
+        except _AtomicReplaceCancelled as cancelled:
+            return cancelled.result
+        except _AtomicReplaceHardLinkError:
+            return (
+                "linked_destination",
+                "The export destination has multiple hard links. Atomic replacement would "
+                "break that link relationship, so nothing was overwritten. Choose a "
+                "different output filename.",
+            )
+        except _AtomicReplaceDurabilityError as e:
+            return (
+                "durability_error",
+                "The exported file is visible on disk, but Carriage could not confirm "
+                "that the directory update is durable. A sudden system crash could lose "
+                f"the rename.\n\nDirectory flush error: {e.original_error}",
+            )
+
+        return ("ok", f"Wrote {out_path}")
     except (OSError, UnicodeError) as e:
-        show_message("Pandoc error", str(e))
+        return ("pandoc_error", str(e))
+
+
+async def _perform_pandoc_export_async(
+    out_path, source_text, extra_args, expected_snapshot, new_file_mode
+):
+    """Run the blocking Pandoc/filesystem work without blocking the UI loop."""
+    return await asyncio.to_thread(
+        _perform_pandoc_export_worker,
+        out_path,
+        source_text,
+        tuple(extra_args or ()),
+        expected_snapshot,
+        new_file_mode,
+    )
+
+
+def _show_pandoc_export_result(status, message):
+    """Present one worker result on the prompt_toolkit/UI thread."""
+    if status == "ok":
+        show_message("Export complete", message)
+    elif status in {"destination_changed_before", "destination_changed_during"}:
+        show_message("Export destination changed", message)
+    elif status in {"read_only_before", "read_only_during"}:
+        show_message("Read-only export destination", message)
+    elif status == "linked_destination":
+        show_message("Linked export destination", message)
+    elif status == "durability_error":
+        show_message("Export durability warning", message)
+    else:
+        show_message("Pandoc error", message)
+
+
+def _start_pandoc_export(
+    out_path, source_text, extra_args, expected_snapshot, new_file_mode
+):
+    """Schedule one already-validated immutable Pandoc export snapshot."""
+    if state.pandoc_export_running:
+        show_message(
+            "Export already running",
+            "A Pandoc export is already in progress. Wait for it to finish before "
+            "starting another Pandoc export.",
+        )
         return False
-    finally:
-        if fd is not None:
+
+    # Claim the export slot synchronously before scheduling the coroutine. This
+    # closes the same-loop race where two menu actions could otherwise both
+    # schedule a task before either task had a chance to set the flag.
+    state.pandoc_export_running = True
+    get_app().invalidate()
+
+    async def run_export():
+        try:
+            status, message = await _perform_pandoc_export_async(
+                out_path,
+                source_text,
+                extra_args,
+                expected_snapshot,
+                new_file_mode,
+            )
+        except Exception as e:
+            status, message = "pandoc_error", str(e)
+        finally:
+            state.pandoc_export_running = False
             try:
-                os.close(fd)
-            except OSError:
+                get_app().invalidate()
+            except Exception:
                 pass
-        if temp_path is not None:
-            try:
-                os.unlink(temp_path)
-            except OSError:
-                pass
+
+        _show_pandoc_export_result(status, message)
+
+    get_app().create_background_task(run_export())
+    return True
 
 
 def _request_pandoc_export(out_path, source_text, extra_args=None):
     """Validate/confirm an export destination before Pandoc is run."""
+    if state.pandoc_export_running:
+        show_message(
+            "Export already running",
+            "A Pandoc export is already in progress. Wait for it to finish before "
+            "starting another Pandoc export.",
+        )
+        return
+
     if state.path is not None and _same_document_path(out_path, state.path):
         show_message(
             "Unsafe export path",
@@ -9703,12 +10545,15 @@ def _request_pandoc_export(out_path, source_text, extra_args=None):
         show_message("Error checking export destination", str(e))
         return
 
+    new_file_mode = _new_file_mode_from_umask()
+
     def perform():
-        _perform_pandoc_export(
+        _start_pandoc_export(
             out_path,
             source_text,
             extra_args or [],
             expected_snapshot=destination_snapshot,
+            new_file_mode=new_file_mode,
         )
 
     if destination_snapshot != _MISSING_DISK_SNAPSHOT:
@@ -9722,6 +10567,13 @@ def _request_pandoc_export(out_path, source_text, extra_args=None):
 
 
 def export_via_pandoc(fmt_label, ext, extra_args=None):
+    if state.pandoc_export_running:
+        show_message(
+            "Export already running",
+            "A Pandoc export is already in progress. Wait for it to finish before "
+            "starting another Pandoc export.",
+        )
+        return
     if _configured_pandoc() is None:
         show_message(
             "Pandoc not found",
@@ -9747,6 +10599,13 @@ def export_via_pandoc(fmt_label, ext, extra_args=None):
 
 
 def do_custom_export():
+    if state.pandoc_export_running:
+        show_message(
+            "Export already running",
+            "A Pandoc export is already in progress. Wait for it to finish before "
+            "starting another Pandoc export.",
+        )
+        return
     path_field = SingleLineInput(text=_default_export_path("out"))
     args_field = SingleLineInput(text="-t html --standalone")
 
@@ -10237,16 +11096,71 @@ def _heading_title(line):
     return parsed[1] if parsed is not None else None
 
 
+@dataclass(frozen=True)
+class _DocumentMetadata:
+    """Cached writer-facing metadata for one committed document generation.
+
+    The visible text object and the copy-on-write object dictionaries are used
+    as identity tokens. Cursor movement leaves all three identities unchanged,
+    while prose edits and committed table/footnote changes replace at least one
+    of them. This keeps repaint-only status work O(1) without tying display
+    metadata to the recovery journal's broader revision counter.
+    """
+
+    visible_text: str
+    tables: object
+    footnotes: object
+    word_count: int
+    heading_rows: tuple[int, ...]
+    heading_titles: tuple[str | None, ...]
+
+
+_document_metadata_cache = None
+
+
+def _document_metadata(visible_text=None):
+    """Return cached word-count and heading metadata for the main document."""
+    global _document_metadata_cache
+
+    if visible_text is None:
+        visible_text = text_area.text
+
+    cache = _document_metadata_cache
+    if (
+        cache is not None
+        and cache.visible_text is visible_text
+        and cache.tables is state.tables
+        and cache.footnotes is state.footnotes
+    ):
+        return cache
+
+    blocks = _analyze_document_layout(visible_text, WRAP_COLUMN)
+    heading_rows = []
+    heading_titles = []
+    for block in blocks:
+        if block.kind == "heading" and block.source_lines:
+            heading_rows.append(block.start)
+            heading_titles.append(_heading_title(block.source_lines[0]))
+
+    cache = _DocumentMetadata(
+        visible_text=visible_text,
+        tables=state.tables,
+        footnotes=state.footnotes,
+        word_count=_prose_word_count(visible_text, blocks=blocks),
+        heading_rows=tuple(heading_rows),
+        heading_titles=tuple(heading_titles),
+    )
+    _document_metadata_cache = cache
+    return cache
+
+
 def _current_section_title(doc):
     """Return the nearest recognized ATX heading at or before the cursor."""
-    cursor_row = doc.cursor_position_row
-    current = None
-    for block in _analyze_document_layout(doc.text, WRAP_COLUMN):
-        if block.start > cursor_row:
-            break
-        if block.kind == "heading" and block.source_lines:
-            current = _heading_title(block.source_lines[0])
-    return current
+    metadata = _document_metadata(doc.text)
+    index = bisect_right(metadata.heading_rows, doc.cursor_position_row) - 1
+    if index < 0:
+        return None
+    return metadata.heading_titles[index]
 
 
 def _document_progress(doc):
@@ -10258,11 +11172,7 @@ def _document_progress(doc):
 
 def _document_heading_rows(doc):
     """Return recognized ATX heading rows in document order."""
-    return [
-        block.start
-        for block in _analyze_document_layout(doc.text, WRAP_COLUMN)
-        if block.kind == "heading"
-    ]
+    return _document_metadata(doc.text).heading_rows
 
 
 def _move_editor_to_row(row, align_top=False):
@@ -10447,16 +11357,21 @@ def _count_raw_pipe_table_prose(source_lines):
     return total
 
 
-def _prose_word_count(visible_text):
+def _prose_word_count(visible_text, blocks=None):
     """Return a writer-facing word count for the current Carriage document.
 
     Markdown block/inline syntax does not count as language. Folded object
     content is counted from its in-memory data, so the status bar reflects what
     will be saved without counting placeholder labels or table separators.
+    ``blocks`` lets the metadata cache reuse the document analysis it already
+    needed for the heading index.
     """
     total = 0
 
-    for block in _analyze_document_layout(visible_text, WRAP_COLUMN):
+    if blocks is None:
+        blocks = _analyze_document_layout(visible_text, WRAP_COLUMN)
+
+    for block in blocks:
         if block.kind in {
             "blank",
             "front-matter",
@@ -10533,8 +11448,10 @@ def get_statusbar_text():
         return [("class:status", f" {transient} ")]
 
     doc = text_area.buffer.document
-    words = _prose_word_count(text_area.text)
-    section = _current_section_title(doc)
+    metadata = _document_metadata(doc.text)
+    words = metadata.word_count
+    section_index = bisect_right(metadata.heading_rows, doc.cursor_position_row) - 1
+    section = metadata.heading_titles[section_index] if section_index >= 0 else None
     progress = _document_progress(doc)
 
     try:
@@ -10553,6 +11470,8 @@ def get_statusbar_text():
     fields = [progress_field, section_field, word_field]
     if state.recovery_error:
         fields.append("recovery:error")
+    if state.pandoc_export_running:
+        fields.append("exporting")
     fields.append(command_field)
 
     # Keep navigation information together at the left, followed by
@@ -11172,6 +12091,29 @@ def _line_prefix_cell_width(row, wrap_count):
     return width
 
 
+_VISUAL_NAVIGATION_CACHE_ROWS = 64
+
+
+def _visual_navigation_cache_key(row, info):
+    """Return the layout generation key for one navigated logical row."""
+    if info is None or info.window_width <= 0:
+        return None
+    generation = getattr(text_area.window, "_height_cache_generation", 0)
+    try:
+        columns = get_app().output.get_size().columns
+    except Exception:
+        columns = None
+    return (generation, int(row), int(info.window_width), columns)
+
+
+def _store_bounded_visual_cache(cache, key, value):
+    """Keep navigation caches useful without retaining an unbounded row set."""
+    if key not in cache and len(cache) >= _VISUAL_NAVIGATION_CACHE_ROWS:
+        cache.pop(next(iter(cache)))
+    cache[key] = value
+    return value
+
+
 def _visual_display_positions(row, info):
     """Map processed display columns on one logical line to (wrap row, x).
 
@@ -11179,11 +12121,29 @@ def _visual_display_positions(row, info):
     operates only on one logical line and creates no screen. ``x`` is measured
     in rendered terminal cells inside the editor Window, after Carriage's
     display processor and continuation prefix have been applied.
+
+    Vertical navigation asks for this mapping repeatedly while moving through a
+    long soft-wrapped paragraph.  Cache it for the current text/layout
+    generation so the same transformed line is measured only once.
     """
-    if info is None or info.window_width <= 0:
+    key = _visual_navigation_cache_key(row, info)
+    if key is None:
         return None
+    cache = text_area.window._visual_positions_cache
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+
     try:
-        fragments = explode_text_fragments(info.ui_content.get_line(row))
+        get_processed = getattr(text_area.control, "_last_get_processed_line", None)
+        if get_processed is None:
+            return None
+        # BufferControl's processed-line cache already contains Carriage's
+        # transformed fragments. UIContent.get_line() wraps that same result
+        # and appends one cursor cell; avoid asking it to process the line again.
+        processed = get_processed(row)
+        fragments = explode_text_fragments(processed.fragments)
+        fragments.append(("", " "))
     except Exception:
         return None
 
@@ -11206,11 +12166,141 @@ def _visual_display_positions(row, info):
     # position of that cell; keeping the terminal position here is useful for
     # defensive/fallback mappings as well.
     positions.append((wrap_row, x))
-    return positions
+    return _store_bounded_visual_cache(cache, key, tuple(positions))
+
+
+def _visual_source_candidates(row, info):
+    """Return navigable source positions grouped by rendered wrap row.
+
+    This is the single source/display resolver used by Up/Down and Home/End.
+    Hidden structural prefixes, compact-footnote interiors, and positions after
+    folded-object sentinels are excluded explicitly rather than relying on
+    source-column tie breaking to make them unreachable by accident.
+    """
+    key = _visual_navigation_cache_key(row, info)
+    if key is None:
+        return None
+    cache = text_area.window._visual_candidates_cache
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+
+    doc = text_area.buffer.document
+    if not (0 <= row < doc.line_count):
+        return None
+
+    get_processed = getattr(text_area.control, "_last_get_processed_line", None)
+    positions = _visual_display_positions(row, info)
+    if get_processed is None or not positions:
+        return None
+    try:
+        processed = get_processed(row)
+    except Exception:
+        return None
+
+    source_line = doc.lines[row]
+    body_col = _hidden_structural_body_col(doc, row)
+    footnote_spans = tuple(_footnote_display_spans(doc.text, row))
+    compact_ranges = tuple(
+        (span[0], span[1])
+        for span in footnote_spans
+        if len(span) >= 5 and not span[4]
+    )
+    folded_footnote = any(len(span) >= 5 and span[4] for span in footnote_spans)
+    folded_visible_end = (
+        max(0, len(source_line) - 1)
+        if folded_footnote and source_line.endswith(FOOTNOTE_SENTINEL)
+        else None
+    )
+
+    by_wrap = {}
+    for source_col in range(len(source_line) + 1):
+        # Structural Markdown rendered in the hanging gutter is presentation,
+        # not ordinary caret space.
+        if source_col < body_col:
+            continue
+        # The source position after a folded-object sentinel is invisible. The
+        # canonical visible line end is immediately before the sentinel.
+        if (
+            source_col > 0
+            and source_line[source_col - 1:source_col]
+            in {TABLE_SENTINEL, FOOTNOTE_SENTINEL}
+        ):
+            continue
+        # Compact footnote source such as ``[^smith]`` is displayed as ``[1]``.
+        # Only the two visible object boundaries are legal cursor stops.
+        if any(start_col < source_col < end_col for start_col, end_col in compact_ranges):
+            continue
+        # A folded footnote definition is also one atomic visible object. Its
+        # source identifier is hidden behind ``[[Footnote N]]`` and must never
+        # become an intermediate cursor stop.
+        if (
+            folded_visible_end is not None
+            and source_col not in {0, folded_visible_end}
+        ):
+            continue
+
+        try:
+            display_col = processed.source_to_display(source_col)
+        except Exception:
+            continue
+        display_col = max(0, min(display_col, len(positions) - 1))
+        wrap_row, x = positions[display_col]
+        candidate = (x, source_col)
+        by_wrap.setdefault(wrap_row, []).append(candidate)
+
+    # Source order is normally already visual order, but sorting makes the
+    # boundary and nearest-x policies explicit even around transformed spans.
+    frozen_by_wrap = {
+        wrap_row: tuple(sorted(candidates, key=lambda item: (item[0], item[1])))
+        for wrap_row, candidates in by_wrap.items()
+    }
+    return _store_bounded_visual_cache(cache, key, frozen_by_wrap)
+
+
+def _normalize_visual_source_col(document, row, source_col):
+    """Snap a source column to an explicit visible cursor boundary."""
+    if not (0 <= row < document.line_count):
+        return source_col
+    source_line = document.lines[row]
+    source_col = max(0, min(len(source_line), int(source_col)))
+    source_col = max(source_col, _hidden_structural_body_col(document, row))
+
+    if (
+        source_col > 0
+        and source_line[source_col - 1:source_col]
+        in {TABLE_SENTINEL, FOOTNOTE_SENTINEL}
+    ):
+        source_col -= 1
+
+    spans = tuple(_footnote_display_spans(document.text, row))
+    for start_col, end_col, _label, _identifier, placeholder in spans:
+        if placeholder:
+            visible_end = (
+                max(0, len(source_line) - 1)
+                if source_line.endswith(FOOTNOTE_SENTINEL)
+                else len(source_line)
+            )
+            if 0 < source_col < visible_end:
+                return min(
+                    (0, visible_end),
+                    key=lambda boundary: (abs(boundary - source_col), boundary),
+                )
+        elif start_col < source_col < end_col:
+            return min(
+                (start_col, end_col),
+                key=lambda boundary: (abs(boundary - source_col), boundary),
+            )
+    return source_col
 
 
 def _source_visual_position(row, source_col, info):
-    """Return (wrap row, x) for one source cursor position."""
+    """Return (wrap row, x) for one explicit visible source position."""
+    doc = text_area.buffer.document
+    if not (0 <= row < doc.line_count):
+        return None
+    source_col = _normalize_visual_source_col(doc, row, source_col)
+
     get_processed = getattr(text_area.control, "_last_get_processed_line", None)
     if get_processed is None:
         return None
@@ -11227,49 +12317,19 @@ def _source_visual_position(row, source_col, info):
 
 
 def _source_col_for_visual_position(row, wrap_row, preferred_x, info):
-    """Return the source column nearest ``preferred_x`` on a rendered row."""
-    doc = text_area.buffer.document
-    if not (0 <= row < doc.line_count):
+    """Return the navigable source column nearest ``preferred_x``."""
+    by_wrap = _visual_source_candidates(row, info)
+    if by_wrap is None:
+        return None
+    row_candidates = by_wrap.get(wrap_row, ())
+    if not row_candidates:
         return None
 
-    get_processed = getattr(text_area.control, "_last_get_processed_line", None)
-    if get_processed is None:
-        return None
-    positions = _visual_display_positions(row, info)
-    if not positions:
-        return None
-
-    try:
-        processed = get_processed(row)
-    except Exception:
-        return None
-
-    source_line = doc.lines[row]
-    body_col = _hidden_structural_body_col(doc, row) if wrap_row == 0 else 0
-    best = None
-    for source_col in range(len(source_line) + 1):
-        if source_col < body_col:
-            continue
-        try:
-            display_col = processed.source_to_display(source_col)
-        except Exception:
-            continue
-        display_col = max(0, min(display_col, len(positions) - 1))
-        candidate_wrap, candidate_x = positions[display_col]
-        if candidate_wrap != wrap_row:
-            continue
-
-        distance = abs(candidate_x - preferred_x)
-        # When two source positions map to the same visual place (for example,
-        # inside a compact footnote display span), prefer a boundary closest to
-        # the requested x, then the earlier source position. Left/Right retain
-        # their existing atomic-object behavior once the cursor lands there.
-        score = (distance, source_col)
-        if best is None or score < best[0]:
-            best = (score, source_col)
-
-    return None if best is None else best[1]
-
+    _x, source_col = min(
+        row_candidates,
+        key=lambda item: (abs(item[0] - preferred_x), item[1]),
+    )
+    return source_col
 
 def _move_editor_cursor_visual_rows(delta):
     """Move the prose caret by one rendered screen row.
@@ -11435,7 +12495,7 @@ def _visual_row_boundary_source_index(row, wrap_row, end=False, info=None):
     This is the shared boundary resolver for Home/End and prose-gutter clicks.
     ``row`` is a logical source row and ``wrap_row`` is the zero-based visual
     row within it. Hidden compact-footnote source and folded-object sentinels
-    are never exposed as cursor stops.
+    are excluded by the same candidate resolver used by Up/Down.
     """
     doc = text_area.buffer.document
     if not (0 <= row < doc.line_count):
@@ -11457,55 +12517,15 @@ def _visual_row_boundary_source_index(row, wrap_row, end=False, info=None):
     if info is None or info.window_width <= 0:
         return physical_boundary()
 
-    get_processed = getattr(text_area.control, "_last_get_processed_line", None)
-    positions = _visual_display_positions(row, info)
-    if get_processed is None or not positions:
+    by_wrap = _visual_source_candidates(row, info)
+    if by_wrap is None:
+        return physical_boundary()
+    row_candidates = by_wrap.get(wrap_row, ())
+    if not row_candidates:
         return physical_boundary()
 
-    try:
-        processed = get_processed(row)
-    except Exception:
-        return physical_boundary()
-
-    compact_ranges = [
-        (span[0], span[1])
-        for span in _footnote_display_spans(doc.text, row)
-        if len(span) >= 5 and not span[4]
-    ]
-    body_col = _hidden_structural_body_col(doc, row) if wrap_row == 0 else 0
-    candidates = []
-    for source_col in range(len(source_line) + 1):
-        if source_col < body_col:
-            continue
-        if (
-            source_col > 0
-            and source_line[source_col - 1:source_col]
-            in {TABLE_SENTINEL, FOOTNOTE_SENTINEL}
-        ):
-            continue
-        if any(
-            start_col < source_col < end_col
-            for start_col, end_col in compact_ranges
-        ):
-            continue
-        try:
-            display_col = processed.source_to_display(source_col)
-        except Exception:
-            continue
-        display_col = max(0, min(display_col, len(positions) - 1))
-        candidate_wrap, x = positions[display_col]
-        if candidate_wrap == wrap_row:
-            candidates.append((x, source_col))
-
-    if not candidates:
-        return physical_boundary()
-
-    if end:
-        _x, source_col = max(candidates, key=lambda item: (item[0], item[1]))
-    else:
-        _x, source_col = min(candidates, key=lambda item: (item[0], item[1]))
+    _x, source_col = row_candidates[-1] if end else row_candidates[0]
     return doc.translate_row_col_to_index(row, source_col)
-
 
 def _visual_row_boundary_target(end=False):
     """Return the source index at the start/end of the current rendered row."""
@@ -11975,15 +12995,44 @@ def _create_application():
     )
 
 
-def _start_background_tasks(startup_error=None, recovery_source_path=None, offer_any_recovery=False):
+def _format_config_startup_warning(diagnostics):
+    path = _config_path()
+    details = "\n".join(f"- {message}" for message in diagnostics)
+    return (
+        f"Carriage found configuration problems in:\n{path}\n\n"
+        f"{details}\n\nValid settings were kept where possible. "
+        "Ignored or unreadable settings use Carriage defaults."
+    )
+
+
+def _start_background_tasks(
+    startup_error=None,
+    recovery_source_path=None,
+    offer_any_recovery=False,
+    config_diagnostics=None,
+):
     application.create_background_task(_working_state_loop())
-    if startup_error is not None:
-        title, message = startup_error
-        show_message(title, message)
-    elif recovery_source_path is not None:
-        _offer_stale_recovery(recovery_source_path)
-    elif offer_any_recovery:
-        _offer_stale_recovery()
+
+    def continue_startup():
+        # Preserve the pre-v1.139 startup precedence: a requested file-open
+        # error is shown instead of offering recovery for that launch.
+        if startup_error is not None:
+            title, message = startup_error
+            show_message(title, message)
+        elif recovery_source_path is not None:
+            _offer_stale_recovery(recovery_source_path)
+        elif offer_any_recovery:
+            _offer_stale_recovery()
+
+    diagnostics = list(config_diagnostics or ())
+    if diagnostics:
+        show_message(
+            "Configuration warning",
+            _format_config_startup_warning(diagnostics),
+            on_close=continue_startup,
+        )
+    else:
+        continue_startup()
 
 
 def _parse_command_line(argv=None):
@@ -12027,7 +13076,10 @@ def main(argv=None):
         return 2
 
     startup_error = None
-    _ensure_config_file()
+    config_diagnostics = list(_CONFIG_DIAGNOSTICS)
+    config_creation_warning = _ensure_config_file()
+    if config_creation_warning is not None:
+        config_diagnostics.append(config_creation_warning)
 
     if args.file is not None:
         path = os.path.expanduser(args.file)
@@ -12054,6 +13106,7 @@ def main(argv=None):
             startup_error,
             recovery_source_path=(state.path if args.file is not None else None),
             offer_any_recovery=(args.file is None),
+            config_diagnostics=config_diagnostics,
         )
     )
 
