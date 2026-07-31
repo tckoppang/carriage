@@ -39,10 +39,19 @@ Conversion brings supported, valid Markdown into Carriage's preferred source for
 - converts Setext headings to ATX headings
 - normalizes supported ATX heading form
 - renumbers simple ordered lists consecutively from the first item's existing number
+- normalizes straightforward underscore-delimited emphasis to Carriage's preferred asterisk form
 - joins supported hard-wrapped prose into logical source lines
 - preserves original Markdown hard breaks and structural blocks whose physical layout is significant
 
 Conversion is intentionally conservative. It is a normalization command, not a Markdown repair tool; complex structures outside Carriage's supported conversion model are left unchanged.
+
+### Emphasis
+
+Carriage uses asterisks as its preferred emphasis style: `*italic*`, `**bold**`, and `***bold italic***`. Select text and press `F2` to toggle italic or `F3` to toggle bold. The two attributes are independent, so applying both shortcuts to the same selection produces bold italic text.
+
+The selected words remain selected after a successful toggle, which makes successive formatting commands practical. Leading and trailing whitespace stays outside the emphasis markers. Carriage-generated emphasis always uses asterisks, but ordinary editing respects clear preexisting `_italic_`, `__bold__`, and `___bold italic___` forms. **Edit > Convert for Carriage** can normalize straightforward underscore emphasis to asterisks.
+
+Formatting is deliberately selection-based rather than modal. F2 and F3 do not start an italic or bold typing mode. If a selection crosses a source line, overlaps protected Markdown syntax, contains mixed or ambiguous emphasis, or otherwise cannot be changed confidently, Carriage leaves the source and selection untouched and briefly explains the no-op on the status line.
 
 ### Hard line breaks
 
@@ -60,7 +69,7 @@ In the prose view, a table is folded into a compact reference such as:
 [[Table 1: Movement Rates]]
 ```
 
-Pressing `Tab` on the reference opens the table editor for supported tables of two through six columns. Tables can have titles, and rows, columns, headers, and cell contents can be edited without turning the main writing view into a grid of Markdown syntax. Existing Markdown column alignment is preserved when tables are edited.
+Pressing `Tab` on the reference opens the table editor for supported tables of two through six columns. `F4` or **Tools > Insert Table** creates a new table. Tables can have titles, and rows, columns, headers, and cell contents can be edited without turning the main writing view into a grid of Markdown syntax. Existing Markdown column alignment is preserved when tables are edited.
 
 The table editor has a navigation mode and a cell-editing mode. Arrow keys move among cells, `Enter` edits the selected cell, `R` opens row commands, and `C` opens column commands. In editable table text, the normal `Ctrl+X`, `Ctrl+C`, and `Ctrl+V` cut, copy, and paste shortcuts remain available.
 
@@ -70,7 +79,7 @@ On disk, the table remains a Markdown pipe table; optional titles use Pandoc-sty
 
 Carriage also provides first-class support for simple Pandoc-style Markdown footnotes.
 
-References are displayed as sequential footnote numbers in the prose view, while their definitions are folded out of the main text. Pressing `Tab` at a footnote opens its dedicated editor. The footnote editor uses the same `Ctrl+X`, `Ctrl+C`, and `Ctrl+V` cut, copy, and paste shortcuts as the main editor. `Enter` or `Ctrl+S` saves the footnote, and `Esc` cancels.
+References are displayed as sequential footnote numbers in the prose view, while their definitions are folded out of the main text. `F5` or **Tools > Insert Footnote** creates a new footnote, and pressing `Tab` at an existing footnote opens its dedicated editor. The footnote editor uses the same `Ctrl+X`, `Ctrl+C`, and `Ctrl+V` cut, copy, and paste shortcuts as the main editor. `Enter` or `Ctrl+S` saves the footnote, and `Esc` cancels.
 
 The saved document uses Pandoc-style Markdown footnote syntax. More complex footnotes that Carriage does not support as objects remain ordinary source.
 
@@ -92,16 +101,13 @@ After an abnormal exit, Carriage detects an abandoned recovery journal and offer
 
 Carriage also tracks the exact version of the source file that was opened or last successfully saved. If another program changes, replaces, or deletes that file before the next manual save, Carriage detects the conflict rather than silently overwriting the external changes.
 
-## Preferences
+## Configuration
 
-**Edit > Preferences** exposes the small set of settings intended for routine adjustment:
+Carriage has no Preferences dialog. Persistent settings are stored in `$XDG_CONFIG_HOME/carriage/config.toml`, or `~/.config/carriage/config.toml` when `XDG_CONFIG_HOME` is not set. Carriage creates the file on first launch, and configuration changes take effect the next time Carriage starts.
 
-- prose width, from 40 to 160 columns
-- scrollbar on or off
+The principal settings are `editor.prose_width`, from 40 to 160 columns, and `interface.scrollbar`, which controls whether the editor scrollbar is shown. The same file also contains lower-level settings for startup status-bar visibility, mouse support, the hard-break marker, the Pandoc executable, and the external spell-check command.
 
-Working-state protection is automatic and is not a preference. Carriage stores settings in `$XDG_CONFIG_HOME/carriage/config.toml`, or `~/.config/carriage/config.toml` when `XDG_CONFIG_HOME` is not set. A few advanced settings can be edited there manually, including startup status-bar visibility, mouse support, the hard-break marker, the Pandoc executable, and the external spell-check command.
-
-The **Edit > Toggle Status Bar** command changes status-bar visibility for the current session only.
+Working-state protection is automatic and is not configurable. The **Edit > Toggle Status Bar** command changes status-bar visibility for the current session only.
 
 ## Export
 
@@ -280,12 +286,17 @@ Carriage uses familiar editing shortcuts where the terminal permits them:
 | `Ctrl+V` | Paste |
 | `Ctrl+Q` | Quit |
 | `F1` | Carriage Help |
+| `F2` | Toggle italic on selected text |
+| `F3` | Toggle bold on selected text |
+| `F4` | Insert table |
+| `F5` | Insert footnote |
 | `F6` | Toggle Extend Selection mode |
 | `F7` | Spell check |
 | `F8` | Renumber the numbered list at the cursor |
 | `F10` / `Ctrl+Space` | Open the menu bar |
+| `Home` / `End` | Go to start / end of the current displayed row |
 | `Ctrl+Home` / `Ctrl+End` | Go to top / end of document |
-| `Alt+Up` / `Alt+Down` | Previous / next section |
+| `Alt+Up` / `Alt+Down` | Previous / next section; align the target ATX heading at the top of the editor |
 | `Tab` | Indent, or open a folded table or footnote |
 
 ### Selection
@@ -297,12 +308,12 @@ Press `F6` to enter Extend Selection mode. While it is active:
 - `Left` / `Right` extends by character
 - `Up` / `Down` extends by displayed row
 - `Ctrl+Left` / `Ctrl+Right` extends by word
-- `Home` / `End` extends to the current line boundary
+- `Home` / `End` extends to the current displayed-row boundary
 - `Ctrl+Home` / `Ctrl+End` extends to the document boundary
 
-Press `F6` again to leave Extend Selection mode while keeping the selection. With mouse support enabled, double-click selects a word and triple-click selects the current paragraph or list item.
+Press `F6` again to leave Extend Selection mode while keeping the selection. Structural Markdown displayed in the hanging gutter is not a cursor destination: keyboard and mouse navigation stop at the visible prose boundary. Backspace at that boundary can still remove the associated structure, such as a list marker, heading marker, or blockquote marker. With mouse support enabled, clicking in the left prose gutter moves the cursor to the beginning of that displayed row, while clicking in the right prose gutter moves it to the end. The scrollbar remains reserved for scrolling. Double-click selects a word and triple-click selects the current paragraph or list item.
 
-Status-bar visibility is controlled from **Edit > Toggle Status Bar** rather than by a dedicated keyboard shortcut. The interface is intended to expose document operations through menus without requiring users to memorize a large command set.
+Status-bar visibility is controlled from **Edit > Toggle Status Bar** rather than by a dedicated keyboard shortcut. Transient notices temporarily take over the full status line. When the normal status bar is hidden, those notices still appear briefly in the same bottom-line position. The interface is intended to expose document operations through menus without requiring users to memorize a large command set.
 
 ## Design philosophy
 

@@ -16,9 +16,10 @@ line. These display conventions never alter the source.
 
 Edit > Convert for Carriage converts valid original Markdown, plus supported
 pipe tables and footnotes, into Carriage's preferred source form. It converts
-Setext headings to ATX headings, corrects simple ordered-list numbering, and
-joins hard-wrapped prose into logical source lines while preserving
-line-sensitive structures and Markdown meaning. Export > Hard-Wrapped Markdown
+Setext headings to ATX headings, corrects simple ordered-list numbering,
+normalizes straightforward underscore emphasis to Carriage's preferred
+asterisk form, and joins hard-wrapped prose into logical source lines while
+preserving line-sensitive structures and Markdown meaning. Export > Hard-Wrapped Markdown
 creates a separate hard-wrapped Markdown copy at the configured prose width
 without modifying the working file.
 
@@ -30,20 +31,19 @@ opens the associated footnote editor. Folded tables and footnotes behave as
 atomic objects in the prose editor; more complex footnotes remain ordinary
 Markdown source.
 
-Carriage includes prose-aware word counting, lightweight Markdown
-highlighting, mouse support, document and section navigation, configurable
-terminal spell checking, and Pandoc export to PDF, DOCX, ODT, HTML, and custom
-formats.
+Carriage includes selection-based italic and bold toggles, prose-aware word
+counting, lightweight Markdown highlighting, mouse support, document and section
+navigation, configurable terminal spell checking, and Pandoc export to PDF,
+DOCX, ODT, HTML, and custom formats.
 
 File operations include New, Open, Save, and Save As. Untitled documents use
 the first recognized ATX heading as the suggested `.md` filename when
 available. Unsaved working state is continuously protected in a private recovery journal
 without changing the Markdown file. The document on disk advances only through
 explicit Save or Save As operations, which use durable atomic replacement and
-protect against external file changes. Preferences for prose width and scrollbar
-visibility are stored in `config.toml` under the user's standard configuration
-directory. A small set of advanced interface and tool settings can be edited
-there manually.
+protect against external file changes. Persistent settings, including prose width
+and scrollbar visibility, are stored in `config.toml` under the user's standard
+configuration directory and can be edited manually.
 
 Requires:
   pip install prompt_toolkit --break-system-packages
@@ -87,9 +87,10 @@ from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.clipboard.base import ClipboardData
 from prompt_toolkit.document import Document
 from prompt_toolkit.data_structures import Point
-from prompt_toolkit.filters import Condition
+from prompt_toolkit.filters import Condition, has_completions, has_focus
 from prompt_toolkit.filters.app import buffer_has_focus
 from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.key_binding.bindings.focus import focus_next, focus_previous
 from prompt_toolkit.lexers import Lexer
 from prompt_toolkit.layout.containers import (
     Float,
@@ -98,6 +99,7 @@ from prompt_toolkit.layout.containers import (
     ConditionalContainer,
     Window,
     WindowAlign,
+    VSplit,
 )
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.layout.processors import Processor, Transformation
@@ -105,22 +107,25 @@ from prompt_toolkit.layout.utils import explode_text_fragments
 from prompt_toolkit.layout.dimension import D
 from prompt_toolkit.layout.layout import Layout
 from prompt_toolkit.layout.margins import Margin
+from prompt_toolkit.layout.screen import Char
 from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
 from prompt_toolkit.selection import SelectionType
 from prompt_toolkit.styles import Style
 from prompt_toolkit.utils import get_cwidth
 from prompt_toolkit.widgets import (
+    Box,
     Button,
-    Checkbox,
     Dialog,
+    Frame,
     Label,
     MenuContainer,
     MenuItem,
+    Shadow,
     TextArea,
 )
 
 APP_NAME = "Carriage"
-APP_VERSION = "1.92"
+APP_VERSION = "1.125"
 
 DEFAULT_WRAP_COLUMN = 80
 DEFAULT_SCROLLBAR_VISIBLE = True
@@ -128,6 +133,27 @@ DEFAULT_STATUSBAR_VISIBLE = True
 DEFAULT_MOUSE_ENABLED = True
 DEFAULT_HARD_BREAK_MARKER_VISIBLE = True
 DEFAULT_PANDOC_EXECUTABLE = "pandoc"
+
+
+def _display_char_width(char):
+    """Return the terminal-cell width prompt_toolkit will actually render.
+
+    ``get_cwidth`` reports control characters such as a literal tab as zero
+    width, while prompt_toolkit's ``Char`` screen object displays them using a
+    printable control-character mapping (a tab becomes ``^I``). Cursor geometry
+    must use the rendered width or visual navigation can drift from the screen.
+    """
+    if not char:
+        return 0
+    rendered = Char.display_mappings.get(char, char)
+    return max(0, get_cwidth(rendered))
+
+
+def _display_text_width(text):
+    """Return rendered terminal-cell width using prompt_toolkit semantics."""
+    return sum(_display_char_width(char) for char in text or "")
+
+
 DEFAULT_SPELLCHECK_COMMAND = ["aspell", "--mode=markdown", "check", "{file}"]
 MIN_WRAP_COLUMN = 40
 MAX_WRAP_COLUMN = 160
@@ -256,7 +282,7 @@ def _validate_config(raw):
     return cfg
 
 
-def _load_preferences():
+def _load_config():
     """Load Carriage's TOML configuration, falling back to defaults."""
     try:
         raw = _read_toml_file(_config_path())
@@ -274,9 +300,9 @@ def _serialize_config_toml(config):
     spell = ", ".join(_toml_string(arg) for arg in config["spellcheck_command"])
     return (
         "# Carriage configuration\n"
-        "# Preferences exposes prose_width and scrollbar.\n"
-        "# Unsaved working state is protected automatically and is not configurable.\n"
-        "# The other settings are advanced options intended for manual editing.\n\n"
+        "# Persistent settings are read at startup.\n"
+        "# Edit this file manually; Carriage has no Preferences dialog.\n"
+        "# Unsaved working state is protected automatically and is not configurable.\n\n"
         "[editor]\n"
         f"prose_width = {int(config['prose_width'])}\n\n"
         "[interface]\n"
@@ -295,32 +321,12 @@ def _serialize_config_toml(config):
     )
 
 
-def _write_preferences_values(prose_width, scrollbar):
-    """Atomically persist preferences while preserving advanced settings."""
+def _write_config(config):
+    """Atomically write a complete validated Carriage configuration."""
     path = _config_path()
     directory = os.path.dirname(path)
     os.makedirs(directory, exist_ok=True)
-
-    # Preferences exposes only two settings. Reload the current config before
-    # writing so advanced values edited manually while Carriage is running are
-    # preserved rather than replaced by the startup-time globals.
-    try:
-        payload = _validate_config(_read_toml_file(path))
-    except FileNotFoundError:
-        payload = _default_config()
-    except (OSError, UnicodeError, ValueError) as exc:
-        # Do not overwrite an existing config that we could not safely parse.
-        # Callers already surface OSError as a Preferences-save failure.
-        raise OSError(
-            f"Could not read existing Carriage configuration: {exc}"
-        ) from exc
-
-    payload.update(
-        {
-            "prose_width": int(prose_width),
-            "scrollbar": bool(scrollbar),
-        }
-    )
+    payload = _validate_config(config)
     fd, temp_path = tempfile.mkstemp(prefix=".config-", suffix=".tmp", dir=directory)
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
@@ -349,14 +355,14 @@ def _write_preferences_values(prose_width, scrollbar):
                 pass
 
 
-_PREFERENCES = _load_preferences()
-WRAP_COLUMN = _PREFERENCES["prose_width"]
-SCROLLBAR_VISIBLE = _PREFERENCES["scrollbar"]
-STATUSBAR_DEFAULT_VISIBLE = _PREFERENCES["statusbar"]
-MOUSE_ENABLED = _PREFERENCES["mouse"]
-HARD_BREAK_MARKER_VISIBLE = _PREFERENCES["hard_break_marker"]
-PANDOC_EXECUTABLE = _PREFERENCES["pandoc"]
-SPELLCHECK_COMMAND = tuple(_PREFERENCES["spellcheck_command"])
+_CONFIG = _load_config()
+WRAP_COLUMN = _CONFIG["prose_width"]
+SCROLLBAR_VISIBLE = _CONFIG["scrollbar"]
+STATUSBAR_DEFAULT_VISIBLE = _CONFIG["statusbar"]
+MOUSE_ENABLED = _CONFIG["mouse"]
+HARD_BREAK_MARKER_VISIBLE = _CONFIG["hard_break_marker"]
+PANDOC_EXECUTABLE = _CONFIG["pandoc"]
+SPELLCHECK_COMMAND = tuple(_CONFIG["spellcheck_command"])
 
 STRUCTURE_GUTTER_WIDTH = 8
 TAB_WIDTH = 4
@@ -757,6 +763,12 @@ class EditorState:
     def __init__(self):
         self.path = None
         self.statusbar_visible = STATUSBAR_DEFAULT_VISIBLE
+        # Transient notices always occupy the status-line position. When the
+        # ordinary status bar is hidden, a one-row overlay appears there only
+        # for the lifetime of the notice, so editor geometry never jumps.
+        self.transient_status_message = None
+        self.transient_status_expires_at = 0.0
+        self.transient_status_generation = 0
         # F6 toggles a portable Extend Selection mode. This is session state,
         # not a preference, and any document edit returns to normal movement.
         self.extend_selection_mode = False
@@ -1039,6 +1051,52 @@ def _clamp_content_mouse_y(requested_y, y_min, y_max, last_content_y):
     return min(y, last_content_y)
 
 
+def _calculate_scrollbar_thumb_geometry(
+    track_height,
+    viewport_height,
+    total_height,
+    rendered_top,
+    force_bottom=False,
+):
+    """Return ``(thumb_top, thumb_height)`` in scrollbar-track rows.
+
+    The track excludes optional arrow rows.  ``rendered_top`` and the height
+    values are measured in actual soft-wrapped display rows.  Keeping this
+    arithmetic in one pure helper makes the two endpoint invariants explicit:
+
+    * at the top, the first thumb row is the first track row;
+    * at the bottom, the final thumb row is the final track row.
+    """
+    track_height = max(0, int(track_height))
+    if track_height <= 0:
+        return 0, 0
+
+    viewport_height = max(1, int(viewport_height))
+    total_height = max(0, int(total_height))
+    rendered_top = max(0, int(rendered_top))
+
+    if total_height <= viewport_height:
+        return 0, track_height
+
+    # Keep a long-document thumb visible without making it visually dominant.
+    min_thumb_height = 2 if track_height >= 2 else 1
+    proportional = int(round(track_height * viewport_height / float(total_height)))
+    thumb_height = max(min_thumb_height, min(track_height, proportional))
+
+    max_document_top = max(0, total_height - viewport_height)
+    max_thumb_top = max(0, track_height - thumb_height)
+    if max_thumb_top <= 0:
+        return 0, thumb_height
+
+    if force_bottom or rendered_top >= max_document_top:
+        return max_thumb_top, thumb_height
+
+    thumb_top = int(round(
+        max_thumb_top * min(rendered_top, max_document_top) / float(max_document_top)
+    ))
+    return max(0, min(max_thumb_top, thumb_top)), thumb_height
+
+
 class RenderedScrollbarMargin(Margin):
     """Scrollbar whose thumb reflects actual soft-wrapped screen rows.
 
@@ -1057,6 +1115,26 @@ class RenderedScrollbarMargin(Margin):
     def get_width(self, get_ui_content):
         return 1
 
+    def _force_bottom(self, window, rendered_top, max_document_top):
+        """Whether the thumb must be drawn flush with the bottom of its track.
+
+        In manual-scroll mode the viewport, not the insertion cursor, owns the
+        scrollbar, so only the rendered viewport position can establish the
+        bottom.  In normal editing mode prompt_toolkit keeps the insertion
+        cursor visible.  Therefore a cursor at the final source insertion point
+        is definitive evidence that Carriage is at the document end; no
+        reconstructed source/display mapping is needed.
+        """
+        if rendered_top >= max_document_top:
+            return True
+        if getattr(window, "manual_scroll_active", False):
+            return False
+        try:
+            buffer = window.content.buffer
+            return buffer.cursor_position == len(buffer.text)
+        except (AttributeError, TypeError):
+            return False
+
     def create_margin(self, window_render_info, width, height):
         if width <= 0 or height <= 0:
             return []
@@ -1073,23 +1151,22 @@ class RenderedScrollbarMargin(Margin):
         )
         total_height = prefix[-1] if heights and prefix else 0
         viewport_height = max(1, window_render_info.window_height)
-
-        if total_height <= 0:
-            thumb_height = track_height
-            thumb_top = 0
-        else:
-            thumb_height = max(1, min(
-                track_height,
-                int(round(track_height * min(1.0, viewport_height / float(total_height)))),
-            ))
-            max_top = max(0, total_height - viewport_height)
-            max_thumb_top = max(0, track_height - thumb_height)
-            if max_top <= 0 or max_thumb_top <= 0:
-                thumb_top = 0
-            else:
-                rendered_top = window._absolute_rendered_scroll(heights, prefix)
-                thumb_top = int(round(max_thumb_top * rendered_top / float(max_top)))
-                thumb_top = max(0, min(max_thumb_top, thumb_top))
+        rendered_top = (
+            window._absolute_rendered_scroll(heights, prefix)
+            if heights and prefix
+            else 0
+        )
+        max_document_top = max(0, total_height - viewport_height)
+        force_bottom = self._force_bottom(
+            window, rendered_top, max_document_top
+        )
+        thumb_top, thumb_height = _calculate_scrollbar_thumb_geometry(
+            track_height=track_height,
+            viewport_height=viewport_height,
+            total_height=total_height,
+            rendered_top=rendered_top,
+            force_bottom=force_bottom,
+        )
 
         result = []
         if display_arrows:
@@ -1100,19 +1177,14 @@ class RenderedScrollbarMargin(Margin):
 
         thumb_end = thumb_top + thumb_height
         for row in range(track_height):
-            in_thumb = thumb_top <= row < thumb_end
-            if in_thumb:
-                style = (
-                    "class:scrollbar.button,scrollbar.end"
-                    if row == thumb_end - 1
-                    else "class:scrollbar.button"
-                )
-            else:
-                style = (
-                    "class:scrollbar.background,scrollbar.start"
-                    if row + 1 == thumb_top
-                    else "class:scrollbar.background"
-                )
+            # Use one unambiguous style for every cell in each region.  The
+            # previous compound end/start styles were unnecessary and made the
+            # final painted thumb cell harder to reason about and test.
+            style = (
+                "class:scrollbar.button"
+                if thumb_top <= row < thumb_end
+                else "class:scrollbar.background"
+            )
             result.append((style, " "))
             if row < track_height - 1 or display_arrows:
                 result.append(("", "\n"))
@@ -1232,6 +1304,10 @@ class ScrollableWindow(Window):
         self, rendered_row, heights=None, prefix=None, window_height=None
     ):
         """Set a cursor-independent viewport top from a rendered-row index."""
+        # Any explicit viewport scroll cancels a section-navigation top anchor.
+        # Otherwise ending a manual scroll while the caret remained on the
+        # heading could unexpectedly snap the heading back to the top.
+        self._section_top_anchor_row = None
         info = self.render_info
         if heights is None or prefix is None:
             cached_heights, cached_prefix = self._rendered_height_geometry()
@@ -1273,8 +1349,25 @@ class ScrollableWindow(Window):
         self.manual_scroll_active = False
 
     def _scroll(self, ui_content, width, height):
-        """Honor manual viewport scrolling without forcing the cursor into view."""
+        """Honor manual scrolling and section-heading viewport alignment."""
         if not self.manual_scroll_active:
+            anchor = getattr(self, "_section_top_anchor_row", None)
+            if (
+                anchor is not None
+                and 0 <= anchor < ui_content.line_count
+                and ui_content.cursor_position.y == anchor
+            ):
+                # Section navigation is deliberately stronger than
+                # prompt_toolkit's normal keep-cursor-visible behavior: the
+                # target ATX heading belongs on the first visible editor row,
+                # even near EOF where that leaves blank rows below it. Keep
+                # the anchor active until some other cursor/edit/scroll action
+                # cancels it, otherwise a later repaint would clamp the view
+                # back upward to keep the bottom of the document filled.
+                self.horizontal_scroll = 0
+                self.vertical_scroll = anchor
+                self.vertical_scroll_2 = 0
+                return
             return super()._scroll(ui_content, width, height)
 
         self.horizontal_scroll = 0
@@ -1398,12 +1491,120 @@ class ScrollableWindow(Window):
                 handler=content_handler,
             )
 
-        if self.on_scrollbar_interact is None or not self.right_margins:
+            def gutter_boundary_target(screen_y, end=False):
+                """Map an outer-margin click to this displayed row's boundary."""
+                y = _clamp_content_mouse_y(
+                    screen_y,
+                    content_y_min,
+                    content_y_max,
+                    last_content_y,
+                )
+
+                # Find any processed display column actually painted on this
+                # screen row. Its logical row plus visual-wrap number are enough
+                # to reuse the exact Home/End boundary resolver.
+                painted = [
+                    (x, row, col)
+                    for (row, col), (mapped_y, x) in info._rowcol_to_yx.items()
+                    if mapped_y == y
+                    and content_x_min <= x < content_x_max
+                ]
+                if painted:
+                    _x, row, display_col = min(painted)
+                    positions = _visual_display_positions(row, info)
+                    if positions:
+                        display_col = max(0, min(display_col, len(positions) - 1))
+                        wrap_row = positions[display_col][0]
+                        return _visual_row_boundary_source_index(
+                            row, wrap_row, end=end, info=info
+                        )
+
+                # Empty lines may have no painted input cell. WindowRenderInfo
+                # still records which logical line owns every visible row.
+                visible_y = y - info._y_offset
+                rowcol = info.visible_line_to_row_col.get(visible_y)
+                if rowcol is not None:
+                    row, display_col = rowcol
+                    positions = _visual_display_positions(row, info)
+                    wrap_row = 0
+                    if positions:
+                        display_col = max(0, min(display_col, len(positions) - 1))
+                        wrap_row = positions[display_col][0]
+                    return _visual_row_boundary_source_index(
+                        row, wrap_row, end=end, info=info
+                    )
+                return None
+
+            def make_gutter_handler(end=False):
+                def gutter_handler(mouse_event):
+                    if mouse_event.event_type == MouseEventType.SCROLL_UP:
+                        self._scroll_up()
+                        return None
+                    if mouse_event.event_type == MouseEventType.SCROLL_DOWN:
+                        self._scroll_down()
+                        return None
+                    if mouse_event.event_type != MouseEventType.MOUSE_DOWN:
+                        # A gutter click is a positioning gesture, not a
+                        # double/triple-click or drag-selection surface.
+                        return None
+
+                    target = gutter_boundary_target(mouse_event.position.y, end=end)
+                    if target is None:
+                        return None
+
+                    self.end_manual_scroll()
+                    app = get_app()
+                    if app.layout.current_control is not self.content:
+                        app.layout.current_control = self.content
+                    buffer = self.content.buffer
+                    buffer.exit_selection()
+                    buffer.cursor_position = max(0, min(len(buffer.text), target))
+                    reset_clicks = getattr(
+                        self.content, "_reset_carriage_click_sequence", None
+                    )
+                    if reset_clicks is not None:
+                        reset_clicks()
+                    app.invalidate()
+                    return None
+
+                return gutter_handler
+
+            left_padding_width = max(0, content_x_min - write_position.xpos)
+            if left_padding_width > 0:
+                mouse_handlers.set_mouse_handler_for_range(
+                    x_min=write_position.xpos,
+                    x_max=content_x_min,
+                    y_min=content_y_min,
+                    y_max=content_y_max,
+                    handler=make_gutter_handler(end=False),
+                )
+
+            # The first right margin is Carriage's transparent centering
+            # padding. The optional final right margin is the scrollbar and is
+            # deliberately excluded from gutter-click behavior.
+            right_padding_width = 0
+            if self.right_margins:
+                right_padding_width = self._get_margin_width(self.right_margins[0])
+            if right_padding_width > 0:
+                mouse_handlers.set_mouse_handler_for_range(
+                    x_min=content_x_max,
+                    x_max=content_x_max + right_padding_width,
+                    y_min=content_y_min,
+                    y_max=content_y_max,
+                    handler=make_gutter_handler(end=True),
+                )
+
+        if (
+            self.on_scrollbar_interact is None
+            or not self.right_margins
+            or not isinstance(self.right_margins[-1], RenderedScrollbarMargin)
+        ):
             return
 
-        # The prose-centering spacer is also a right margin, but only the
-        # final margin is the actual scrollbar. Keep mouse handling pinned to
-        # that far-right column instead of making the empty spacer clickable.
+        # The prose-centering spacer is also a right margin, but only an actual
+        # RenderedScrollbarMargin owns scrollbar interaction. When the scrollbar
+        # scrollbar is disabled, the right centering margin remains a clickable prose
+        # gutter rather than silently behaving like a hidden scrollbar.
         scrollbar_width = self._get_margin_width(self.right_margins[-1])
         if scrollbar_width <= 0:
             return
@@ -1955,7 +2156,7 @@ def _dash_standin_glue_positions(line, prefix_width, body_width):
     # ordinary Markdown/list punctuation character.
     for match in _SPACED_DASH_STANDIN_RE.finditer(body):
         group = match.group(0)
-        if sum(max(0, get_cwidth(ch)) for ch in group) > body_width:
+        if _display_text_width(group) > body_width:
             continue
         for name in ("gap1", "gap2"):
             start, end = match.span(name)
@@ -1983,7 +2184,7 @@ class ProseLayoutProcessor(Processor):
         if prefix_width > gutter:
             prefix_width = 0
 
-        quote_marker_width = sum(max(0, get_cwidth(ch)) for ch in quote_marker)
+        quote_marker_width = _display_text_width(quote_marker)
         padding = max(0, gutter - prefix_width)
 
         fragments = explode_text_fragments(ti.fragments)
@@ -2049,7 +2250,7 @@ class ProseLayoutProcessor(Processor):
                     "" if unit_style == "class:markdown.hard-break" else text
                 )
         measured_body = _wrap_measure_text("".join(measured_parts))
-        fallback_wrap = sum(max(0, get_cwidth(ch)) for ch in measured_body) > body_width
+        fallback_wrap = _display_text_width(measured_body) > body_width
 
         def append_display_padding(count, src_anchor):
             nonlocal display_pos
@@ -2072,11 +2273,11 @@ class ProseLayoutProcessor(Processor):
                         if not found:
                             continue
                         if source_index in dash_glue_positions:
-                            width += max(0, get_cwidth(char))
+                            width += _display_char_width(char)
                             continue
                         return width
                     found = True
-                    width += max(0, get_cwidth(char))
+                    width += _display_char_width(char)
             return width
 
         body_col = 0
@@ -2107,7 +2308,7 @@ class ProseLayoutProcessor(Processor):
                 continue
 
             if style != "class:markdown.hard-break":
-                body_col += sum(max(0, get_cwidth(ch)) for ch in text)
+                body_col += _display_text_width(text)
 
             if fallback_wrap and text.isspace():
                 # The spaces around a drafted dash stand-in are visual glue,
@@ -2122,7 +2323,16 @@ class ProseLayoutProcessor(Processor):
                 unit_width = next_wrap_unit_width(unit_index + 1)
                 if 0 < unit_width <= body_width and body_col + unit_width > body_width:
                     fill = max(0, (body_width + 1) - body_col)
-                    append_display_padding(fill, src_end - 1 if src_end > src_start else src_start)
+                    append_display_padding(
+                        fill, src_end - 1 if src_end > src_start else src_start
+                    )
+                    # The source cursor position after this whitespace is also
+                    # the position immediately before the first word on the
+                    # new visual row.  Map it to that new-row boundary rather
+                    # than leaving the earlier mapping at the end of the
+                    # previous row.  Otherwise Left from ``N|either`` appears
+                    # to jump over ``|Neither`` to the preceding wrapped row.
+                    source_to_display_map[src_end] = display_pos
                     body_col = 0
 
         source_to_display_map[source_length] = display_pos
@@ -2170,7 +2380,7 @@ def _soft_wrap_line_prefix(lineno, wrap_count):
     if not quote_marker:
         return [("class:editor", " " * gutter)]
 
-    marker_width = sum(max(0, get_cwidth(ch)) for ch in quote_marker)
+    marker_width = _display_text_width(quote_marker)
     padding = max(0, gutter - marker_width)
     fragments = []
     if padding:
@@ -2183,9 +2393,112 @@ _MULTI_CLICK_SECONDS = 0.40
 _MULTI_CLICK_INDEX_TOLERANCE = 1
 
 
+def _inline_footnote_global_span_at_position(full_text, position, direction=0):
+    """Return a compact inline-footnote source span touching ``position``.
+
+    ``direction`` controls which boundary counts as belonging to the object:
+    moving right treats the opening boundary as part of the object, moving left
+    treats the closing boundary as part of it, and zero accepts either edge.
+    This keeps hidden identifiers such as ``[^smith]`` atomic even though the
+    prose view displays only a compact reference such as ``[1]``.
+    """
+    position = max(0, min(len(full_text), int(position)))
+    compact_identifiers = _footnote_number_map(full_text)
+    for (
+        start, end, identifier, _row, _start_col, _end_col
+    ) in _footnote_reference_spans(full_text):
+        if identifier not in compact_identifiers:
+            continue
+        if start < position < end:
+            return start, end, identifier
+        if direction >= 0 and position == start:
+            return start, end, identifier
+        if direction <= 0 and position == end:
+            return start, end, identifier
+    return None
+
+
+def _normalize_word_target(full_text, origin, target, direction):
+    """Keep word navigation from landing inside compact footnote source."""
+    span = _inline_footnote_global_span_at_position(full_text, origin, direction)
+    if span is not None:
+        start, end, _identifier = span
+        return end if direction > 0 else start
+
+    # A stock prompt_toolkit word boundary can point at the hidden identifier.
+    # Snap such a result to the far visible edge in the direction of travel.
+    compact_identifiers = _footnote_number_map(full_text)
+    for (
+        start, end, identifier, _row, _start_col, _end_col
+    ) in _footnote_reference_spans(full_text):
+        if identifier not in compact_identifiers:
+            continue
+        if direction > 0 and origin < end and start <= target < end:
+            return end
+        if direction < 0 and origin > start and start < target <= end:
+            return start
+    return target
+
+
+def _word_navigation_target(document, direction):
+    """Return the next visible word-navigation target for the prose editor."""
+    origin = document.cursor_position
+
+    # Folded table/footnote labels are one visible object even though their
+    # internal placeholder text contains several source words plus a sentinel.
+    folded = _folded_placeholder_at_cursor(document)
+    if folded is not None:
+        row = document.cursor_position_row
+        col = document.cursor_position_col
+        line = document.current_line
+        visible_end = (
+            len(line) - 1
+            if line.endswith((TABLE_SENTINEL, FOOTNOTE_SENTINEL))
+            else len(line)
+        )
+        row_start = document.translate_row_col_to_index(row, 0)
+        if direction > 0 and col < visible_end:
+            return row_start + visible_end
+        if direction < 0 and col > 0:
+            return row_start
+        # At the right visible edge, begin the stock search after the hidden
+        # sentinel so Ctrl+Right cannot stop on its zero-width source position.
+        if direction > 0 and col >= visible_end and len(line) > visible_end:
+            origin = row_start + len(line)
+            document = Document(document.text, cursor_position=origin)
+
+    if direction < 0:
+        amount = document.find_previous_word_beginning()
+        if amount is None:
+            return None
+    else:
+        amount = document.find_next_word_beginning()
+        if amount is None:
+            if origin >= len(document.text):
+                return None
+            amount = len(document.text) - origin
+    target = max(0, min(len(document.text), origin + amount))
+    target = _normalize_word_target(document.text, origin, target, direction)
+    return _clamp_source_position_out_of_gutter(document.text, target)
+
+
 def _word_selection_range(full_text, cursor_position):
-    """Return the source range for the word at ``cursor_position``."""
+    """Return the source range for the visible word/object at the cursor."""
     cursor_position = max(0, min(len(full_text), cursor_position))
+    footnote_span = _inline_footnote_global_span_at_position(full_text, cursor_position, 1)
+    if footnote_span is not None:
+        start, end, _identifier = footnote_span
+        return start, end
+
+    line_start, line_end = _line_bounds_at_position(full_text, cursor_position)
+    line = full_text[line_start:line_end]
+    if _folded_object_line(line):
+        visible_end = line_end
+        if line.endswith((TABLE_SENTINEL, FOOTNOTE_SENTINEL)):
+            visible_end -= 1
+        if line_start <= cursor_position <= visible_end:
+            return line_start, visible_end
+
     document = Document(full_text, cursor_position=cursor_position)
     start_delta, end_delta = document.find_boundaries_of_current_word()
     start = cursor_position + start_delta
@@ -2273,8 +2586,10 @@ class FullWidthSafeBufferControl(BufferControl):
 
             self._carriage_mouse_dragged = False
             result = super().mouse_handler(mouse_event)
-            # BufferControl has now translated the rendered position back to a
-            # source index. Keep that exact source location for click counting.
+            # BufferControl translates transformed gutter glyphs back to source
+            # positions too. They are not navigable editor space, so normalize
+            # a click on structural Markdown to the visible prose boundary.
+            _clamp_buffer_cursor_out_of_gutter(buffer)
             self._carriage_mouse_down_index = buffer.cursor_position
             return result
 
@@ -2284,7 +2599,9 @@ class FullWidthSafeBufferControl(BufferControl):
         ):
             self._carriage_mouse_dragged = True
             self._reset_carriage_click_sequence()
-            return super().mouse_handler(mouse_event)
+            result = super().mouse_handler(mouse_event)
+            _clamp_buffer_cursor_out_of_gutter(buffer)
+            return result
 
         if mouse_event.event_type == MouseEventType.MOUSE_UP:
             # Disable prompt_toolkit's private timestamp-only double-click
@@ -2292,6 +2609,7 @@ class FullWidthSafeBufferControl(BufferControl):
             # rapid click elsewhere cannot accidentally count as a double-click.
             self._last_click_timestamp = None
             result = super().mouse_handler(mouse_event)
+            _clamp_buffer_cursor_out_of_gutter(buffer)
 
             if getattr(self, "_carriage_mouse_dragged", False):
                 self._reset_carriage_click_sequence()
@@ -2365,6 +2683,10 @@ text_area.window._height_cache_prefix = None
 # display transformations and soft wrapping.
 text_area.window._vertical_preferred_x = None
 text_area.window._visual_vertical_move_in_progress = False
+# Alt+Up/Alt+Down can pin a target heading to the first visible editor row.
+# The anchor survives repaints but is cleared by any subsequent ordinary
+# cursor movement, edit, or manual viewport scroll.
+text_area.window._section_top_anchor_row = None
 text_area.window.on_scrollbar_interact = _on_scrollbar_interact
 # Wheel/scrollbar scrolling is allowed to move the viewport away from the
 # insertion point. Hide the screen cursor during that read-only navigation;
@@ -2388,8 +2710,13 @@ text_area.window.right_margins = [CenterPaddingMargin("right")] + (
 
 
 def _resume_editor_view(_buffer=None):
-    """Exit viewport-only scrolling as soon as the cursor moves."""
+    """Exit manual scrolling and keep the prose caret out of the gutter."""
+    buffer = _buffer or text_area.buffer
+    _clamp_buffer_cursor_out_of_gutter(buffer)
     text_area.window.end_manual_scroll()
+    # Ordinary cursor movement releases any Alt+Up/Alt+Down viewport anchor.
+    # Section navigation installs a fresh anchor after moving the cursor.
+    text_area.window._section_top_anchor_row = None
     # Repeated Up/Down presses preserve a rendered-screen column, just like a
     # conventional editor preserves a preferred column across short lines. Any
     # other cursor movement (Left/Right, mouse click, Home/End, etc.) starts a
@@ -2402,6 +2729,7 @@ def _editor_text_changed(_buffer=None):
     """Reset viewport ownership, invalidate layout, and protect changed work."""
     state.extend_selection_mode = False
     text_area.window.end_manual_scroll()
+    text_area.window._section_top_anchor_row = None
     text_area.window._vertical_preferred_x = None
     text_area.window.invalidate_rendered_height_cache()
     _working_state_changed()
@@ -2481,11 +2809,118 @@ def close_dialog():
     app.invalidate()
 
 
+class SingleLineInput:
+    """Minimal one-line dialog input without TextArea scrolling chrome."""
+
+    def __init__(self, text="", *, style="class:input-field", width=None):
+        self.buffer = Buffer(
+            document=Document(text, cursor_position=len(text)),
+            multiline=False,
+        )
+        self.control = BufferControl(
+            buffer=self.buffer,
+            focusable=True,
+            focus_on_click=True,
+        )
+        self.window = Window(
+            content=self.control,
+            height=D.exact(1),
+            width=width,
+            dont_extend_height=True,
+            dont_extend_width=width is not None,
+            wrap_lines=False,
+            style=style,
+        )
+
+    @property
+    def text(self):
+        return self.buffer.text
+
+    def __pt_container__(self):
+        return self.window
+
+
+def _wrap_dialog_prose(text, width=64):
+    """Word-wrap dialog prose while preserving intentional line breaks."""
+    rendered = []
+    for line in str(text).splitlines():
+        if not line:
+            rendered.append("")
+            continue
+        wrapped = textwrap.wrap(
+            line,
+            width=width,
+            break_long_words=False,
+            break_on_hyphens=False,
+        )
+        rendered.extend(wrapped or [""])
+    return "\n".join(rendered)
+
+
+def _dialog_prose(text, width=64):
+    """Return a consistently word-wrapped explanatory label for dialogs."""
+    return Label(
+        text=_wrap_dialog_prose(text, width),
+        wrap_lines=True,
+        width=D(preferred=width, max=width),
+    )
+
+
+def _current_transient_status_message():
+    """Return the active transient status-line notice, if any."""
+    message = state.transient_status_message
+    if message is None:
+        return None
+    if time.monotonic() < state.transient_status_expires_at:
+        return message
+    state.transient_status_message = None
+    state.transient_status_expires_at = 0.0
+    return None
+
+
+def _clear_transient_status_message(generation=None):
+    """Clear one transient notice without erasing a newer replacement."""
+    if (
+        generation is not None
+        and generation != state.transient_status_generation
+    ):
+        return
+    state.transient_status_message = None
+    state.transient_status_expires_at = 0.0
+    try:
+        get_app().invalidate()
+    except Exception:
+        pass
+
+
+def show_transient_status(message, duration=3.0):
+    """Show a nonmodal full-width notice on the status-bar line."""
+    state.transient_status_generation += 1
+    generation = state.transient_status_generation
+    state.transient_status_message = str(message)
+    state.transient_status_expires_at = time.monotonic() + max(0.1, float(duration))
+
+    try:
+        get_app().invalidate()
+    except Exception:
+        pass
+
+    # Keyboard/menu handlers run inside prompt_toolkit's asyncio loop. Schedule
+    # one invalidation at expiry so a notice disappears even when the writer
+    # pauses without pressing another key. The generation guard prevents an
+    # older timer from clearing a newer message.
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    loop.call_later(duration, _clear_transient_status_message, generation)
+
+
 def show_message(title, text):
     ok_button = Button(text="OK", handler=close_dialog)
     dialog = Dialog(
         title=title,
-        body=Label(text=text),
+        body=_dialog_prose(text, width=64),
         buttons=[ok_button],
         width=D(preferred=70),
     )
@@ -2493,7 +2928,7 @@ def show_message(title, text):
 
 
 def show_input_dialog(title, label_text, default, callback):
-    input_field = TextArea(text=default, multiline=False, style="class:input-field")
+    input_field = SingleLineInput(text=default)
 
     def ok_handler():
         value = input_field.text
@@ -2502,7 +2937,7 @@ def show_input_dialog(title, label_text, default, callback):
 
     dialog = Dialog(
         title=title,
-        body=HSplit([Label(text=label_text), input_field]),
+        body=HSplit([_dialog_prose(label_text, width=64), input_field]),
         buttons=[
             Button(text="OK", handler=ok_handler),
             Button(text="Cancel", handler=close_dialog),
@@ -2517,7 +2952,7 @@ def confirm(title, text, on_yes):
     cancel_button = Button(text="Cancel", handler=close_dialog)
     dialog = Dialog(
         title=title,
-        body=Label(text=text),
+        body=_dialog_prose(text, width=64),
         buttons=[yes_button, cancel_button],
         width=D(preferred=70),
     )
@@ -2544,7 +2979,7 @@ def with_unsaved_changes_check(action):
 
         dialog = Dialog(
             title="Unsaved changes",
-            body=Label(text="Save changes before continuing?"),
+            body=_dialog_prose("Save changes before continuing?", width=64),
             buttons=[save_button, discard_button, cancel_button],
             width=D(preferred=70),
         )
@@ -3316,7 +3751,7 @@ def _offer_stale_recovery(source_path=None):
     later_button = Button(text="Later", handler=close_dialog)
     dialog = Dialog(
         title="Recover document?",
-        body=Label(text=description),
+        body=_dialog_prose(description, width=72),
         buttons=[restore_button, discard_button, later_button],
         width=D(preferred=78),
     )
@@ -3333,11 +3768,10 @@ def _show_read_only_save(on_saved=None):
     cancel_button = Button(text="Cancel", handler=close_dialog)
     dialog = Dialog(
         title="Read-only file",
-        body=Label(
-            text=(
-                "The current file is marked read-only. Carriage will not replace it.\n\n"
-                "Use Save As to write your changes to a different file."
-            )
+        body=_dialog_prose(
+            "The current file is marked read-only. Carriage will not replace it.\n\n"
+            "Use Save As to write your changes to a different file.",
+            width=70,
         ),
         buttons=[save_as_button, cancel_button],
         width=D(preferred=76),
@@ -3363,13 +3797,12 @@ def _show_save_conflict(disk_snapshot, on_saved=None):
     cancel_button = Button(text="Cancel", handler=close_dialog)
     dialog = Dialog(
         title="File changed on disk",
-        body=Label(
-            text=(
-                "This file has been changed, replaced, or deleted outside Carriage "
-                "since it was opened or last saved.\n\n"
-                "Save As keeps both versions. Overwrite replaces the current disk "
-                "version with the text in Carriage."
-            )
+        body=_dialog_prose(
+            "This file has been changed, replaced, or deleted outside Carriage "
+            "since it was opened or last saved.\n\n"
+            "Save As keeps both versions. Overwrite replaces the current disk "
+            "version with the text in Carriage.",
+            width=72,
         ),
         buttons=[save_as_button, overwrite_button, cancel_button],
         width=D(preferred=78),
@@ -3384,7 +3817,7 @@ def _confirm_replace(title, text, on_replace):
     cancel_button = Button(text="Cancel", handler=close_dialog)
     dialog = Dialog(
         title=title,
-        body=Label(text=text),
+        body=_dialog_prose(text, width=68),
         buttons=[replace_button, cancel_button],
         width=D(preferred=74),
     )
@@ -5752,6 +6185,45 @@ def _active_structural_prefix_width(document, row, role=None, columns=None):
     return info[0] if 0 < info[0] <= gutter else None
 
 
+def _hidden_structural_body_col(document, row):
+    """Return the first navigable source column for a guttered source row.
+
+    Structural Markdown that Carriage has moved into the hanging gutter remains
+    part of the source file, but it is presentation rather than ordinary cursor
+    space.  Navigation therefore begins at the first visible prose column.
+    """
+    prefix_width = _active_structural_prefix_width(document, row)
+    return 0 if prefix_width is None else prefix_width
+
+
+def _clamp_source_position_out_of_gutter(full_text, position):
+    """Snap a source insertion point out of any hidden structural prefix."""
+    position = max(0, min(len(full_text), int(position)))
+    document = Document(full_text, cursor_position=position)
+    row = document.cursor_position_row
+    body_col = _hidden_structural_body_col(document, row)
+    if document.cursor_position_col < body_col:
+        return document.translate_row_col_to_index(row, body_col)
+    return position
+
+
+def _clamp_buffer_cursor_out_of_gutter(buffer):
+    """Keep the main prose caret out of display-only structural gutter text."""
+    target = _clamp_source_position_out_of_gutter(
+        buffer.text, buffer.cursor_position
+    )
+    if target == buffer.cursor_position:
+        return False
+    if getattr(buffer, "_carriage_gutter_clamp_active", False):
+        return False
+    buffer._carriage_gutter_clamp_active = True
+    try:
+        buffer.cursor_position = target
+    finally:
+        buffer._carriage_gutter_clamp_active = False
+    return True
+
+
 def _list_continuation_prefix_width(document, row):
     return _active_structural_prefix_width(
         document, row, role="list-continuation"
@@ -5766,6 +6238,179 @@ def _hard_wrap_export_text(full_text, width=None):
     for block in _analyze_document_layout(full_text, width):
         rendered.extend(_render_wrap_block(block, width=width))
     return "\n".join(rendered)
+
+
+def _source_range_intersects(ranges, start, end):
+    """Return True when [start, end) overlaps any sorted source range."""
+    if end <= start:
+        return False
+    for range_start, range_end in ranges:
+        if range_end <= start:
+            continue
+        if range_start >= end:
+            break
+        return True
+    return False
+
+
+def _markdown_delimiter_flanking(text, start, end, marker):
+    """Return conservative CommonMark-style open/close flags for a run."""
+    before = text[start - 1] if start > 0 else "\n"
+    after = text[end] if end < len(text) else "\n"
+    before_ws = before.isspace()
+    after_ws = after.isspace()
+    # For emphasis recognition, treating any non-word, non-space character as
+    # punctuation is slightly more conservative than the Markdown definition
+    # and prevents Carriage from inventing emphasis in uncertain constructs.
+    before_punct = not before_ws and not before.isalnum()
+    after_punct = not after_ws and not after.isalnum()
+
+    left_flanking = (not after_ws) and (
+        not after_punct or before_ws or before_punct
+    )
+    right_flanking = (not before_ws) and (
+        not before_punct or after_ws or after_punct
+    )
+
+    if marker == "_":
+        can_open = left_flanking and (not right_flanking or before_punct)
+        can_close = right_flanking and (not left_flanking or after_punct)
+    else:
+        can_open = left_flanking
+        can_close = right_flanking
+    return can_open, can_close
+
+
+def _emphasis_run_at(text, index):
+    """Return (marker, run_end, run_length) for one unescaped emphasis run."""
+    if not (0 <= index < len(text)) or text[index] not in "*_":
+        return None
+    if _markdown_char_is_escaped(text, index):
+        return None
+    marker = text[index]
+    end = index + 1
+    while end < len(text) and text[end] == marker:
+        end += 1
+    return marker, end, end - index
+
+
+def _range_has_emphasis_delimiter(text, start, end, protected=()):
+    """Return True when a range contains emphasis-like delimiter syntax."""
+    i = max(0, start)
+    end = min(len(text), end)
+    while i < end:
+        if text[i] not in "*_" or _range_contains(protected, i):
+            i += 1
+            continue
+        run = _emphasis_run_at(text, i)
+        if run is None:
+            i += 1
+            continue
+        marker, run_end, _count = run
+        run_end = min(run_end, end)
+        can_open, can_close = _markdown_delimiter_flanking(
+            text, i, run_end, marker
+        )
+        if can_open or can_close:
+            return True
+        i = run_end
+    return False
+
+
+def _emphasis_spans_in_range(text, start, end, protected=()):
+    """Return conservative matched emphasis spans within one source range.
+
+    Runs of one, two, or three matching markers are treated as Carriage's four
+    supported emphasis states. A small stack is enough for the straightforward
+    valid Markdown Carriage promises to manipulate, while still recognizing
+    nested/mixed emphasis so partial selections can be rejected safely.
+    """
+    stack = []
+    spans = []
+    i = max(0, start)
+    end = min(len(text), end)
+    while i < end:
+        if text[i] not in "*_" or _range_contains(protected, i):
+            i += 1
+            continue
+        run = _emphasis_run_at(text, i)
+        if run is None:
+            i += 1
+            continue
+        marker, run_end, count = run
+        if run_end > end:
+            break
+        if count not in {1, 2, 3}:
+            i = run_end
+            continue
+        can_open, can_close = _markdown_delimiter_flanking(
+            text, i, run_end, marker
+        )
+
+        if can_close and stack and stack[-1][0] == marker and stack[-1][1] == count:
+            _marker, _count, open_start, open_end = stack.pop()
+            spans.append((open_start, open_end, i, run_end, marker, count))
+        elif can_open:
+            stack.append((marker, count, i, run_end))
+        i = run_end
+
+    return tuple(sorted(spans))
+
+
+def _normalize_underscore_emphasis_inline(text):
+    """Normalize only straightforward underscore emphasis to asterisks.
+
+    Code spans, inline HTML/autolinks, link destinations/reference labels,
+    escaped delimiters, intraword underscores, nested emphasis, and ambiguous
+    underscore runs are left byte-identical. Replacing a delimiter never
+    changes source length, which also keeps conversion cursor mapping stable.
+    """
+    if "_" not in text:
+        return text
+
+    protected = _merge_source_ranges(
+        list(_inline_footnote_literal_ranges(text))
+        + [(match.start(), match.end()) for match in _BARE_URL_OR_EMAIL_RE.finditer(text)]
+    )
+    spans = _emphasis_spans_in_range(text, 0, len(text), protected=protected)
+    if not spans:
+        return text
+
+    chars = list(text)
+    for span in spans:
+        open_start, open_end, close_start, close_end, marker, count = span
+        if marker != "_" or count not in {1, 2, 3}:
+            continue
+
+        # Convert only a standalone emphasis span. If it contains another
+        # emphasis span or sits inside one, preserving the entire nested/mixed
+        # construct is safer than partially changing its delimiter family.
+        nested = False
+        for other in spans:
+            if other is span:
+                continue
+            other_start, _other_open_end, _other_close_start, other_end, _other_marker, _other_count = other
+            if other_end <= open_start or other_start >= close_end:
+                continue
+            nested = True
+            break
+        if nested:
+            continue
+
+        inner = text[open_end:close_start]
+        if not inner or inner[0].isspace() or inner[-1].isspace():
+            continue
+        if _range_has_emphasis_delimiter(
+            text, open_end, close_start, protected=protected
+        ):
+            continue
+
+        for pos in range(open_start, open_end):
+            chars[pos] = "*"
+        for pos in range(close_start, close_end):
+            chars[pos] = "*"
+
+    return "".join(chars)
 
 
 def _convert_markdown_prose(source_lines):
@@ -5793,13 +6438,14 @@ def _convert_markdown_prose(source_lines):
             current.append(stripped)
 
         if marker is not None:
-            joined = " ".join(current)
+            joined = _normalize_underscore_emphasis_inline(" ".join(current))
             rendered.append(current_guard + joined + marker)
             current = []
             current_guard = ""
 
     if current or not rendered:
-        rendered.append(current_guard + " ".join(current))
+        joined = _normalize_underscore_emphasis_inline(" ".join(current))
+        rendered.append(current_guard + joined)
 
     return rendered
 
@@ -5833,7 +6479,7 @@ def _canonical_heading_title(title):
 
 def _canonical_atx_heading(marker, title):
     """Render one ATX heading in Carriage's canonical source form."""
-    title = _canonical_heading_title(title)
+    title = _normalize_underscore_emphasis_inline(_canonical_heading_title(title))
     return f"{marker} {title}" if title else marker
 
 
@@ -5856,7 +6502,7 @@ def _setext_title_for_atx(title):
 
 def _canonical_setext_atx_heading(marker, title):
     """Render a Setext heading as semantics-preserving canonical ATX."""
-    title = _setext_title_for_atx(title)
+    title = _normalize_underscore_emphasis_inline(_setext_title_for_atx(title))
     return f"{marker} {title}" if title else marker
 
 
@@ -6225,7 +6871,8 @@ def convert_for_carriage_text(full_text):
     ordered-list runs are renumbered consecutively from their first item; ordinary
     hard-wrapped prose becomes one physical line per logical segment; original
     Markdown hard breaks made with two trailing spaces remain physical line
-    boundaries. Line-sensitive structural blocks are preserved when Carriage
+    boundaries; straightforward underscore emphasis is normalized to Carriage's
+    preferred asterisk form. Line-sensitive structural blocks are preserved when Carriage
     does not have a safe compatibility transformation for them.
     """
     blocks = _analyze_document_layout(full_text, WRAP_COLUMN)
@@ -6544,6 +7191,257 @@ def convert_for_carriage_with_cursor(full_text, cursor_position):
     return new_text, max(0, min(len(new_text), mapped_cursor))
 
 
+def _emphasis_run_ending_at(text, index):
+    """Return (marker, run_start, run_length) for a run ending at index."""
+    if index <= 0 or text[index - 1] not in "*_":
+        return None
+    marker = text[index - 1]
+    start = index - 1
+    while start > 0 and text[start - 1] == marker:
+        start -= 1
+    if _markdown_char_is_escaped(text, start):
+        return None
+    return marker, start, index - start
+
+
+def _emphasis_wrapper_inside_selection(text, start, end, protected):
+    """Recognize a complete 1/2/3-marker wrapper included in a selection."""
+    opening = _emphasis_run_at(text, start)
+    closing = _emphasis_run_ending_at(text, end)
+    if opening is None or closing is None:
+        return None
+
+    marker, open_end, count = opening
+    close_marker, close_start, close_count = closing
+    if (
+        marker != close_marker
+        or count != close_count
+        or count not in {1, 2, 3}
+        or open_end >= close_start
+    ):
+        return None
+    # The selected edges must contain complete delimiter runs, not slices of a
+    # longer run that happens to look like emphasis after selection.
+    if (start > 0 and text[start - 1] == marker) or (
+        end < len(text) and text[end] == marker
+    ):
+        return None
+    if _source_range_intersects(protected, start, open_end) or _source_range_intersects(
+        protected, close_start, end
+    ):
+        return None
+
+    can_open, _ = _markdown_delimiter_flanking(text, start, open_end, marker)
+    _, can_close = _markdown_delimiter_flanking(text, close_start, end, marker)
+    if not (can_open and can_close):
+        return None
+
+    return marker, count, open_end, close_start, start, end
+
+
+def _emphasis_wrapper_around_selection(text, start, end, protected):
+    """Recognize a complete 1/2/3-marker wrapper immediately outside a selection."""
+    opening = _emphasis_run_ending_at(text, start)
+    closing = _emphasis_run_at(text, end)
+    if opening is None or closing is None:
+        return None
+
+    marker, open_start, count = opening
+    close_marker, close_end, close_count = closing
+    if marker != close_marker or count != close_count or count not in {1, 2, 3}:
+        return None
+    if _source_range_intersects(protected, open_start, start) or _source_range_intersects(
+        protected, end, close_end
+    ):
+        return None
+
+    can_open, _ = _markdown_delimiter_flanking(text, open_start, start, marker)
+    _, can_close = _markdown_delimiter_flanking(text, end, close_end, marker)
+    if not (can_open and can_close):
+        return None
+
+    return marker, count, start, end, open_start, close_end
+
+
+def _formatting_selection_bounds(full_text, start, end):
+    """Trim whitespace and hidden structural syntax from one-line selection."""
+    start = max(0, min(len(full_text), start))
+    end = max(start, min(len(full_text), end))
+    if end <= start:
+        return None, "selection contains no text"
+    if "\n" in full_text[start:end]:
+        return None, "selection crosses a source line boundary"
+
+    document = Document(full_text, cursor_position=start)
+    row = document.cursor_position_row
+    line_start, line_end = _line_bounds_at_position(full_text, start)
+
+    # Triple-click and some keyboard selections can include structural source
+    # that Carriage displays in the hanging gutter. Formatting applies to the
+    # visible prose, never to the hidden heading/list/blockquote marker.
+    row_layout = _layout_row_map(full_text)[row]
+    body_col = row_layout.structural_prefix_width
+    start = max(start, line_start + body_col)
+
+    # A legacy ATX heading may still contain optional closing hashes. If a
+    # whole-line selection reaches them, keep that structural syntax outside
+    # the emphasis operation just as we keep the opening marker outside it.
+    line = full_text[line_start:line_end]
+    heading = _atx_heading_source_span(line)
+    if heading is not None:
+        _marker, _title, _mstart, _mend, title_start, title_end = heading
+        start = max(start, line_start + title_start)
+        end = min(end, line_start + title_end)
+
+    while start < end and full_text[start].isspace():
+        start += 1
+    while end > start and full_text[end - 1].isspace():
+        end -= 1
+    if end <= start:
+        return None, "selection contains no text"
+    return (start, end), None
+
+
+def _toggle_emphasis_transform(full_text, start, end, kind):
+    """Return one safe emphasis toggle transformation for [start, end).
+
+    ``kind`` is ``italic`` or ``bold``. The result is
+    ``(new_text, selection_start, selection_end, error)``. On uncertainty the
+    original source is returned unchanged and ``error`` explains the no-op.
+    """
+    label = "italic" if kind == "italic" else "bold"
+    bounds, error = _formatting_selection_bounds(full_text, start, end)
+    if bounds is None:
+        return full_text, start, end, f"Cannot toggle {label}: {error}"
+    start, end = bounds
+
+    if TABLE_SENTINEL in full_text[start:end] or FOOTNOTE_SENTINEL in full_text[start:end]:
+        return full_text, start, end, f"Cannot toggle {label}: selection includes a folded object"
+
+    protected = _inline_footnote_literal_ranges(full_text)
+    if _source_range_intersects(protected, start, end):
+        return full_text, start, end, f"Cannot toggle {label}: selection includes protected Markdown syntax"
+
+    footnote_ranges = tuple((item[0], item[1]) for item in _footnote_reference_spans(full_text))
+    if _source_range_intersects(footnote_ranges, start, end):
+        return full_text, start, end, f"Cannot toggle {label}: selection includes a footnote reference"
+
+    wrapper = _emphasis_wrapper_inside_selection(full_text, start, end, protected)
+    if wrapper is None:
+        wrapper = _emphasis_wrapper_around_selection(full_text, start, end, protected)
+
+    if wrapper is not None:
+        marker, count, content_start, content_end, replace_start, replace_end = wrapper
+    else:
+        # If a marker is immediately attached to either edge but does not form
+        # one complete recognized wrapper, adding more syntax would be a guess.
+        left_attached = start > 0 and full_text[start - 1] in "*_"
+        right_attached = end < len(full_text) and full_text[end] in "*_"
+        if left_attached or right_attached:
+            return full_text, start, end, f"Cannot toggle {label}: ambiguous existing emphasis"
+        marker = "*"
+        count = 0
+        content_start, content_end = start, end
+        replace_start, replace_end = start, end
+
+    # A selection may sit inside a larger emphasis span without touching its
+    # delimiters (for example, selecting only `tal` in `*italic*`). Never add
+    # markers in that case. The recognized wrapper is allowed only when it is
+    # exactly the matched span being toggled; any additional containing/nested
+    # span makes the operation heterogeneous and therefore a no-op.
+    line_start, line_end = _line_bounds_at_position(full_text, content_start)
+    recognized_span = (replace_start, replace_end) if count else None
+    for open_start, _open_end, _close_start, close_end, _family, _run_count in _emphasis_spans_in_range(
+        full_text, line_start, line_end, protected=protected
+    ):
+        if close_end <= start or open_start >= end:
+            continue
+        if recognized_span == (open_start, close_end):
+            continue
+        return full_text, start, end, f"Cannot toggle {label}: selection overlaps existing emphasis"
+
+    if recognized_span is not None:
+        left_nested = (
+            replace_start > line_start
+            and full_text[replace_start - 1] in "*_"
+            and not _markdown_char_is_escaped(full_text, replace_start - 1)
+        )
+        right_nested = (
+            replace_end < line_end
+            and full_text[replace_end] in "*_"
+            and not _markdown_char_is_escaped(full_text, replace_end)
+        )
+        if left_nested or right_nested:
+            return full_text, start, end, f"Cannot toggle {label}: ambiguous nested emphasis"
+
+    if content_end <= content_start:
+        return full_text, start, end, f"Cannot toggle {label}: selection contains no text"
+    if full_text[content_start].isspace() or full_text[content_end - 1].isspace():
+        return full_text, start, end, f"Cannot toggle {label}: ambiguous emphasis boundaries"
+    if _range_has_emphasis_delimiter(
+        full_text, content_start, content_end, protected=protected
+    ):
+        return full_text, start, end, f"Cannot toggle {label}: selection contains mixed emphasis"
+
+    italic_on = count in {1, 3}
+    bold_on = count in {2, 3}
+    if kind == "italic":
+        italic_on = not italic_on
+    else:
+        bold_on = not bold_on
+    new_count = (1 if italic_on else 0) + (2 if bold_on else 0)
+
+    content = full_text[content_start:content_end]
+    delimiter = marker * new_count
+    replacement = delimiter + content + delimiter
+    new_text = full_text[:replace_start] + replacement + full_text[replace_end:]
+    new_selection_start = replace_start + new_count
+    new_selection_end = new_selection_start + len(content)
+    return new_text, new_selection_start, new_selection_end, None
+
+
+def _toggle_selected_emphasis(kind):
+    """Toggle one emphasis attribute on the main editor's active selection."""
+    buf = text_area.buffer
+    label = "italic" if kind == "italic" else "bold"
+    if buf.selection_state is None:
+        show_transient_status(f"Select text to toggle {label}.")
+        return
+    ranges = list(buf.document.selection_ranges())
+    if len(ranges) != 1:
+        show_transient_status(f"Cannot toggle {label}: unsupported selection shape")
+        return
+    if _selection_intersects_folded_object(buf):
+        show_transient_status(f"Cannot toggle {label}: selection includes a folded object")
+        return
+
+    start, end = ranges[0]
+    new_text, new_start, new_end, error = _toggle_emphasis_transform(
+        buf.text, start, end, kind
+    )
+    if error is not None:
+        show_transient_status(error)
+        return
+    if new_text == buf.text:
+        return
+
+    buf.save_to_undo_stack()
+    buf.set_document(
+        Document(text=new_text, cursor_position=new_end),
+        bypass_readonly=True,
+    )
+    _select_source_range(buf, (new_start, new_end))
+    get_app().invalidate()
+
+
+def do_toggle_italic():
+    _toggle_selected_emphasis("italic")
+
+
+def do_toggle_bold():
+    _toggle_selected_emphasis("bold")
+
+
 def do_renumber_list():
     """Renumber the ordered list containing the cursor, preserving its start."""
     buf = text_area.buffer
@@ -6566,22 +7464,124 @@ def do_renumber_list():
     )
 
 
+def _normalize_footnote_source_lines(note):
+    """Normalize emphasis only in a folded footnote's body source."""
+    if note.original_lines is None:
+        return None
+    rendered = []
+    for index, line in enumerate(note.original_lines):
+        if index == 0:
+            match = _FOOTNOTE_DEFINITION_RE.match(line)
+            if match is None:
+                rendered.append(line)
+                continue
+            body_start = match.start(2)
+            rendered.append(
+                line[:body_start]
+                + _normalize_underscore_emphasis_inline(line[body_start:])
+            )
+            continue
+
+        continuation = _footnote_continuation_text(line)
+        if continuation is None:
+            rendered.append(line)
+            continue
+        prefix_width = len(line) - len(continuation)
+        rendered.append(
+            line[:prefix_width]
+            + _normalize_underscore_emphasis_inline(continuation)
+        )
+    return rendered
+
+
+def _normalize_folded_object_emphasis():
+    """Return copy-on-write table/footnote mappings normalized for Convert."""
+    tables = state.tables
+    footnotes = state.footnotes
+    tables_changed = False
+    footnotes_changed = False
+
+    updated_tables = dict(tables)
+    for number, table in tables.items():
+        headers = [_normalize_underscore_emphasis_inline(value) for value in table.headers]
+        rows = [
+            [_normalize_underscore_emphasis_inline(value) for value in row]
+            for row in table.rows
+        ]
+        title = _normalize_underscore_emphasis_inline(table.title)
+        original_lines = (
+            None
+            if table.original_lines is None
+            else [
+                _normalize_underscore_emphasis_inline(line)
+                for line in table.original_lines
+            ]
+        )
+        if (
+            headers != table.headers
+            or rows != table.rows
+            or title != table.title
+            or original_lines != table.original_lines
+        ):
+            updated_tables[number] = TableData(
+                headers=headers,
+                rows=rows,
+                title=title,
+                alignments=list(table.alignments),
+                original_lines=original_lines,
+                caption_position=table.caption_position,
+                dirty=table.dirty,
+            )
+            tables_changed = True
+
+    updated_footnotes = dict(footnotes)
+    for identifier, note in footnotes.items():
+        text = _normalize_underscore_emphasis_inline(note.text)
+        original_lines = _normalize_footnote_source_lines(note)
+        if text != note.text or original_lines != note.original_lines:
+            updated_footnotes[identifier] = FootnoteData(
+                identifier=note.identifier,
+                text=text,
+                original_lines=original_lines,
+                dirty=note.dirty,
+            )
+            footnotes_changed = True
+
+    return (
+        updated_tables if tables_changed else tables,
+        updated_footnotes if footnotes_changed else footnotes,
+        tables_changed or footnotes_changed,
+    )
+
+
 def do_convert_for_carriage():
     """Convert the working document to Carriage's preferred Markdown form."""
     buf = text_area.buffer
     old_text = buf.text
     old_cursor = buf.cursor_position
     new_text, new_cursor = convert_for_carriage_with_cursor(old_text, old_cursor)
-    if new_text == old_text:
+    new_tables, new_footnotes, objects_changed = _normalize_folded_object_emphasis()
+
+    # A table title is part of its folded prose placeholder. Underscore to
+    # asterisk normalization is length-preserving, so refreshing those labels
+    # cannot disturb the cursor mapping produced above.
+    if new_tables is not state.tables:
+        new_text = _canonicalize_table_placeholders(new_text, new_tables)
+
+    if new_text == old_text and not objects_changed:
         return
 
     if new_cursor is None:
         new_cursor = len(new_text)
     buf.save_to_undo_stack()
+    state.tables = new_tables
+    state.footnotes = new_footnotes
     buf.set_document(
         Document(text=new_text, cursor_position=new_cursor),
         bypass_readonly=True,
     )
+    if objects_changed:
+        _working_state_changed(immediate=True)
 
 
 def do_undo():
@@ -6647,121 +7647,21 @@ def do_paste():
 
 
 
-def _persist_current_preferences():
-    _write_preferences_values(WRAP_COLUMN, SCROLLBAR_VISIBLE)
-
-
 def _ensure_config_file():
     """Create config.toml on first launch without replacing an existing file."""
     if os.path.exists(_config_path()):
         return
     try:
-        _persist_current_preferences()
+        _write_config(_CONFIG)
     except OSError:
-        # A read-only/missing config home must never prevent the editor from
-        # starting. Preferences will report the write error if the user later
-        # tries to save settings explicitly.
+        # A read-only or unavailable config home must never prevent startup.
         pass
-
-
-
-def _apply_scrollbar_visibility():
-    """Apply the persistent scrollbar preference without changing scrolling."""
-    text_area.window.right_margins = [CenterPaddingMargin("right")] + (
-        [_scrollbar_margin] if SCROLLBAR_VISIBLE else []
-    )
-    text_area.window.invalidate_rendered_height_cache()
-
-
-def _invalidate_width_dependent_layout():
-    """Drop display/layout caches whose results depend on prose width."""
-    _analyze_document_layout.cache_clear()
-    _structural_display_map.cache_clear()
-    _layout_row_map.cache_clear()
-    _dash_standin_glue_positions.cache_clear()
-    text_area.window.invalidate_rendered_height_cache()
 
 
 def do_toggle_statusbar():
     """Toggle the status bar for this session only."""
     state.statusbar_visible = not state.statusbar_visible
     get_app().invalidate()
-
-
-def do_preferences():
-    """Open Carriage's intentionally small persistent Preferences dialog."""
-    width_field = TextArea(
-        text=str(WRAP_COLUMN),
-        multiline=False,
-        width=D(preferred=8),
-        style="class:input-field",
-    )
-    scrollbar_box = Checkbox(text="Show scrollbar", checked=SCROLLBAR_VISIBLE)
-
-    def save_preferences():
-        global WRAP_COLUMN, SCROLLBAR_VISIBLE
-
-        try:
-            prose_width = int(width_field.text.strip())
-        except ValueError:
-            show_message(
-                "Invalid prose width",
-                f"Enter a whole number from {MIN_WRAP_COLUMN} to {MAX_WRAP_COLUMN}.",
-            )
-            return
-        if not MIN_WRAP_COLUMN <= prose_width <= MAX_WRAP_COLUMN:
-            show_message(
-                "Invalid prose width",
-                f"Enter a whole number from {MIN_WRAP_COLUMN} to {MAX_WRAP_COLUMN}.",
-            )
-            return
-
-        try:
-            _write_preferences_values(prose_width, scrollbar_box.checked)
-        except OSError as e:
-            show_message(
-                "Preferences not saved",
-                "Carriage could not update its preferences file.\n\n" + str(e),
-            )
-            return
-
-        width_changed = prose_width != WRAP_COLUMN
-        scrollbar_changed = scrollbar_box.checked != SCROLLBAR_VISIBLE
-
-        WRAP_COLUMN = prose_width
-        SCROLLBAR_VISIBLE = scrollbar_box.checked
-
-        if width_changed:
-            _invalidate_width_dependent_layout()
-        if scrollbar_changed:
-            _apply_scrollbar_visibility()
-
-        close_dialog()
-        get_app().invalidate()
-
-    save_button = Button(text="Save", handler=save_preferences)
-    dialog = Dialog(
-        title="Preferences",
-        body=HSplit(
-            [
-                Label(text=f"Prose width ({MIN_WRAP_COLUMN}–{MAX_WRAP_COLUMN} columns)"),
-                width_field,
-                Window(height=1),
-                scrollbar_box,
-                Window(height=1),
-                Label(
-                    text=(
-                        "Unsaved work is protected automatically in a private "
-                        "recovery journal; the Markdown file changes only when "
-                        "you explicitly Save or Save As."
-                    )
-                ),
-            ]
-        ),
-        buttons=[save_button, Button(text="Cancel", handler=close_dialog)],
-        width=D(preferred=66),
-    )
-    show_dialog(dialog, focus=width_field)
 
 
 # ---------------------------------------------------------------------------
@@ -6773,22 +7673,17 @@ def _table_rows(session):
 
 
 def _table_cell_label(session):
-    location = (
+    return (
         f"Header · column {session.selected_col + 1}"
         if session.selected_row == 0
         else f"Row {session.selected_row} · column {session.selected_col + 1}"
     )
-    mode = "Editing" if session.editing else "Nav"
-    return f"{mode} · {location}"
 
 
 def _table_mode_hint(session):
     if session.editing:
-        return "Editing: Enter saves cell · Esc discards cell edit · Ctrl+S saves table"
-    return (
-        "Nav: ←↑↓→ move · Enter edit · Shift+Tab at first cell title · "
-        "R row · C col · ^S save · Esc cancel"
-    )
+        return "Edit: Enter commit · Esc discard · ^S save table"
+    return "←↑↓→ move · Enter edit · R row · C col · ^S save · Esc cancel"
 
 
 def _update_table_editor_ui(session):
@@ -7038,6 +7933,80 @@ def _run_table_editor_command(action):
     action()
 
 
+def _table_command_button(text, handler):
+    """Create a table command button wide enough to show its full caption.
+
+    prompt_toolkit's Button defaults to 12 columns, which clips longer table
+    commands such as ``Insert Above`` and ``Delete Column`` (usually losing
+    the right ``>`` and sometimes caption characters).  Size these submenu
+    buttons from their rendered cell width instead.
+    """
+    return Button(
+        text=text,
+        handler=handler,
+        width=max(12, get_cwidth(text) + 4),
+    )
+
+
+def _show_table_command_dialog(title, message, buttons, width, focus=None):
+    """Show a fully opaque table row/column command popup.
+
+    The stock prompt_toolkit Dialog leaves portions of narrow rows effectively
+    transparent in this table-editor context, allowing underlying grid lines to
+    show through and visually cut the right frame border. Build these small
+    popups with explicit filler windows so the message row and button row paint
+    their entire width using the dialog background.
+    """
+    buttons_kb = KeyBindings()
+    if len(buttons) > 1:
+        first_selected = has_focus(buttons[0])
+        last_selected = has_focus(buttons[-1])
+        buttons_kb.add("left", filter=~first_selected)(focus_previous)
+        buttons_kb.add("right", filter=~last_selected)(focus_next)
+
+    kb = KeyBindings()
+    kb.add("tab", filter=~has_completions)(focus_next)
+    kb.add("s-tab", filter=~has_completions)(focus_previous)
+
+    body_row = VSplit(
+        [
+            _dialog_prose(message, width=52),
+            Window(style="class:dialog.body"),
+        ]
+    )
+    buttons_row = VSplit(
+        [*buttons, Window(style="class:dialog.body")],
+        padding=1,
+        key_bindings=buttons_kb,
+    )
+    frame_body = HSplit(
+        [
+            Box(
+                body=body_row,
+                padding=D(preferred=1, max=1),
+                padding_bottom=0,
+                style="class:dialog.body",
+            ),
+            Box(
+                body=buttons_row,
+                height=D(min=1, max=3, preferred=3),
+                style="class:dialog.body",
+            ),
+        ],
+        style="class:dialog.body",
+    )
+    dialog = Shadow(
+        body=Frame(
+            title=title,
+            body=frame_body,
+            style="class:dialog.body",
+            width=width,
+            key_bindings=kb,
+            modal=True,
+        )
+    )
+    show_dialog(dialog, focus=focus if focus is not None else buttons[0])
+
 def _show_table_row_menu():
     session = current_table_editor
     if session is None:
@@ -7047,26 +8016,26 @@ def _show_table_row_menu():
         session.editing = False
         _update_table_editor_ui(session)
 
-    above = Button(
-        text="Insert Above",
-        handler=lambda: _run_table_editor_command(lambda: _insert_table_editor_row("above")),
+    above = _table_command_button(
+        "Insert Above",
+        lambda: _run_table_editor_command(lambda: _insert_table_editor_row("above")),
     )
-    below = Button(
-        text="Insert Below",
-        handler=lambda: _run_table_editor_command(lambda: _insert_table_editor_row("below")),
+    below = _table_command_button(
+        "Insert Below",
+        lambda: _run_table_editor_command(lambda: _insert_table_editor_row("below")),
     )
-    delete = Button(
-        text="Delete Row",
-        handler=lambda: _run_table_editor_command(_delete_table_editor_row),
+    delete = _table_command_button(
+        "Delete Row",
+        lambda: _run_table_editor_command(_delete_table_editor_row),
     )
-    cancel = Button(text="Cancel", handler=close_dialog)
-    dialog = Dialog(
+    cancel = _table_command_button("Cancel", close_dialog)
+    _show_table_command_dialog(
         title="Row",
-        body=Label(text="Change the selected table row."),
+        message="Change the selected table row.",
         buttons=[above, below, delete, cancel],
         width=D(preferred=70),
+        focus=below if session.selected_row == 0 else above,
     )
-    show_dialog(dialog, focus=below if session.selected_row == 0 else above)
 
 
 def _show_table_column_menu():
@@ -7078,39 +8047,30 @@ def _show_table_column_menu():
         session.editing = False
         _update_table_editor_ui(session)
 
-    left = Button(
-        text="Insert Left",
-        handler=lambda: _run_table_editor_command(lambda: _insert_table_editor_column("left")),
+    left = _table_command_button(
+        "Insert Left",
+        lambda: _run_table_editor_command(lambda: _insert_table_editor_column("left")),
     )
-    right = Button(
-        text="Insert Right",
-        handler=lambda: _run_table_editor_command(lambda: _insert_table_editor_column("right")),
+    right = _table_command_button(
+        "Insert Right",
+        lambda: _run_table_editor_command(lambda: _insert_table_editor_column("right")),
     )
-    delete = Button(
-        text="Delete Column",
-        handler=lambda: _run_table_editor_command(_delete_table_editor_column),
+    delete = _table_command_button(
+        "Delete Column",
+        lambda: _run_table_editor_command(_delete_table_editor_column),
     )
-    cancel = Button(text="Cancel", handler=close_dialog)
-    dialog = Dialog(
+    cancel = _table_command_button("Cancel", close_dialog)
+    _show_table_command_dialog(
         title="Column",
-        body=Label(text="Change the selected table column."),
+        message="Change the selected table column.",
         buttons=[left, right, delete, cancel],
         width=D(preferred=76),
+        focus=right,
     )
-    show_dialog(dialog, focus=right)
 
 
-def _table_grid_fragments(session):
-    """Render the complete table and anchor scrolling to the selected cell.
-
-    The grid Window is deliberately a bounded viewport.  Every table row is
-    rendered into its UIContent, including rows whose wrapped cell text makes
-    them several screen lines tall.  A zero-width [SetCursorPosition] marker
-    is placed at the selected cell; prompt_toolkit uses that logical cursor to
-    keep the selection inside the viewport as arrow-key navigation moves
-    through a tall table.  The cursor itself remains hidden.
-    """
-    rows = _table_rows(session)
+def _table_grid_geometry(session):
+    """Return shared column geometry and border strings for the table editor."""
     columns = session.working.column_count
     try:
         terminal_width = get_app().output.get_size().columns
@@ -7118,23 +8078,70 @@ def _table_grid_fragments(session):
         terminal_width = 100
     available = max(50, min(120, terminal_width - 12))
     cell_width = max(8, (available - columns - 1) // columns - 2)
+    span = "─" * (cell_width + 2)
+    return {
+        "columns": columns,
+        "cell_width": cell_width,
+        "top": "┌" + "┬".join(span for _ in range(columns)) + "┐",
+        "middle": "├" + "┼".join(span for _ in range(columns)) + "┤",
+        "bottom": "└" + "┴".join(span for _ in range(columns)) + "┘",
+    }
+
+
+def _table_grid_outer_border_fragments(session, edge):
+    """Render one fixed outer border outside the scrolling table viewport."""
+    geometry = _table_grid_geometry(session)
+    return [("class:table.border", geometry[edge])]
+
+
+def _table_grid_body_height(session):
+    """Return the natural rendered height of the scrollable table body.
+
+    Rows can wrap to multiple terminal lines, and each adjacent pair of rows
+    has one internal separator.  Cap the viewport at 18 rows for large tables,
+    but never allocate blank body rows below a short table.
+    """
+    rows = _table_rows(session)
+    geometry = _table_grid_geometry(session)
+    cell_width = geometry["cell_width"]
+
+    natural_height = max(1, len(rows) - 1)  # internal separators
+    for row in rows:
+        row_height = 1
+        for cell in row:
+            wrapped = textwrap.wrap(
+                cell,
+                width=cell_width,
+                break_long_words=False,
+                break_on_hyphens=False,
+                replace_whitespace=False,
+            ) or [""]
+            row_height = max(row_height, len(wrapped))
+        natural_height += row_height
+
+    viewport_height = min(natural_height, 18)
+    # Give HSplit permission to shrink on unusually short terminals, while the
+    # preferred/max pair prevents spare blank rows on ordinary layouts.
+    return D(min=1, preferred=viewport_height, max=viewport_height)
+
+
+def _table_grid_fragments(session):
+    """Render only the scrollable table body and internal row separators.
+
+    The top and bottom borders are separate fixed Windows in the dialog.  This
+    Window contains only rows and internal separators, so arrow-key navigation
+    can scroll the selected cell without ever scrolling the table frame away.
+    A zero-width [SetCursorPosition] marker at the selected cell gives
+    prompt_toolkit a logical cursor to keep visible; the cursor itself remains
+    hidden.
+    """
+    rows = _table_rows(session)
+    geometry = _table_grid_geometry(session)
+    columns = geometry["columns"]
+    cell_width = geometry["cell_width"]
+    border = geometry["middle"]
 
     fragments = []
-    # Middle separators must terminate at the table edges. Using ┼ at the
-    # ends draws a horizontal stroke beyond each outside vertical border;
-    # ├/┤ join into those borders without overshooting them.
-    border = "├" + "┼".join("─" * (cell_width + 2) for _ in range(columns)) + "┤"
-
-    def add_border(first=False, last=False):
-        if first:
-            text = "┌" + "┬".join("─" * (cell_width + 2) for _ in range(columns)) + "┐"
-        elif last:
-            text = "└" + "┴".join("─" * (cell_width + 2) for _ in range(columns)) + "┘"
-        else:
-            text = border
-        fragments.append(("class:table.border", text + "\n"))
-
-    add_border(first=True)
     for row_number, row in enumerate(rows):
         wrapped_cells = []
         for cell in row:
@@ -7149,7 +8156,6 @@ def _table_grid_fragments(session):
 
         row_height = max(len(parts) for parts in wrapped_cells)
         selected_row = row_number == session.selected_row
-        # prompt_toolkit scrolls this Window to keep its logical cursor visible.
         # Anchor downward navigation (and always the final row) at the row's
         # last rendered line so the bottom of a tall row can actually enter the
         # viewport. Upward navigation anchors at the first rendered line.
@@ -7160,14 +8166,14 @@ def _table_grid_fragments(session):
         for visual_line in range(row_height):
             fragments.append(("class:table.border", "│"))
             for col in range(columns):
-                text = wrapped_cells[col][visual_line] if visual_line < len(wrapped_cells[col]) else ""
-                text = text.ljust(cell_width)
+                cell_text = (
+                    wrapped_cells[col][visual_line]
+                    if visual_line < len(wrapped_cells[col])
+                    else ""
+                )
+                cell_text = cell_text.ljust(cell_width)
                 selected = selected_row and col == session.selected_col
                 if selected and visual_line == cursor_visual_line:
-                    # FormattedTextControl exposes this marker as its logical
-                    # cursor position.  Window scrolling follows it even
-                    # though show_cursor=False, giving the grid a real
-                    # vertically scrolling viewport without altering data.
                     fragments.append(("[SetCursorPosition]", ""))
                 if selected:
                     style_name = "class:table.cell.selected"
@@ -7175,21 +8181,13 @@ def _table_grid_fragments(session):
                     style_name = "class:table.header"
                 else:
                     style_name = "class:table.cell"
-                fragments.append((style_name, f" {text} "))
+                fragments.append((style_name, f" {cell_text} "))
                 fragments.append(("class:table.border", "│"))
             fragments.append(("", "\n"))
 
         if row_number != len(rows) - 1:
-            add_border()
-    add_border(last=True)
+            fragments.append(("class:table.border", border + "\n"))
 
-    if len(rows) > 1:
-        fragments.append(
-            (
-                "class:table.hint",
-                "Arrow navigation scrolls the table automatically when the selected cell moves beyond the viewport.",
-            )
-        )
     return fragments
 
 
@@ -7301,15 +8299,43 @@ def open_table_editor(table_number):
     )
     grid_window = Window(
         content=grid_control,
-        height=D(preferred=16, max=20),
+        height=lambda: _table_grid_body_height(session),
         dont_extend_height=True,
+    )
+    grid_top_border = Window(
+        content=FormattedTextControl(
+            text=lambda: _table_grid_outer_border_fragments(session, "top")
+        ),
+        height=1,
+        dont_extend_height=True,
+    )
+    grid_bottom_border = Window(
+        content=FormattedTextControl(
+            text=lambda: _table_grid_outer_border_fragments(session, "bottom")
+        ),
+        height=1,
+        dont_extend_height=True,
+    )
+    # Keep the table grid itself centered within the table editor. The title,
+    # hints, and command buttons retain the dialog's normal full-width layout.
+    # Constrain the grid stack to its actual rendered width, then let equal
+    # flexible windows on either side absorb the remaining dialog space.
+    grid_stack = Box(
+        body=HSplit([grid_top_border, grid_window, grid_bottom_border]),
+        width=lambda: get_cwidth(_table_grid_geometry(session)["top"]),
+        padding=0,
+    )
+    centered_grid = VSplit(
+        [
+            Window(),
+            grid_stack,
+            Window(),
+        ]
     )
     cell_label = Label(text=_table_cell_label(session))
     mode_label = Label(text=_table_mode_hint(session))
-    title_editor = TextArea(
+    title_editor = SingleLineInput(
         text=session.working.title,
-        multiline=False,
-        focus_on_click=True,
         style="class:input-field",
     )
     cell_editor = TextArea(
@@ -7409,7 +8435,7 @@ def open_table_editor(table_number):
                 Label(text="Title (optional; Shift+Tab from first cell):"),
                 title_editor,
                 Window(height=1, char="─", style="class:divider"),
-                grid_window,
+                centered_grid,
                 Window(height=1, char="─", style="class:divider"),
                 cell_label,
                 ConditionalContainer(
@@ -7445,9 +8471,9 @@ def do_insert_table():
             "Move the cursor off the folded table or footnote before inserting another table.",
         )
         return
-    title_field = TextArea(text="", multiline=False, style="class:input-field")
-    columns_field = TextArea(text="3", multiline=False, style="class:input-field")
-    rows_field = TextArea(text="2", multiline=False, style="class:input-field")
+    title_field = SingleLineInput(text="")
+    columns_field = SingleLineInput(text="3")
+    rows_field = SingleLineInput(text="2")
 
     def insert_handler():
         try:
@@ -8249,12 +9275,8 @@ def export_via_pandoc(fmt_label, ext, extra_args=None):
 
 
 def do_custom_export():
-    path_field = TextArea(
-        text=_default_export_path("out"), multiline=False, style="class:input-field"
-    )
-    args_field = TextArea(
-        text="-t html --standalone", multiline=False, style="class:input-field"
-    )
+    path_field = SingleLineInput(text=_default_export_path("out"))
+    args_field = SingleLineInput(text="-t html --standalone")
 
     def ok_handler():
         out_path = os.path.expanduser(path_field.text.strip())
@@ -8419,15 +9441,20 @@ KEYBINDING_ROWS = [
     ("Ctrl+V", "Paste"),
     ("Ctrl+Q", "Quit"),
     ("F1", "Carriage Help"),
+    ("F2", "Toggle italic on selected text"),
+    ("F3", "Toggle bold on selected text"),
+    ("F4", "Insert table"),
+    ("F5", "Insert footnote"),
     ("F6", "Toggle Extend Selection mode"),
     ("F7", "Spell check"),
     ("F8", "Renumber numbered list"),
     ("F10", "Open menu bar"),
     ("Ctrl+Space", "Open menu bar"),
+    ("Home / End", "Go to start / end of displayed row"),
     ("Ctrl+Home", "Go to top of document"),
     ("Ctrl+End", "Go to end of document"),
-    ("Alt+Up", "Go to previous section"),
-    ("Alt+Down", "Go to next section"),
+    ("Alt+Up", "Go to previous section; align heading at top"),
+    ("Alt+Down", "Go to next section; align heading at top"),
     ("1-6", "Jump to File/Edit/Go/Export/Tools/Help"),
     ("Tab", "Indent normally; on a table or footnote, open its editor"),
     ("Esc", "Close menu or dialog"),
@@ -8457,22 +9484,37 @@ def _format_help_notes(width=62):
         (
             "Selection: F6 toggles Extend Selection mode. While it is active, "
             "Left/Right selects by character, Up/Down by display row, "
-            "Ctrl+Left/Right by word, Home/End to the current line boundary, "
+            "Ctrl+Left/Right by word, Home/End to the current displayed-row boundary, "
             "and Ctrl+Home/End to the document boundary. Press F6 again to leave "
             "Extend Selection while preserving the selection. The usual "
             "Shift+Arrow, Shift+Home/End, Ctrl+Shift+Left/Right, and "
             "Ctrl+Shift+Home/End shortcuts remain available when the terminal "
-            "passes them through. With mouse support enabled, double-click selects "
-            "a word and triple-click selects the current paragraph or list item. "
+            "passes them through. Structural Markdown displayed in the hanging gutter "
+            "is not a cursor destination; navigation stops at the visible prose boundary, "
+            "while Backspace there can still remove structure such as a list marker. "
+            "With mouse support enabled, clicking the left or right prose gutter moves "
+            "to the beginning or end of that displayed row; "
+            "double-click selects a word and triple-click selects the current paragraph "
+            "or list item. "
             "Ctrl+X cuts, Ctrl+C copies, and Ctrl+V pastes. Cut/copy use "
             "Carriage's internal clipboard."
+        ),
+        (
+            "Emphasis: Select text and press F2 for italic or F3 for bold. The two "
+            "attributes toggle independently, so applying both produces bold italic. "
+            "Carriage-generated emphasis uses asterisks; straightforward existing "
+            "underscore emphasis is respected during ordinary toggling. Leading and "
+            "trailing selection whitespace remains outside the markers. If Carriage "
+            "cannot identify a safe toggle, the source and selection are left unchanged "
+            "and a brief explanation appears on the status line."
         ),
         (
             "Wrapping: Carriage soft-wraps visually at the configured prose width "
             "without changing source line breaks. Edit > Convert for Carriage is a "
             "document-wide normalization command: it converts Setext headings to ATX, "
-            "renumbers simple ordered lists from their existing first number, and joins "
-            "hard-wrapped prose into logical source lines while preserving supported "
+            "renumbers simple ordered lists from their existing first number, normalizes "
+            "straightforward underscore emphasis to Carriage's preferred asterisk form, "
+            "and joins hard-wrapped prose into logical source lines while preserving supported "
             "Markdown structure. Original Markdown hard breaks use two trailing spaces "
             "and display as ↵ when the hard-break marker is enabled; the marker is "
             "visual only. Export > Hard-Wrapped Markdown writes a separate Markdown "
@@ -8491,6 +9533,13 @@ def _format_help_notes(width=62):
             "labels directly."
         ),
         (
+            "Configuration: Persistent settings are read at startup from "
+            "$XDG_CONFIG_HOME/carriage/config.toml, or ~/.config/carriage/config.toml "
+            "when XDG_CONFIG_HOME is not set. Prose width and scrollbar visibility "
+            "are configured there along with the smaller set of interface and tool "
+            "settings. Carriage does not provide a Preferences dialog."
+        ),
+        (
             "Saving and recovery: Carriage continuously protects unsaved working "
             "state in a private recovery journal without changing the Markdown file. "
             "The journal is normally updated two seconds after editing becomes idle "
@@ -8500,14 +9549,15 @@ def _format_help_notes(width=62):
             "restore or discard recovered work."
         ),
         (
-            "Tables: Arrow keys navigate table cells. Enter edits the selected cell; "
+            "Tables: F4 or Tools > Insert Table creates a new table. Arrow keys navigate "
+            "table cells. Enter edits the selected cell; "
             "Enter again commits it. Shift+Tab from the first cell focuses the title "
             "field; Tab or Enter returns to the grid. In navigation mode, R opens row "
             "commands and C opens column commands. Ctrl-based editing shortcuts retain "
             "their normal meanings inside editable text fields."
         ),
         (
-            "Footnotes: Tools > Insert Footnote creates a standard Markdown reference "
+            "Footnotes: F5 or Tools > Insert Footnote creates a standard Markdown reference "
             "and a folded single-paragraph definition. References display as [1], [2], "
             "and so on; Tab opens a simple note editor. Complex footnotes remain "
             "ordinary source."
@@ -8583,8 +9633,11 @@ def _build_markdown_help(width=62):
         (
             "Emphasis",
             [
-                "    *italic*  or  _italic_",
-                "    **bold**  or  __bold__",
+                "    *italic*",
+                "    **bold**",
+                "    ***bold italic***",
+                "F2 toggles italic and F3 toggles bold on selected text.",
+                "Carriage writes asterisks; Convert for Carriage can normalize straightforward underscore emphasis.",
             ],
         ),
         (
@@ -8625,7 +9678,7 @@ def _build_markdown_help(width=62):
             [
                 "    Text with a note.[^id]",
                 "    [^id]: Footnote text",
-                "Tools > Insert Footnote creates a simple standard footnote.",
+                "F5 or Tools > Insert Footnote creates a simple standard footnote.",
                 "Carriage folds single-paragraph definitions and displays",
                 "references sequentially as [1], [2], and so on.",
                 "Use Tools > Delete Footnote at Cursor to remove a folded",
@@ -8635,7 +9688,7 @@ def _build_markdown_help(width=62):
         (
             "Tables",
             [
-                "Use Tools > Insert Table to create a table, or edit a folded",
+                "Use F4 or Tools > Insert Table to create a table, or edit a folded",
                 "table object with Tab or Tools > Edit Table at Cursor.",
                 "Use Tools > Delete Table at Cursor to remove one safely.",
                 "Optional titles use Pandoc table captions and appear in the",
@@ -8678,7 +9731,7 @@ def do_show_about():
     ok_button = Button(text="OK", handler=close_dialog)
     dialog = Dialog(
         title="About Carriage",
-        body=Label(text=ABOUT_TEXT, wrap_lines=False),
+        body=_dialog_prose(ABOUT_TEXT, width=62),
         buttons=[ok_button],
         width=D(preferred=70),
     )
@@ -8733,21 +9786,25 @@ def _document_heading_rows(doc):
     ]
 
 
-def _move_editor_to_row(row):
-    """Move the prose-editor cursor to column zero of a logical row."""
+def _move_editor_to_row(row, align_top=False):
+    """Move the prose cursor to a logical row, optionally pinning it at top."""
     doc = text_area.buffer.document
     if not doc.lines:
         text_area.buffer.cursor_position = 0
+        text_area.window._section_top_anchor_row = 0 if align_top else None
         return
 
     row = max(0, min(len(doc.lines) - 1, row))
-    text_area.buffer.cursor_position = doc.translate_row_col_to_index(row, 0)
+    body_col = _hidden_structural_body_col(doc, row)
+    text_area.buffer.cursor_position = doc.translate_row_col_to_index(row, body_col)
+    # cursor_position_changed clears an existing anchor. Install the requested
+    # one only after the move so it survives until the next ordinary action.
+    text_area.window._section_top_anchor_row = row if align_top else None
     get_app().invalidate()
 
 
 def do_go_top():
-    text_area.buffer.cursor_position = 0
-    get_app().invalidate()
+    _move_editor_to_row(0)
 
 
 def do_go_end():
@@ -8774,7 +9831,7 @@ def do_go_previous_section():
             break
 
     if target is not None:
-        _move_editor_to_row(target)
+        _move_editor_to_row(target, align_top=True)
 
 
 def do_go_next_section():
@@ -8783,7 +9840,7 @@ def do_go_next_section():
     cursor_row = doc.cursor_position_row
     for row in _document_heading_rows(doc):
         if row > cursor_row:
-            _move_editor_to_row(row)
+            _move_editor_to_row(row, align_top=True)
             return
 
 
@@ -8992,6 +10049,10 @@ def _prose_word_count(visible_text):
 
 
 def get_statusbar_text():
+    transient = _current_transient_status_message()
+    if transient is not None:
+        return [("class:status", f" {transient} ")]
+
     doc = text_area.buffer.document
     words = _prose_word_count(text_area.text)
     section = _current_section_title(doc)
@@ -9046,9 +10107,34 @@ status_bar = ConditionalContainer(
     filter=Condition(lambda: state.statusbar_visible),
 )
 
+# When the normal status bar is disabled, transient notices still occupy the
+# same bottom screen row as an overlay. This keeps the notification location
+# consistent without temporarily changing the editor's height.
+transient_status_overlay = ConditionalContainer(
+    Window(
+        content=FormattedTextControl(get_statusbar_text),
+        height=1,
+        style="class:status",
+    ),
+    filter=Condition(
+        lambda: (
+            not state.statusbar_visible
+            and _current_transient_status_message() is not None
+        )
+    ),
+)
+floats.append(
+    Float(
+        content=transient_status_overlay,
+        left=0,
+        right=0,
+        bottom=0,
+        height=1,
+    )
+)
+
 body = HSplit(
     [
-        Window(height=1, style="class:editor"),
         text_area,
         status_divider,
         status_bar,
@@ -9056,13 +10142,13 @@ body = HSplit(
 )
 
 class EdgeAlignedMenuContainer(MenuContainer):
-    """MenuContainer whose selection includes its leading separator cell.
+    """MenuContainer with symmetric top-level selection highlighting.
 
-    prompt_toolkit inserts one unselected space before every top-level menu
-    item. For the first item, that leaves a one-cell strip of menu-bar
-    background between the bar's left edge and the selected highlight. Keep
-    the inter-item spacing, but treat that separator as part of the selected
-    item and anchor its submenu at the same left edge.
+    prompt_toolkit inserts one separator cell before every top-level menu item.
+    Keep that separator in the ordinary menu-bar style so the selected
+    highlight covers only the menu label itself. Preserve Carriage's special
+    first-menu anchoring by placing File's submenu marker before its separator;
+    all later submenus anchor at the start of their visible label.
     """
 
     def _get_menu_fragments(self):
@@ -9090,19 +10176,24 @@ class EdgeAlignedMenuContainer(MenuContainer):
                     self.selected_menu = [index]
 
             selected = index == self.selected_menu[0] and focused
+
+            # Keep File's pull-down flush with the menu bar's left edge, but
+            # do not color its leading separator as part of the selection.
+            if selected and index == 0:
+                yield ("[SetMenuPosition]", "", mouse_handler)
+
+            yield ("class:menu-bar", " ", mouse_handler)
+
+            # Other pull-downs begin at the visible start of their labels,
+            # matching prompt_toolkit's normal menu positioning.
+            if selected and index != 0:
+                yield ("[SetMenuPosition]", "", mouse_handler)
+
             style_name = (
                 "class:menu-bar.selected-item"
                 if selected
                 else "class:menu-bar"
             )
-
-            # Anchor the submenu at the left edge of the complete selected
-            # block, including the separator cell. This makes File line up
-            # exactly with the left edge of the menu bar.
-            if selected:
-                yield ("[SetMenuPosition]", "", mouse_handler)
-
-            yield (style_name, " ", mouse_handler)
             yield (style_name, item.text, mouse_handler)
 
         result = []
@@ -9111,45 +10202,63 @@ class EdgeAlignedMenuContainer(MenuContainer):
         return result
 
 
+def _menu_label(label, shortcut=None, shortcut_col=None):
+    """Return a menu caption with shortcuts aligned to one column.
+
+    Each pull-down chooses a shortcut column appropriate to its own labels.
+    Shortcutless commands remain unpadded, while every shortcut-bearing item
+    in that menu begins at the same rendered cell.
+    """
+    if not shortcut:
+        return label
+    if shortcut_col is None:
+        shortcut_col = get_cwidth(label) + 2
+    padding = max(2, shortcut_col - get_cwidth(label))
+    return f"{label}{' ' * padding}{shortcut}"
+
+
 menu_container = EdgeAlignedMenuContainer(
     body=body,
     menu_items=[
         MenuItem(
             "  File  ",
             children=[
-                MenuItem("New          Ctrl+N", handler=with_unsaved_changes_check(do_new)),
-                MenuItem("Open...      Ctrl+O", handler=with_unsaved_changes_check(do_open)),
-                MenuItem("Save      Ctrl+S / F9", handler=do_save),
+                MenuItem(_menu_label("New", "Ctrl+N", 13), handler=with_unsaved_changes_check(do_new)),
+                MenuItem(_menu_label("Open...", "Ctrl+O", 13), handler=with_unsaved_changes_check(do_open)),
+                MenuItem(_menu_label("Save", "Ctrl+S / F9", 13), handler=do_save),
                 MenuItem("Save As...", handler=do_save_as),
                 MenuItem("-", disabled=True),
-                MenuItem("Quit         Ctrl+Q", handler=with_unsaved_changes_check(do_quit)),
+                MenuItem(_menu_label("Quit", "Ctrl+Q", 13), handler=with_unsaved_changes_check(do_quit)),
             ],
         ),
         MenuItem(
             "  Edit  ",
             children=[
-                MenuItem("Undo         Ctrl+Z", handler=do_undo),
-                MenuItem("Redo         Ctrl+R", handler=do_redo),
+                MenuItem(_menu_label("Undo", "Ctrl+Z", 18), handler=do_undo),
+                MenuItem(_menu_label("Redo", "Ctrl+R", 18), handler=do_redo),
                 MenuItem("-", disabled=True),
-                MenuItem("Cut          Ctrl+X", handler=do_cut),
-                MenuItem("Copy         Ctrl+C", handler=do_copy),
-                MenuItem("Paste        Ctrl+V", handler=do_paste),
+                MenuItem(_menu_label("Cut", "Ctrl+X", 18), handler=do_cut),
+                MenuItem(_menu_label("Copy", "Ctrl+C", 18), handler=do_copy),
+                MenuItem(_menu_label("Paste", "Ctrl+V", 18), handler=do_paste),
                 MenuItem("-", disabled=True),
-                MenuItem("Renumber List   F8", handler=do_renumber_list),
+                MenuItem(_menu_label("Italic", "F2", 18), handler=do_toggle_italic),
+                MenuItem(_menu_label("Bold", "F3", 18), handler=do_toggle_bold),
+                MenuItem(_menu_label("Extend Selection", "F6", 18), handler=lambda: _toggle_extend_selection_mode()),
+                MenuItem("-", disabled=True),
+                MenuItem(_menu_label("Renumber List", "F8", 18), handler=do_renumber_list),
                 MenuItem("Convert for Carriage", handler=do_convert_for_carriage),
                 MenuItem("-", disabled=True),
-                MenuItem("Preferences...", handler=do_preferences),
                 MenuItem("Toggle Status Bar", handler=do_toggle_statusbar),
             ],
         ),
         MenuItem(
             "  Go  ",
             children=[
-                MenuItem("Top of Document      Ctrl+Home", handler=do_go_top),
-                MenuItem("End of Document      Ctrl+End", handler=do_go_end),
+                MenuItem(_menu_label("Top of Document", "Ctrl+Home", 20), handler=do_go_top),
+                MenuItem(_menu_label("End of Document", "Ctrl+End", 20), handler=do_go_end),
                 MenuItem("-", disabled=True),
-                MenuItem("Previous Section     Alt+Up", handler=do_go_previous_section),
-                MenuItem("Next Section         Alt+Down", handler=do_go_next_section),
+                MenuItem(_menu_label("Previous Section", "Alt+Up", 20), handler=do_go_previous_section),
+                MenuItem(_menu_label("Next Section", "Alt+Down", 20), handler=do_go_next_section),
             ],
         ),
         MenuItem(
@@ -9175,21 +10284,21 @@ menu_container = EdgeAlignedMenuContainer(
         MenuItem(
             "  Tools  ",
             children=[
-                MenuItem("Spell Check   F7", handler=do_run_spellcheck),
+                MenuItem(_menu_label("Spell Check", "F7", 26), handler=do_run_spellcheck),
                 MenuItem("-", disabled=True),
-                MenuItem("Insert Table...", handler=do_insert_table),
-                MenuItem("Edit Table at Cursor   Tab", handler=do_edit_table_at_cursor),
+                MenuItem(_menu_label("Insert Table...", "F4", 26), handler=do_insert_table),
+                MenuItem(_menu_label("Edit Table at Cursor", "Tab", 26), handler=do_edit_table_at_cursor),
                 MenuItem("Delete Table at Cursor...", handler=do_delete_table_at_cursor),
                 MenuItem("-", disabled=True),
-                MenuItem("Insert Footnote", handler=do_insert_footnote),
-                MenuItem("Edit Footnote at Cursor   Tab", handler=do_edit_footnote_at_cursor),
+                MenuItem(_menu_label("Insert Footnote", "F5", 26), handler=do_insert_footnote),
+                MenuItem(_menu_label("Edit Footnote at Cursor", "Tab", 26), handler=do_edit_footnote_at_cursor),
                 MenuItem("Delete Footnote at Cursor...", handler=do_delete_footnote_at_cursor),
             ],
         ),
         MenuItem(
             "  Help  ",
             children=[
-                MenuItem("Carriage Help   F1", handler=do_show_help),
+                MenuItem(_menu_label("Carriage Help", "F1", 16), handler=do_show_help),
                 MenuItem("Markdown Syntax", handler=do_show_markdown_help),
                 MenuItem("-", disabled=True),
                 MenuItem("About Carriage", handler=do_show_about),
@@ -9223,6 +10332,31 @@ def _(event):
 @kb.add("c-o", filter=editor_focused)
 def _(event):
     with_unsaved_changes_check(do_open)()
+
+
+@kb.add("f2", filter=editor_focused)
+def _(event):
+    # Selection-only italic toggle. Carriage intentionally does not provide a
+    # persistent formatting mode or a Ctrl+I alias (Ctrl+I is Tab in terminals).
+    do_toggle_italic()
+
+
+@kb.add("f3", filter=editor_focused)
+def _(event):
+    # Selection-only bold toggle; F3 is the sole keyboard shortcut.
+    do_toggle_bold()
+
+
+@kb.add("f4", filter=editor_focused)
+def _(event):
+    # F4 is the single-keystroke alias for Tools > Insert Table.
+    do_insert_table()
+
+
+@kb.add("f5", filter=editor_focused)
+def _(event):
+    # F5 is the single-keystroke alias for Tools > Insert Footnote.
+    do_insert_footnote()
 
 
 @kb.add("c-s", filter=editor_focused)
@@ -9555,7 +10689,7 @@ def _line_prefix_cell_width(row, wrap_count):
         # Formatted-text fragments can carry mouse handlers/extra tuple fields;
         # style is item 0 and text is item 1.
         if len(fragment) >= 2:
-            width += get_cwidth(fragment[1])
+            width += _display_text_width(fragment[1])
     return width
 
 
@@ -9581,7 +10715,7 @@ def _visual_display_positions(row, info):
 
     for fragment in fragments:
         char = fragment[1]
-        char_width = max(0, get_cwidth(char))
+        char_width = _display_char_width(char)
         if x + char_width > width:
             wrap_row += 1
             x = _line_prefix_cell_width(row, wrap_row)
@@ -9632,8 +10766,11 @@ def _source_col_for_visual_position(row, wrap_row, preferred_x, info):
         return None
 
     source_line = doc.lines[row]
+    body_col = _hidden_structural_body_col(doc, row) if wrap_row == 0 else 0
     best = None
     for source_col in range(len(source_line) + 1):
+        if source_col < body_col:
+            continue
         try:
             display_col = processed.source_to_display(source_col)
         except Exception:
@@ -9754,6 +10891,7 @@ def _extend_selection_to_position(target):
     """Move the active end of the F6 selection to an absolute source index."""
     buf = text_area.buffer
     target = max(0, min(len(buf.text), int(target)))
+    target = _clamp_source_position_out_of_gutter(buf.text, target)
     original_position = buf.cursor_position
 
     if buf.selection_state is None:
@@ -9770,25 +10908,184 @@ def _extend_selection_to_position(target):
     return buf.cursor_position != original_position
 
 
-def _extend_selection_by_word(delta):
-    """Extend the F6 selection one ordinary word boundary left or right."""
-    doc = text_area.buffer.document
-    if delta < 0:
-        amount = doc.find_previous_word_beginning()
-    else:
-        amount = doc.find_next_word_beginning()
-        if amount is None and doc.cursor_position < len(doc.text):
-            amount = len(doc.text) - doc.cursor_position
-    if amount is None:
+def _move_editor_cursor_by_word(direction):
+    """Move by a visible word boundary without entering hidden footnote source."""
+    buf = text_area.buffer
+    target = _word_navigation_target(buf.document, direction)
+    if target is None or target == buf.cursor_position:
         return False
-    return _extend_selection_to_position(doc.cursor_position + amount)
+    text_area.window.end_manual_scroll()
+    buf.cursor_position = target
+    buf.preferred_column = None
+    get_app().invalidate()
+    return True
+
+
+def _move_editor_selection_by_word(direction):
+    """Extend an ordinary Shift/F6 selection by one visible word boundary."""
+    buf = text_area.buffer
+    target = _word_navigation_target(buf.document, direction)
+    if target is None:
+        return False
+
+    if buf.selection_state is None:
+        if not buf.text:
+            return False
+        buf.start_selection(selection_type=SelectionType.CHARACTERS)
+    if buf.selection_state is not None:
+        buf.selection_state.enter_shift_mode()
+
+    original = buf.cursor_position
+    buf.cursor_position = target
+    if buf.selection_state is not None:
+        anchor = buf.selection_state.original_cursor_position
+        if buf.cursor_position == anchor:
+            buf.exit_selection()
+    get_app().invalidate()
+    return buf.cursor_position != original
+
+
+def _extend_selection_by_word(delta):
+    """Extend the F6 selection one visible word boundary left or right."""
+    return _move_editor_selection_by_word(delta)
+
+
+def _visual_row_boundary_source_index(row, wrap_row, end=False, info=None):
+    """Return one displayed-row boundary as an absolute source index.
+
+    This is the shared boundary resolver for Home/End and prose-gutter clicks.
+    ``row`` is a logical source row and ``wrap_row`` is the zero-based visual
+    row within it. Hidden compact-footnote source and folded-object sentinels
+    are never exposed as cursor stops.
+    """
+    doc = text_area.buffer.document
+    if not (0 <= row < doc.line_count):
+        return None
+
+    source_line = doc.lines[row]
+    if info is None:
+        info = text_area.window.render_info
+
+    def physical_boundary():
+        if end:
+            source_col = len(source_line)
+            if source_line.endswith((TABLE_SENTINEL, FOOTNOTE_SENTINEL)):
+                source_col = max(0, source_col - 1)
+        else:
+            source_col = _hidden_structural_body_col(doc, row)
+        return doc.translate_row_col_to_index(row, source_col)
+
+    if info is None or info.window_width <= 0:
+        return physical_boundary()
+
+    get_processed = getattr(text_area.control, "_last_get_processed_line", None)
+    positions = _visual_display_positions(row, info)
+    if get_processed is None or not positions:
+        return physical_boundary()
+
+    try:
+        processed = get_processed(row)
+    except Exception:
+        return physical_boundary()
+
+    compact_ranges = [
+        (span[0], span[1])
+        for span in _footnote_display_spans(doc.text, row)
+        if len(span) >= 5 and not span[4]
+    ]
+    body_col = _hidden_structural_body_col(doc, row) if wrap_row == 0 else 0
+    candidates = []
+    for source_col in range(len(source_line) + 1):
+        if source_col < body_col:
+            continue
+        if (
+            source_col > 0
+            and source_line[source_col - 1:source_col]
+            in {TABLE_SENTINEL, FOOTNOTE_SENTINEL}
+        ):
+            continue
+        if any(
+            start_col < source_col < end_col
+            for start_col, end_col in compact_ranges
+        ):
+            continue
+        try:
+            display_col = processed.source_to_display(source_col)
+        except Exception:
+            continue
+        display_col = max(0, min(display_col, len(positions) - 1))
+        candidate_wrap, x = positions[display_col]
+        if candidate_wrap == wrap_row:
+            candidates.append((x, source_col))
+
+    if not candidates:
+        return physical_boundary()
+
+    if end:
+        _x, source_col = max(candidates, key=lambda item: (item[0], item[1]))
+    else:
+        _x, source_col = min(candidates, key=lambda item: (item[0], item[1]))
+    return doc.translate_row_col_to_index(row, source_col)
+
+
+def _visual_row_boundary_target(end=False):
+    """Return the source index at the start/end of the current rendered row."""
+    buf = text_area.buffer
+    doc = buf.document
+    row = doc.cursor_position_row
+    info = text_area.window.render_info
+
+    if info is None or info.window_width <= 0:
+        amount = doc.get_end_of_line_position() if end else doc.get_start_of_line_position()
+        target = doc.cursor_position + amount
+        if end and doc.current_line.endswith((TABLE_SENTINEL, FOOTNOTE_SENTINEL)):
+            target = max(doc.translate_row_col_to_index(row, 0), target - 1)
+        return target
+
+    current_visual = _source_visual_position(row, doc.cursor_position_col, info)
+    if current_visual is None:
+        amount = doc.get_end_of_line_position() if end else doc.get_start_of_line_position()
+        return doc.cursor_position + amount
+
+    return _visual_row_boundary_source_index(
+        row, current_visual[0], end=end, info=info
+    )
+
+
+def _move_editor_cursor_to_visual_row_boundary(end=False):
+    buf = text_area.buffer
+    target = _visual_row_boundary_target(end=end)
+    if target == buf.cursor_position:
+        return False
+    text_area.window.end_manual_scroll()
+    buf.cursor_position = target
+    buf.preferred_column = None
+    get_app().invalidate()
+    return True
+
+
+def _move_editor_selection_to_visual_row_boundary(end=False):
+    buf = text_area.buffer
+    target = _visual_row_boundary_target(end=end)
+    if buf.selection_state is None:
+        if not buf.text:
+            return False
+        buf.start_selection(selection_type=SelectionType.CHARACTERS)
+    if buf.selection_state is not None:
+        buf.selection_state.enter_shift_mode()
+    original = buf.cursor_position
+    buf.cursor_position = target
+    if buf.selection_state is not None:
+        anchor = buf.selection_state.original_cursor_position
+        if buf.cursor_position == anchor:
+            buf.exit_selection()
+    get_app().invalidate()
+    return buf.cursor_position != original
 
 
 def _extend_selection_to_line_boundary(end=False):
-    """Extend the F6 selection to the current physical line boundary."""
-    doc = text_area.buffer.document
-    amount = doc.get_end_of_line_position() if end else doc.get_start_of_line_position()
-    return _extend_selection_to_position(doc.cursor_position + amount)
+    """Compatibility name: F6 Home/End now use the rendered-row boundary."""
+    return _move_editor_selection_to_visual_row_boundary(end=end)
 
 
 def _move_editor_selection_visual_rows(delta):
@@ -9858,19 +11155,48 @@ def _move_editor_cursor_across_lines(delta):
     doc = buf.document
     row = doc.cursor_position_row
     col = doc.cursor_position_col
+    body_col = _hidden_structural_body_col(doc, row)
+
+    # Hidden structural source is never ordinary cursor space. If an old
+    # recovery/undo position or an indirect operation somehow lands there,
+    # normalize it before interpreting the requested movement. At the visible
+    # left edge of a guttered line, Left must still cross the newline normally:
+    # skip the hidden prefix as a unit and land at the previous line's visible
+    # end rather than stopping or exposing the structural Markdown.
+    if col < body_col:
+        buf.cursor_position = doc.translate_row_col_to_index(row, body_col)
+        return
+    if delta < 0 and body_col > 0 and col == body_col:
+        if row <= 0:
+            return
+        line_start = doc.translate_row_col_to_index(row, 0)
+        target = max(0, line_start - 1)
+        # Folded-object sentinels are source-only; if the previous line ends in
+        # one, land at its visible end rather than on the invisible marker.
+        while target > 0 and text[target - 1] in {TABLE_SENTINEL, FOOTNOTE_SENTINEL}:
+            target -= 1
+        buf.cursor_position = _clamp_source_position_out_of_gutter(text, target)
+        return
 
     folded_placeholder = _folded_placeholder_at_cursor(doc)
     if folded_placeholder is not None:
-        # A folded object is one visible navigation unit. Once the caret is on
-        # its line, Left/Right jumps to the object's edge rather than walking
-        # through the label character by character. Shift+Arrow inherits this
-        # behavior, so keyboard selections include the object whole.
-        if delta > 0 and col < len(doc.current_line):
-            buf.cursor_position = doc.translate_row_col_to_index(row, len(doc.current_line))
+        # A folded object is one visible navigation unit. Its trailing sentinel
+        # is a source-only implementation marker and must never consume a key.
+        # The canonical visible end is immediately *before* that sentinel.
+        line = doc.current_line
+        visible_end = len(line)
+        if line.endswith((TABLE_SENTINEL, FOOTNOTE_SENTINEL)):
+            visible_end -= 1
+
+        if delta > 0 and col < visible_end:
+            buf.cursor_position = doc.translate_row_col_to_index(row, visible_end)
             return
         if delta < 0 and col > 0:
             buf.cursor_position = doc.translate_row_col_to_index(row, 0)
             return
+        # At the visible right edge, fall through to the generic path below. It
+        # skips the sentinel first and then crosses the newline in this same
+        # keypress, taking the caret directly to the next visible line.
 
     footnote_span = _footnote_source_span_at_cursor(doc)
     if footnote_span is not None:
@@ -9883,42 +11209,36 @@ def _move_editor_cursor_across_lines(delta):
             return
 
     if delta > 0:
-        # TABLE_SENTINEL is an internal zero-width marker attached to folded
-        # table references. Skip it without consuming a visible cursor step.
-        at_line_end = doc.cursor_position_col == len(doc.current_line)
-        continuation_width = (
-            _list_continuation_prefix_width(doc, row + 1)
+        # Folded-object sentinels are internal zero-width markers. Treat the
+        # position immediately before one as the visible line end, then skip the
+        # marker without consuming a cursor step.
+        current_line = doc.current_line
+        visible_line_end = len(current_line)
+        if current_line.endswith((TABLE_SENTINEL, FOOTNOTE_SENTINEL)):
+            visible_line_end -= 1
+        at_line_end = doc.cursor_position_col >= visible_line_end
+        next_body_col = (
+            _hidden_structural_body_col(doc, row + 1)
             if at_line_end and row + 1 < doc.line_count
-            else None
+            else 0
         )
         while pos < len(text) and text[pos] in {TABLE_SENTINEL, FOOTNOTE_SENTINEL}:
             pos += 1
         if pos < len(text):
             pos += 1
-        if continuation_width is not None:
-            pos = min(len(text), pos + continuation_width)
+        if next_body_col:
+            pos = min(len(text), pos + next_body_col)
         while pos < len(text) and text[pos] in {TABLE_SENTINEL, FOOTNOTE_SENTINEL}:
             pos += 1
     elif delta < 0:
-        continuation_width = _list_continuation_prefix_width(
-            doc, doc.cursor_position_row
-        )
-        if (
-            continuation_width is not None
-            and doc.cursor_position_col == continuation_width
-        ):
-            # Treat canonical continuation indentation as display structure:
-            # one Left from visible column zero reaches the previous line end.
-            pos = max(0, pos - continuation_width - 1)
-        else:
-            while pos > 0 and text[pos - 1] in {TABLE_SENTINEL, FOOTNOTE_SENTINEL}:
-                pos -= 1
-            if pos > 0:
-                pos -= 1
-            while pos > 0 and text[pos - 1] in {TABLE_SENTINEL, FOOTNOTE_SENTINEL}:
-                pos -= 1
+        while pos > 0 and text[pos - 1] in {TABLE_SENTINEL, FOOTNOTE_SENTINEL}:
+            pos -= 1
+        if pos > 0:
+            pos -= 1
+        while pos > 0 and text[pos - 1] in {TABLE_SENTINEL, FOOTNOTE_SENTINEL}:
+            pos -= 1
 
-    buf.cursor_position = pos
+    buf.cursor_position = _clamp_source_position_out_of_gutter(text, pos)
 
 
 @kb.add("s-up", filter=editor_focused)
@@ -9980,24 +11300,60 @@ def _(event):
 extend_selection_mode = Condition(lambda: state.extend_selection_mode)
 
 
-@kb.add("c-left", filter=editor_focused & extend_selection_mode)
+@kb.add("c-left", filter=editor_focused)
 def _(event):
-    _extend_selection_by_word(-1)
+    if state.extend_selection_mode:
+        _extend_selection_by_word(-1)
+    else:
+        event.current_buffer.exit_selection()
+        _move_editor_cursor_by_word(-1)
 
 
-@kb.add("c-right", filter=editor_focused & extend_selection_mode)
+@kb.add("c-right", filter=editor_focused)
 def _(event):
-    _extend_selection_by_word(1)
+    if state.extend_selection_mode:
+        _extend_selection_by_word(1)
+    else:
+        event.current_buffer.exit_selection()
+        _move_editor_cursor_by_word(1)
 
 
-@kb.add("home", filter=editor_focused & extend_selection_mode)
+@kb.add("c-s-left", filter=editor_focused)
 def _(event):
-    _extend_selection_to_line_boundary(end=False)
+    _move_editor_selection_by_word(-1)
 
 
-@kb.add("end", filter=editor_focused & extend_selection_mode)
+@kb.add("c-s-right", filter=editor_focused)
 def _(event):
-    _extend_selection_to_line_boundary(end=True)
+    _move_editor_selection_by_word(1)
+
+
+@kb.add("home", filter=editor_focused)
+def _(event):
+    if state.extend_selection_mode:
+        _extend_selection_to_line_boundary(end=False)
+    else:
+        event.current_buffer.exit_selection()
+        _move_editor_cursor_to_visual_row_boundary(end=False)
+
+
+@kb.add("end", filter=editor_focused)
+def _(event):
+    if state.extend_selection_mode:
+        _extend_selection_to_line_boundary(end=True)
+    else:
+        event.current_buffer.exit_selection()
+        _move_editor_cursor_to_visual_row_boundary(end=True)
+
+
+@kb.add("s-home", filter=editor_focused)
+def _(event):
+    _move_editor_selection_to_visual_row_boundary(end=False)
+
+
+@kb.add("s-end", filter=editor_focused)
+def _(event):
+    _move_editor_selection_to_visual_row_boundary(end=True)
 
 
 @kb.add("c-s", filter=table_editor_active)
