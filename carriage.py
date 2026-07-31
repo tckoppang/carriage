@@ -46,7 +46,7 @@ and scrollbar visibility, are stored in `config.toml` under the user's standard
 configuration directory and can be edited manually.
 
 Requires:
-  pip install prompt_toolkit --break-system-packages
+  pip install 'prompt_toolkit>=3.0.52,<3.0.54'
 
 Optional:
   pandoc, for document export (or configure another Pandoc executable)
@@ -61,6 +61,7 @@ Usage:
 import argparse
 import asyncio
 import copy
+import errno
 from functools import lru_cache
 from bisect import bisect_right
 import hashlib
@@ -79,6 +80,7 @@ import stat
 from html.parser import HTMLParser
 from dataclasses import dataclass, field
 
+import prompt_toolkit
 from prompt_toolkit.application import Application
 from prompt_toolkit.cursor_shapes import CursorShape, SimpleCursorShapeConfig
 from prompt_toolkit.output.color_depth import ColorDepth
@@ -125,7 +127,7 @@ from prompt_toolkit.widgets import (
 )
 
 APP_NAME = "Carriage"
-APP_VERSION = "1.125"
+APP_VERSION = "1.129"
 
 DEFAULT_WRAP_COLUMN = 80
 DEFAULT_SCROLLBAR_VISIBLE = True
@@ -133,6 +135,38 @@ DEFAULT_STATUSBAR_VISIBLE = True
 DEFAULT_MOUSE_ENABLED = True
 DEFAULT_HARD_BREAK_MARKER_VISIBLE = True
 DEFAULT_PANDOC_EXECUTABLE = "pandoc"
+
+# Carriage deliberately relies on several prompt_toolkit implementation
+# details for cursor geometry, mouse handling, scrolling, and unified undo.
+# v1.125 was audited against 3.0.52 and 3.0.53; keep the initial public
+# compatibility window deliberately narrow until newer releases pass the same
+# editor-behavior regression suite.
+PROMPT_TOOLKIT_MIN_VERSION = (3, 0, 52)
+PROMPT_TOOLKIT_MAX_VERSION = (3, 0, 54)  # exclusive
+PROMPT_TOOLKIT_REQUIREMENT = "prompt_toolkit>=3.0.52,<3.0.54"
+
+
+def _prompt_toolkit_version_tuple(version_text):
+    """Return the numeric release prefix from a prompt_toolkit version."""
+    match = re.match(r"^(\d+)\.(\d+)\.(\d+)", str(version_text))
+    if match is None:
+        return None
+    return tuple(int(part) for part in match.groups())
+
+
+def _check_prompt_toolkit_compatibility():
+    """Raise RuntimeError when prompt_toolkit is outside the audited window."""
+    installed_text = getattr(prompt_toolkit, "__version__", "unknown")
+    installed = _prompt_toolkit_version_tuple(installed_text)
+    if (
+        installed is None
+        or installed < PROMPT_TOOLKIT_MIN_VERSION
+        or installed >= PROMPT_TOOLKIT_MAX_VERSION
+    ):
+        raise RuntimeError(
+            "Carriage requires "
+            f"{PROMPT_TOOLKIT_REQUIREMENT}; found prompt_toolkit {installed_text}."
+        )
 
 
 def _display_char_width(char):
@@ -495,148 +529,213 @@ def _source_line_offsets(full_text):
     return tuple(offsets)
 
 
-def _matching_link_label_start(text, close_index, protected, additional=()):
-    """Find the opening [ for a valid-looking Markdown link/image label."""
-    depth = 1
-    i = close_index - 1
-    while i >= 0:
-        if _range_contains(protected, i) or _range_contains(additional, i):
-            i -= 1
+def _escaped_source_positions(text):
+    """Return indexes whose character is escaped by an odd backslash run.
+
+    Several inline recognizers need the same escape test while scanning the
+    document. Computing the relevant positions once keeps those scans linear
+    even on source containing very long backslash runs.
+    """
+    escaped = set()
+    backslashes = 0
+    for index, char in enumerate(text):
+        if char == "\\":
+            backslashes += 1
             continue
-        char = text[i]
-        if char == "]" and not _markdown_char_is_escaped(text, i):
+        if backslashes % 2:
+            escaped.add(index)
+        backslashes = 0
+    return frozenset(escaped)
+
+
+def _angle_inline_ranges(full_text, code_ranges, escaped_positions):
+    """Return complete single-line ``<...>`` inline ranges in one pass.
+
+    Carriage intentionally recognizes these constructs only as literal source
+    regions for footnote exclusion; it does not parse or normalize their
+    contents. A failed candidate advances to the next physical line, avoiding
+    the old repeated suffix scan for every unmatched ``<``.
+    """
+    ranges = []
+    n = len(full_text)
+    code_index = 0
+    i = 0
+
+    while i < n:
+        while code_index < len(code_ranges) and code_ranges[code_index][1] <= i:
+            code_index += 1
+        if code_index < len(code_ranges):
+            start, end = code_ranges[code_index]
+            if start <= i < end:
+                i = end
+                continue
+
+        char = full_text[i]
+        if char != "<" or i in escaped_positions:
+            i += 1
+            continue
+
+        quote = None
+        j = i + 1
+        while j < n and full_text[j] != "\n":
+            current = full_text[j]
+            if j in escaped_positions:
+                j += 1
+                continue
+            if quote is not None:
+                if current == quote:
+                    quote = None
+            elif current in {'"', "'"}:
+                quote = current
+            elif current == ">":
+                ranges.append((i, j + 1))
+                i = j + 1
+                break
+            j += 1
+        else:
+            # No unquoted closer exists for this candidate before the physical
+            # line ends. Under Carriage's valid-Markdown input contract, later
+            # '<' characters on the same malformed line cannot establish a
+            # construct that needs footnote protection, so skip the remainder
+            # of the line instead of rescanning the same suffix repeatedly.
+            newline = full_text.find("\n", i)
+            i = n if newline < 0 else newline + 1
+
+    return ranges
+
+
+def _scan_inline_link_destination(text, start, escaped_positions):
+    """Return the end of a complete ``(...)`` destination, or ``None``."""
+    depth = 1
+    quote = None
+    j = start + 1
+    n = len(text)
+    while j < n:
+        char = text[j]
+        if j in escaped_positions:
+            j += 1
+            continue
+        if quote is not None:
+            if char == quote:
+                quote = None
+        elif char in {'"', "'"}:
+            quote = char
+        elif char == "(":
             depth += 1
-        elif char == "[" and not _markdown_char_is_escaped(text, i):
+        elif char == ")":
             depth -= 1
             if depth == 0:
-                return i
-        elif char == "\n" and depth == 1:
-            # Original Markdown permits inline content in labels, but treating
-            # a prior physical line as the start of a link here would create
-            # surprising footnote exclusions. Reference/inline link syntax
-            # itself remains untouched; this helper only protects destinations.
-            return None
-        i -= 1
+                return j + 1
+        j += 1
     return None
 
 
+def _scan_reference_label(text, start, escaped_positions):
+    """Return the end of a complete single-line ``[...]`` label, or None."""
+    j = start + 1
+    n = len(text)
+    while j < n and text[j] != "\n":
+        if text[j] == "]" and j not in escaped_positions:
+            return j + 1
+        j += 1
+    return None
+
+
+@lru_cache(maxsize=8)
 def _inline_footnote_literal_ranges(full_text):
-    """Return inline source ranges where ``[^id]`` must remain literal.
+    """Return inline ranges where ``[^id]`` must remain literal.
 
     Footnotes are an extension layered on original Markdown. Their reference
-    syntax must therefore lose special meaning inside original-Markdown code
-    spans, autolinks/inline HTML, inline link/image destinations, and the
-    second label of reference-style links/images.
+    syntax loses special meaning inside original-Markdown code spans,
+    autolinks/inline HTML, inline link/image destinations, and the second label
+    of reference-style links/images.
+
+    Recognition is deliberately a forward scan. The previous implementation
+    searched backward from every ``]`` and repeatedly rescanned the remainder
+    of a line from every unmatched ``<``, producing quadratic behavior on
+    otherwise harmless source text.
     """
     n = len(full_text)
-
-    # Code spans are literal source and can cross physical lines.
     code_ranges = list(_inline_code_span_ranges(full_text))
+    escaped_positions = _escaped_source_positions(full_text)
+    angle_ranges = _angle_inline_ranges(
+        full_text, code_ranges, escaped_positions
+    )
+    protected = _merge_source_ranges(code_ranges + angle_ranges)
 
-    # Angle-bracket inline constructs: autolinks and raw inline HTML. Under the
-    # valid-Markdown input contract, a complete <...> pair is source whose
-    # contents should not be reinterpreted as a footnote reference.
-    angle_ranges = []
-    i = 0
-    while i < n:
-        if (
-            full_text[i] == "<"
-            and not _markdown_char_is_escaped(full_text, i)
-            and not _range_contains(code_ranges, i)
-        ):
-            quote = None
-            end = None
-            j = i + 1
-            while j < n and full_text[j] != "\n":
-                char = full_text[j]
-                if quote is not None:
-                    if char == quote:
-                        quote = None
-                elif char in {'"', "'"}:
-                    quote = char
-                elif char == ">":
-                    end = j
-                    break
-                j += 1
-            if end is not None:
-                angle_ranges.append((i, end + 1))
-                i = end + 1
-                continue
-        i += 1
-
-    # Merge once before link scanning. _range_contains() can then use binary
-    # search instead of walking every protected range for every candidate.
-    ranges = _merge_source_ranges(code_ranges + angle_ranges)
-
-    # Inline destinations and reference-style second labels. Original
-    # Markdown permits an optional space between the two bracket sets of a
-    # reference link; inline links require the opening '(' immediately after
-    # the closing ']'. Newly discovered ranges are naturally ordered and
-    # non-overlapping because this scan advances past each completed construct,
-    # so they do not need to be re-sorted after every link.
     link_ranges = []
+    bracket_stack = []
+    protected_index = 0
     i = 0
+
     while i < n:
-        if (
-            full_text[i] != "]"
-            or _markdown_char_is_escaped(full_text, i)
-            or _range_contains(ranges, i)
-            or _range_contains(link_ranges, i)
+        while (
+            protected_index < len(protected)
+            and protected[protected_index][1] <= i
         ):
-            i += 1
-            continue
-        if _matching_link_label_start(full_text, i, ranges, link_ranges) is None:
-            i += 1
-            continue
-
-        next_index = i + 1
-        if next_index < n and full_text[next_index] == "(":
-            depth = 1
-            quote = None
-            j = next_index + 1
-            while j < n:
-                char = full_text[j]
-                if _markdown_char_is_escaped(full_text, j):
-                    j += 1
-                    continue
-                if quote is not None:
-                    if char == quote:
-                        quote = None
-                elif char in {'"', "'"}:
-                    quote = char
-                elif char == "(":
-                    depth += 1
-                elif char == ")":
-                    depth -= 1
-                    if depth == 0:
-                        link_ranges.append((next_index, j + 1))
-                        break
-                j += 1
-            i = max(i + 1, j + 1 if j < n else i + 1)
-            continue
-
-        j = next_index
-        while j < n and full_text[j] in " \t":
-            j += 1
-        if j < n and full_text[j] == "[" and not _markdown_char_is_escaped(full_text, j):
-            close = j + 1
-            while close < n:
-                if full_text[close] == "]" and not _markdown_char_is_escaped(full_text, close):
-                    link_ranges.append((j, close + 1))
-                    i = close + 1
-                    break
-                if full_text[close] == "\n":
-                    break
-                close += 1
-            else:
-                i += 1
-            if i == close + 1:
+            protected_index += 1
+        if protected_index < len(protected):
+            start, end = protected[protected_index]
+            if start <= i < end:
+                if full_text.find("\n", i, end) >= 0:
+                    bracket_stack.clear()
+                i = end
                 continue
+
+        char = full_text[i]
+        if char == "\n":
+            # Footnote exclusion deliberately keeps link labels on one physical
+            # source line. This matches Carriage's prior conservative contract.
+            bracket_stack.clear()
+            i += 1
+            continue
+
+        if i in escaped_positions:
+            i += 1
+            continue
+
+        if char == "[":
+            bracket_stack.append(i)
+            i += 1
+            continue
+
+        if char != "]" or not bracket_stack:
+            i += 1
+            continue
+
+        # The top stack entry is the same balanced opening label that the old
+        # backward depth scan would find, but it is obtained in O(1).
+        bracket_stack.pop()
+        next_index = i + 1
+
+        if next_index < n and full_text[next_index] == "(":
+            destination_end = _scan_inline_link_destination(
+                full_text, next_index, escaped_positions
+            )
+            if destination_end is not None:
+                link_ranges.append((next_index, destination_end))
+                i = destination_end
+                continue
+
+        reference_start = next_index
+        while reference_start < n and full_text[reference_start] in " \t":
+            reference_start += 1
+        if (
+            reference_start < n
+            and full_text[reference_start] == "["
+            and reference_start not in escaped_positions
+        ):
+            reference_end = _scan_reference_label(
+                full_text, reference_start, escaped_positions
+            )
+            if reference_end is not None:
+                link_ranges.append((reference_start, reference_end))
+                i = reference_end
+                continue
+
         i += 1
 
-    # Link destinations can contain code/HTML ranges, so merge the two sorted
-    # groups once at the end before returning the canonical protected set.
-    return tuple(_merge_source_ranges(ranges + link_ranges))
+    return tuple(_merge_source_ranges(protected + link_ranges))
 
 @lru_cache(maxsize=8)
 def _footnote_reference_spans(full_text):
@@ -790,6 +889,15 @@ class EditorState:
         self.recovery_error = False
         self.recovery_error_reported = False
         self.recovery_error_message = None
+        self.recovery_error_kind = None
+        # Recovery write failures mean current unsaved work is not durably
+        # journaled. Cleanup failures are different: the document may already
+        # be saved/discarded, but an obsolete journal could not be removed or
+        # safely marked retired. Keep the two failure classes separate so a
+        # later successful checkpoint cannot accidentally hide a cleanup issue.
+        self.recovery_write_error_message = None
+        self.recovery_cleanup_failures = {}
+        self.recovery_cleanup_retry_at = 0.0
         self.working_state_revision = 0
         self.working_state_persisted_revision = 0
         self.working_state_first_dirty_at = None
@@ -1734,26 +1842,10 @@ def _on_scrollbar_interact(row_in_window, window_height):
 _HIGHLIGHT_ATX_RE = re.compile(r"^#{1,6}(?!#)(?=.*\S)")
 _HIGHLIGHT_FENCE_RE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
 
-# Order matters: triple emphasis before bold, then italic. The patterns are
-# intentionally conservative; Carriage is not trying to be a complete Markdown
-# parser merely to color prose. DOTALL is deliberate: hard-wrapped prose can
-# place the opening emphasis delimiter on one physical line and the closing
-# delimiter on a later physical line within the same paragraph/list item.
-_HIGHLIGHT_INLINE_RE = re.compile(
-    r"(?P<strong_em>"
-    r"(?<!\\)\*\*\*(?=\S).+?(?<=\S)(?<!\\)\*\*\*"
-    r"|(?<!\w)___(?=\S).+?(?<=\S)___(?!\w)"
-    r")"
-    r"|(?P<strong>"
-    r"(?<!\\)\*\*(?=\S).+?(?<=\S)(?<!\\)\*\*"
-    r"|(?<!\w)__(?=\S).+?(?<=\S)__(?!\w)"
-    r")"
-    r"|(?P<em>"
-    r"(?<![\\*])\*(?!\*)(?=\S).+?(?<=\S)(?<!\\)\*(?!\*)"
-    r"|(?<![\w\\])_(?!_)(?=\S).+?(?<=\S)_(?![\w_])"
-    r")",
-    re.DOTALL,
-)
+# Inline emphasis highlighting uses the same conservative delimiter/flanking
+# scanner as Carriage's emphasis-editing logic. Keeping one bounded scanner
+# avoids catastrophic regex backtracking and prevents the display layer from
+# inventing a second, subtly different emphasis grammar.
 
 _HIGHLIGHT_LIST_ITEM_RE = re.compile(r"^\s{0,3}(?:[-*+]|\d+\.)\s+")
 _HIGHLIGHT_THEMATIC_BREAK_RE = re.compile(
@@ -1787,12 +1879,33 @@ def _highlight_fenced_lines(lines):
     return protected
 
 
-def _highlight_style_for_match(match):
-    if match.lastgroup == "strong_em":
-        return "class:markdown.bold-italic"
-    if match.lastgroup == "strong":
-        return "class:markdown.bold"
-    return "class:markdown.italic"
+def _highlight_emphasis_spans(text):
+    """Return non-overlapping emphasis spans as ``(start, end, style)``.
+
+    The shared emphasis scanner can return nested spans. prompt_toolkit's lexer
+    consumes one flat fragment stream, so highlight the outermost span and skip
+    nested overlaps, matching the old lexer's non-overlapping presentation while
+    handling valid nested delimiters deterministically.
+    """
+    candidates = _emphasis_spans_in_range(text, 0, len(text))
+    if not candidates:
+        return ()
+
+    styled = []
+    occupied_end = -1
+    for open_start, _open_end, _close_start, close_end, _marker, count in candidates:
+        if open_start < occupied_end:
+            continue
+        style = {
+            3: "class:markdown.bold-italic",
+            2: "class:markdown.bold",
+            1: "class:markdown.italic",
+        }.get(count)
+        if style is None:
+            continue
+        styled.append((open_start, close_end, style))
+        occupied_end = close_end
+    return tuple(styled)
 
 
 
@@ -1808,10 +1921,7 @@ def _highlight_inline_markdown_block(block_lines):
         return []
 
     combined = "\n".join(block_lines)
-    spans = [
-        (match.start(), match.end(), _highlight_style_for_match(match))
-        for match in _HIGHLIGHT_INLINE_RE.finditer(combined)
-    ]
+    spans = list(_highlight_emphasis_spans(combined))
 
     rendered = []
     offset = 0
@@ -2688,6 +2798,34 @@ text_area.window._visual_vertical_move_in_progress = False
 # cursor movement, edit, or manual viewport scroll.
 text_area.window._section_top_anchor_row = None
 text_area.window.on_scrollbar_interact = _on_scrollbar_interact
+
+
+def _check_prompt_toolkit_private_contract():
+    """Verify the audited private prompt_toolkit surfaces Carriage relies on.
+
+    The narrow version window is the primary compatibility boundary. This
+    structural check catches distro patches or unusual builds that report an
+    accepted version while removing one of the implementation details Carriage
+    intentionally uses. It runs before Application construction.
+    """
+    required = [
+        (text_area.buffer, "_undo_stack", "Buffer undo stack"),
+        (text_area.buffer, "_redo_stack", "Buffer redo stack"),
+        (text_area.window, "_write_to_screen_at_index", "Window screen writer"),
+        (text_area.window, "_scroll", "Window scrolling hook"),
+        (text_area.window, "_get_margin_width", "Window margin geometry"),
+        (text_area.window, "_mouse_handler", "Window mouse fallback"),
+        (text_area.control, "_last_click_timestamp", "BufferControl click state"),
+        (text_area.control, "_last_get_processed_line", "BufferControl processed-line cache"),
+    ]
+    missing = [label for obj, name, label in required if not hasattr(obj, name)]
+    if missing:
+        details = ", ".join(missing)
+        raise RuntimeError(
+            "This prompt_toolkit build is missing private interfaces required "
+            f"by Carriage: {details}. Reinstall {PROMPT_TOOLKIT_REQUIREMENT}."
+        )
+
 # Wheel/scrollbar scrolling is allowed to move the viewport away from the
 # insertion point. Hide the screen cursor during that read-only navigation;
 # any actual edit or cursor movement exits manual-scroll mode and restores it.
@@ -3118,6 +3256,93 @@ def _path_is_read_only(path):
     return not bool(file_stat.st_mode & write_bits) or not os.access(target_path, os.W_OK)
 
 
+def _read_extended_attributes(path):
+    """Return readable extended attributes for an existing regular file.
+
+    Atomic replacement creates a new inode, so xattrs that belong to the old
+    inode must be copied deliberately. Platforms without the standard xattr
+    APIs simply return an empty mapping. Unsupported filesystems are treated
+    the same way; other errors are surfaced rather than silently discarding
+    metadata that Carriage knows is present.
+    """
+    if not all(hasattr(os, name) for name in ("listxattr", "getxattr", "setxattr")):
+        return {}
+
+    unsupported = {
+        value
+        for name in ("ENOTSUP", "EOPNOTSUPP", "EINVAL")
+        if (value := getattr(errno, name, None)) is not None
+    }
+    try:
+        names = os.listxattr(path)
+    except OSError as e:
+        if e.errno in unsupported:
+            return {}
+        raise OSError(f"Could not read file metadata for {path}: {e}") from e
+
+    attributes = {}
+    for name in names:
+        try:
+            attributes[name] = os.getxattr(path, name)
+        except OSError as e:
+            # An attribute can disappear between listxattr() and getxattr().
+            # That is harmless; any other readable-metadata failure must stop
+            # the save rather than knowingly replace the inode without it.
+            if e.errno == getattr(errno, "ENODATA", None):
+                continue
+            raise OSError(
+                f"Could not read extended attribute {name!r} from {path}: {e}"
+            ) from e
+    return attributes
+
+
+def _apply_replacement_metadata(fd, source_stat, source_xattrs):
+    """Apply preservable metadata from the old inode to a temporary file.
+
+    Ownership/group, permission bits, and every readable extended attribute are
+    preserved before the temporary file can replace the source. System-managed
+    attributes that the filesystem already assigned identically need no write.
+    If known metadata cannot be reproduced, abort the save instead of silently
+    dropping it.
+    """
+    temp_stat = os.fstat(fd)
+    source_uid = getattr(source_stat, "st_uid", None)
+    source_gid = getattr(source_stat, "st_gid", None)
+    temp_uid = getattr(temp_stat, "st_uid", source_uid)
+    temp_gid = getattr(temp_stat, "st_gid", source_gid)
+
+    if (temp_uid, temp_gid) != (source_uid, source_gid):
+        if not hasattr(os, "fchown"):
+            raise OSError(
+                "Carriage cannot preserve this file's owner/group on this platform. "
+                "Use Save As to write a new file instead."
+            )
+        try:
+            os.fchown(fd, source_uid, source_gid)
+        except OSError as e:
+            raise OSError(
+                "Carriage cannot preserve this file's owner/group during atomic save. "
+                "Use Save As to write a new file instead."
+            ) from e
+
+    os.fchmod(fd, stat.S_IMODE(source_stat.st_mode))
+
+    for name, value in source_xattrs.items():
+        try:
+            current = os.getxattr(fd, name)
+        except OSError:
+            current = None
+        if current == value:
+            continue
+        try:
+            os.setxattr(fd, name, value)
+        except OSError as e:
+            raise OSError(
+                f"Carriage cannot preserve extended attribute {name!r} during atomic save. "
+                "Use Save As to write a new file instead."
+            ) from e
+
+
 def _recovery_directory():
     """Return the per-user directory used for protected working-state journals."""
     base = os.environ.get("XDG_STATE_HOME")
@@ -3384,6 +3609,7 @@ def _recovery_payload():
         "footnotes": footnotes,
         "had_table_draft": had_table_draft,
         "had_footnote_draft": had_footnote_draft,
+        "retired": False,
     }
 
 
@@ -3475,6 +3701,39 @@ def _write_recovery_payload_atomic(recovery_path, epoch, payload, revision):
                 pass
 
 
+def _refresh_recovery_error_state():
+    """Project recovery write/cleanup failures into the user-visible status."""
+    previous = (
+        state.recovery_error,
+        state.recovery_error_kind,
+        state.recovery_error_message,
+    )
+
+    if state.recovery_write_error_message:
+        state.recovery_error = True
+        state.recovery_error_kind = "write"
+        state.recovery_error_message = state.recovery_write_error_message
+    elif state.recovery_cleanup_failures:
+        state.recovery_error = True
+        state.recovery_error_kind = "cleanup"
+        path, detail = next(iter(state.recovery_cleanup_failures.items()))
+        state.recovery_error_message = (
+            f"Could not safely retire obsolete recovery journal {path!r}: {detail}"
+        )
+    else:
+        state.recovery_error = False
+        state.recovery_error_kind = None
+        state.recovery_error_message = None
+
+    current = (
+        state.recovery_error,
+        state.recovery_error_kind,
+        state.recovery_error_message,
+    )
+    if current != previous:
+        state.recovery_error_reported = False
+
+
 def _record_recovery_success(revision):
     state.working_state_persisted_revision = max(
         state.working_state_persisted_revision, revision
@@ -3482,9 +3741,8 @@ def _record_recovery_success(revision):
     if state.working_state_revision == revision:
         state.working_state_first_dirty_at = None
         state.working_state_last_change_at = None
-    state.recovery_error = False
-    state.recovery_error_reported = False
-    state.recovery_error_message = None
+    state.recovery_write_error_message = None
+    _refresh_recovery_error_state()
 
 
 def _write_recovery_snapshot():
@@ -3505,25 +3763,116 @@ def _write_recovery_snapshot():
         _record_recovery_success(revision)
 
 
+def _mark_recovery_retired(path):
+    """Durably mark an obsolete journal so it can never be offered as recovery.
+
+    Directory permissions can occasionally prevent unlinking a journal even
+    though the journal itself remains writable. In that case overwrite the
+    obsolete journal in place with a retired marker. This is intentionally a
+    fallback for data that no longer needs recovery; even interruption during
+    this rewrite can only leave an unreadable file, which stale-recovery
+    discovery already ignores rather than restoring.
+    """
+    try:
+        with open(path, "r+", encoding="utf-8") as f:
+            try:
+                payload = json.load(f)
+            except (ValueError, json.JSONDecodeError):
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+
+            # Keep enough structure for normal recovery-file validation and
+            # manual diagnosis while making the retirement state explicit.
+            payload.setdefault("format", RECOVERY_FORMAT_VERSION)
+            payload.setdefault("pid", _RECOVERY_OWNER_PID)
+            payload.setdefault("boot_id", _RECOVERY_OWNER_BOOT_ID)
+            payload.setdefault("process_start_id", _RECOVERY_OWNER_START_ID)
+            payload.setdefault("source_path", None)
+            payload.setdefault("saved_text", "")
+            payload.setdefault("disk_snapshot", None)
+            payload.setdefault("cursor_position", 0)
+            payload.setdefault("visible_text", "")
+            payload.setdefault("tables", {})
+            payload.setdefault("footnotes", {})
+            payload.setdefault("had_table_draft", False)
+            payload.setdefault("had_footnote_draft", False)
+            payload["retired"] = True
+            payload["retired_at"] = time.time()
+            payload["retired_by_pid"] = _RECOVERY_OWNER_PID
+
+            f.seek(0)
+            json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
+            f.truncate()
+            f.flush()
+            os.fsync(f.fileno())
+        return True, None
+    except FileNotFoundError:
+        return True, None
+    except (OSError, UnicodeError, TypeError, ValueError) as e:
+        return False, str(e)
+
+
+def _cleanup_recovery_path(path):
+    """Remove one obsolete journal, or retire it if unlinking is impossible."""
+    if not path:
+        return True
+    try:
+        os.unlink(path)
+        state.recovery_cleanup_failures.pop(path, None)
+        return True
+    except FileNotFoundError:
+        state.recovery_cleanup_failures.pop(path, None)
+        return True
+    except OSError as unlink_error:
+        retired, retire_error = _mark_recovery_retired(path)
+        if retired:
+            # The file may remain physically present, but stale discovery will
+            # recognize it as intentionally retired and never offer it.
+            state.recovery_cleanup_failures.pop(path, None)
+            return True
+
+        detail = f"unlink failed: {unlink_error}; retirement failed: {retire_error}"
+        state.recovery_cleanup_failures[path] = detail
+        return False
+
+
+def _retry_failed_recovery_cleanup():
+    """Retry journals that previously could neither be removed nor retired."""
+    if not state.recovery_cleanup_failures:
+        return True
+    for path in list(state.recovery_cleanup_failures):
+        _cleanup_recovery_path(path)
+    _refresh_recovery_error_state()
+    return not state.recovery_cleanup_failures
+
+
 def _clear_recovery_file():
+    """Retire the active journal generation and make obsolete recovery harmless.
+
+    Return True when every obsolete journal is either deleted or durably marked
+    retired. False means at least one old journal could still be mistaken for a
+    crash recovery on a future launch; callers performing destructive state
+    transitions can then stop rather than creating that ambiguity.
+    """
     with _RECOVERY_IO_LOCK:
         recovery_path = state.recovery_path
+        # Retire this generation before touching the file. A background writer
+        # that is still preparing a temporary snapshot will see the epoch/path
+        # mismatch at commit time and cannot recreate the retired journal.
         state.recovery_path = None
         state.recovery_epoch += 1
         state.recovery_committed_revision = 0
-        if recovery_path is not None:
-            try:
-                os.unlink(recovery_path)
-            except FileNotFoundError:
-                pass
-            except OSError:
-                # A failed cleanup is safer than deleting anything else. A stale
-                # file can simply be offered again on a future launch.
-                pass
-    state.recovery_error = False
-    state.recovery_error_reported = False
-    state.recovery_error_message = None
 
+    if recovery_path is not None:
+        _cleanup_recovery_path(recovery_path)
+
+    # A later boundary operation is also an opportunity to retry any older
+    # cleanup failure after permissions/filesystem conditions have changed.
+    _retry_failed_recovery_cleanup()
+    state.recovery_write_error_message = None
+    _refresh_recovery_error_state()
+    return not state.recovery_cleanup_failures
 
 def _read_recovery_payload(path):
     """Read and validate the current Carriage recovery-journal format."""
@@ -3611,6 +3960,16 @@ def _stale_recovery_files(source_path=None):
         path = os.path.join(directory, name)
         try:
             payload = _read_recovery_payload(path)
+            if payload.get("retired") is True:
+                # An intentional Save/New/Open/Quit cleanup may have been able
+                # to mark a journal retired even when directory permissions
+                # prevented unlinking it. Never offer such a file as crash
+                # recovery; opportunistically remove it when possible.
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+                continue
             if _recovery_owner_is_live(payload):
                 continue
 
@@ -3633,6 +3992,8 @@ def _stale_recovery_files(source_path=None):
 
 def _restore_recovery_file(path):
     payload = _read_recovery_payload(path)
+    if payload.get("retired") is True:
+        raise ValueError("This recovery journal was intentionally retired.")
     restored_tables = {}
     for raw_number, raw_table in payload["tables"].items():
         number = int(raw_number)
@@ -3683,9 +4044,8 @@ def _restore_recovery_file(path):
         state.disk_snapshot = None
 
     _claim_recovery_path(path)
-    state.recovery_error = False
-    state.recovery_error_reported = False
-    state.recovery_error_message = None
+    state.recovery_write_error_message = None
+    _refresh_recovery_error_state()
 
     # Claim the restored journal for this process immediately so a second
     # concurrently running Carriage instance will not offer it as stale.
@@ -3824,8 +4184,37 @@ def _confirm_replace(title, text, on_replace):
     show_dialog(dialog, focus=cancel_button)
 
 
+
+def _reprotect_after_blocked_cleanup():
+    """Re-journal unsaved RAM state when a destructive transition is blocked.
+
+    New/Open/Quit retire the current journal before changing document state. If
+    cleanup proves unsafe and the transition is therefore cancelled, the old
+    document remains in RAM and must immediately receive a fresh active journal
+    generation rather than relying on the retired/failed path.
+    """
+    if not _has_recoverable_changes():
+        return
+    _working_state_changed(immediate=True)
+    try:
+        _write_recovery_snapshot()
+    except (OSError, UnicodeError, TypeError, ValueError) as e:
+        state.recovery_write_error_message = str(e)
+        _refresh_recovery_error_state()
+
+
 def do_new():
-    _clear_recovery_file()
+    if not _clear_recovery_file():
+        cleanup_detail = state.recovery_error_message or "Unknown recovery cleanup error."
+        _reprotect_after_blocked_cleanup()
+        show_message(
+            "Recovery cleanup error",
+            "Carriage could not safely retire the previous recovery journal, "
+            "so the current document has been left open and re-protected. Fix "
+            "the recovery storage problem and try New again.\n\n"
+            f"{cleanup_detail}",
+        )
+        return
     text_area.buffer.reset(Document(text=""))
     state.path = None
     state.saved_text = ""
@@ -3848,7 +4237,18 @@ def do_open():
         except (OSError, UnicodeError) as e:
             show_message("Error opening file", str(e))
             return
-        _clear_recovery_file()
+        if not _clear_recovery_file():
+            cleanup_detail = state.recovery_error_message or "Unknown recovery cleanup error."
+            _reprotect_after_blocked_cleanup()
+            show_message(
+                "Recovery cleanup error",
+                "Carriage could not safely retire the current recovery journal, "
+                "so the requested file was not opened. The current document has "
+                "been re-protected; fix the recovery storage problem and try "
+                "Open again.\n\n"
+                f"{cleanup_detail}",
+            )
+            return
         visible = _collapse_objects_from_source(content)
         text_area.buffer.reset(Document(text=visible))
         state.path = path
@@ -3867,6 +4267,7 @@ def _write_file(path, expected_snapshot, report_conflict=True, report_read_only=
         show_message("Document object error", str(e))
         return _SAVE_ERROR
 
+    content_bytes = content.encode("utf-8")
     target_path = _canonical_path(path)
     directory = os.path.dirname(target_path) or "."
     temp_path = None
@@ -3895,10 +4296,19 @@ def _write_file(path, expected_snapshot, report_conflict=True, report_read_only=
                 )
             return _SAVE_READ_ONLY
 
-        try:
-            existing_mode = stat.S_IMODE(os.stat(target_path).st_mode)
-        except FileNotFoundError:
-            existing_mode = None
+        existing_stat = None
+        existing_xattrs = {}
+        if current_snapshot != _MISSING_DISK_SNAPSHOT:
+            existing_stat = os.stat(target_path)
+            if existing_stat.st_nlink > 1:
+                show_message(
+                    "Linked file",
+                    "This file has multiple hard links. Carriage's atomic Save would "
+                    "break that link relationship, so nothing was overwritten. "
+                    "Use Save As to write a separate file instead.",
+                )
+                return _SAVE_ERROR
+            existing_xattrs = _read_extended_attributes(target_path)
 
         fd, temp_path = tempfile.mkstemp(
             prefix=f".{os.path.basename(target_path)}.",
@@ -3908,19 +4318,23 @@ def _write_file(path, expected_snapshot, report_conflict=True, report_read_only=
         )
 
         try:
-            if existing_mode is not None:
-                os.fchmod(fd, existing_mode)
-            else:
-                # Match the permissions a normal open(..., "w") would use
-                # for a newly created file, including the process umask.
-                current_umask = os.umask(0)
-                os.umask(current_umask)
-                os.fchmod(fd, 0o666 & ~current_umask)
-
             with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
                 fd = None  # fdopen owns and closes the descriptor now.
+                # Keep mkstemp's private mode while writing. Only after the
+                # complete contents exist do we expose the replacement file's
+                # final permissions/ACL metadata, then fsync both together.
                 f.write(content)
                 f.flush()
+                if existing_stat is not None:
+                    _apply_replacement_metadata(
+                        f.fileno(), existing_stat, existing_xattrs
+                    )
+                else:
+                    # Match the permissions a normal open(..., "w") would use
+                    # for a newly created file, including the process umask.
+                    current_umask = os.umask(0)
+                    os.umask(current_umask)
+                    os.fchmod(f.fileno(), 0o666 & ~current_umask)
                 os.fsync(f.fileno())
 
             # Recheck after the complete temporary file has been written. If
@@ -3950,7 +4364,8 @@ def _write_file(path, expected_snapshot, report_conflict=True, report_read_only=
 
             # The temporary file is in the destination directory, so this
             # replacement is atomic on the same filesystem. The existing file
-            # stays untouched unless the complete new contents were written.
+            # stays untouched unless the complete new contents and preservable
+            # metadata were written successfully.
             os.replace(temp_path, target_path)
             temp_path = None
 
@@ -3964,8 +4379,8 @@ def _write_file(path, expected_snapshot, report_conflict=True, report_read_only=
                 _fsync_directory(directory)
             except OSError as durability_error:
                 state.path = path
-                state.disk_snapshot = _snapshot_bytes(content.encode("utf-8"))
-            
+                state.disk_snapshot = _snapshot_bytes(content_bytes)
+
                 recovery_detail = (
                     "The new file is visible on disk, but Carriage could not "
                     "confirm that the directory update is durable. The document "
@@ -3974,13 +4389,15 @@ def _write_file(path, expected_snapshot, report_conflict=True, report_read_only=
                 try:
                     _write_recovery_snapshot()
                 except (OSError, UnicodeError, TypeError, ValueError) as recovery_error:
-                    state.recovery_error = True
+                    state.recovery_write_error_message = str(recovery_error)
+                    _refresh_recovery_error_state()
                     recovery_detail += (
                         "\n\nCarriage also could not update working-state recovery: "
                         f"{recovery_error}"
                     )
                 else:
-                    state.recovery_error = False
+                    state.recovery_write_error_message = None
+                    _refresh_recovery_error_state()
                     recovery_detail += "\n\nWorking-state recovery has been retained."
 
                 show_message(
@@ -3999,7 +4416,7 @@ def _write_file(path, expected_snapshot, report_conflict=True, report_read_only=
 
         state.saved_text = content
         state.path = path
-        state.disk_snapshot = _snapshot_bytes(content.encode("utf-8"))
+        state.disk_snapshot = _snapshot_bytes(content_bytes)
         _clear_recovery_file()
         _reset_working_state_tracking()
         return _SAVE_OK
@@ -4014,9 +4431,6 @@ def do_save(on_saved=None):
         return
 
     try:
-        if _path_is_read_only(state.path):
-            _show_read_only_save(on_saved)
-            return
         disk_snapshot = _disk_snapshot(state.path)
     except OSError as e:
         show_message("Error checking file", str(e))
@@ -4028,8 +4442,31 @@ def do_save(on_saved=None):
         # as the one that must remain unchanged during this save.
         state.disk_snapshot = disk_snapshot
 
+    # Conflict detection always comes before the unchanged fast path. Pressing
+    # Save must never silently bless an externally changed file merely because
+    # the in-memory document itself has not changed.
     if disk_snapshot != state.disk_snapshot:
         _show_save_conflict(disk_snapshot, on_saved)
+        return
+
+    # A verified unchanged document is already saved. Do not replace the inode,
+    # touch mtime, disturb hard links, or expose file metadata to an unnecessary
+    # atomic replacement. A read-only file is also fine here because no write is
+    # required.
+    if not state.is_modified(text_area.text):
+        if not _has_recoverable_changes():
+            _clear_recovery_file()
+            _reset_working_state_tracking()
+        if on_saved:
+            on_saved()
+        return
+
+    try:
+        if _path_is_read_only(state.path):
+            _show_read_only_save(on_saved)
+            return
+    except OSError as e:
+        show_message("Error checking file", str(e))
         return
 
     result = _write_file(state.path, expected_snapshot=state.disk_snapshot)
@@ -4114,7 +4551,17 @@ def do_save_as(on_saved=None):
 
 
 def do_quit():
-    _clear_recovery_file()
+    if not _clear_recovery_file():
+        cleanup_detail = state.recovery_error_message or "Unknown recovery cleanup error."
+        _reprotect_after_blocked_cleanup()
+        show_message(
+            "Recovery cleanup error",
+            "Carriage could not safely retire the recovery journal, so it has "
+            "not quit. Unsaved work has been re-protected; fix the recovery "
+            "storage problem and try Quit again.\n\n"
+            f"{cleanup_detail}",
+        )
+        return
     get_app().exit()
 
 
@@ -8827,9 +9274,21 @@ async def _working_state_loop():
     while True:
         await asyncio.sleep(WORKING_STATE_POLL_SECONDS)
 
-        # A failed checkpoint is visible in the status bar immediately. The
-        # modal warning waits until no other dialog is open so it never stacks
-        # on top of an unrelated user decision.
+        # Cleanup failures are normally rare and often transient (for example,
+        # permissions changed while Carriage was running). Retry at a low rate
+        # without making the normal 250 ms checkpoint poll perform filesystem
+        # work on every iteration.
+        now = time.monotonic()
+        if (
+            state.recovery_cleanup_failures
+            and now >= state.recovery_cleanup_retry_at
+        ):
+            state.recovery_cleanup_retry_at = now + 5.0
+            _retry_failed_recovery_cleanup()
+
+        # A failed checkpoint/cleanup is visible in the status bar immediately.
+        # The modal warning waits until no other dialog is open so it never
+        # stacks on top of an unrelated user decision.
         if (
             state.recovery_error
             and not state.recovery_error_reported
@@ -8837,25 +9296,39 @@ async def _working_state_loop():
         ):
             state.recovery_error_reported = True
             detail = state.recovery_error_message or "Unknown recovery error."
-            show_message(
-                "Recovery unavailable",
-                "Carriage could not update the protected working-state journal. "
-                "Your Markdown file has not been changed; use Save to commit work "
-                f"manually.\n\n{detail}",
-            )
+            if state.recovery_error_kind == "cleanup":
+                show_message(
+                    "Recovery cleanup error",
+                    "Carriage could not remove or safely retire an obsolete "
+                    "working-state journal. Your Markdown file is unaffected, "
+                    "but Carriage will block destructive document transitions "
+                    f"until the journal can be made harmless.\n\n{detail}",
+                )
+            else:
+                show_message(
+                    "Recovery unavailable",
+                    "Carriage could not update the protected working-state journal. "
+                    "Your Markdown file has not been changed; use Save to commit work "
+                    f"manually.\n\n{detail}",
+                )
+
+        # Every main-buffer/object-draft mutation advances the revision. If the
+        # current revision has already been reconciled with disk/journal, there
+        # is nothing to materialize or compare. This removes the old four-times-
+        # per-second whole-document scan while preserving undo-to-saved-state:
+        # Undo itself advances the revision, so that transition still reaches
+        # _has_recoverable_changes() below and clears the now-obsolete journal.
+        if state.working_state_revision <= state.working_state_persisted_revision:
+            continue
 
         if not _has_recoverable_changes():
-            if state.recovery_path is not None:
-                _clear_recovery_file()
+            _clear_recovery_file()
             _reset_working_state_tracking()
             continue
 
         # Persist only states that changed after the last successful journal
         # commit. Main prose edits, object commits, and active table/footnote
         # drafts all signal revisions through the shared mutation hook.
-        if state.working_state_revision <= state.working_state_persisted_revision:
-            continue
-
         now = time.monotonic()
         if state.working_state_first_dirty_at is None:
             state.working_state_first_dirty_at = now
@@ -8882,9 +9355,8 @@ async def _working_state_loop():
                 revision,
             )
         except (OSError, UnicodeError, TypeError, ValueError) as e:
-            state.recovery_error = True
-            state.recovery_error_reported = False
-            state.recovery_error_message = str(e)
+            state.recovery_write_error_message = str(e)
+            _refresh_recovery_error_state()
             # Avoid a tight retry loop after an I/O failure. New edits will
             # update last_change_at naturally; otherwise retry after the normal
             # idle interval.
@@ -9398,8 +9870,15 @@ def _launch_spellcheck():
         text_area.buffer.reset(Document(text=visible))
         state.saved_text = content
         state.disk_snapshot = disk_snapshot
-        _clear_recovery_file()
+        cleanup_ok = _clear_recovery_file()
         _reset_working_state_tracking()
+        if not cleanup_ok:
+            show_message(
+                "Recovery cleanup error",
+                "The spell-checked file was reloaded successfully, but Carriage "
+                "could not safely retire its obsolete recovery journal.\n\n"
+                f"{state.recovery_error_message or 'Unknown recovery cleanup error.'}",
+            )
 
     get_app().create_background_task(run_and_reload())
 
@@ -11475,20 +11954,25 @@ style = Style.from_dict(
     }
 )
 
-application = Application(
-    layout=layout,
-    key_bindings=kb,
-    style=style,
-    mouse_support=MOUSE_ENABLED,
-    full_screen=True,
-    # Without this, prompt_toolkit's default color depth is 256-color, not
-    # true 24-bit - our exact hex values would get approximated to the
-    # nearest of 256 colors, which can quietly collapse contrast between
-    # similar tones. Kitty (and virtually every modern terminal) supports
-    # real 24-bit color, so ask for it explicitly.
-    color_depth=ColorDepth.DEPTH_24_BIT,
-    cursor=SimpleCursorShapeConfig(cursor_shape=CursorShape.BEAM),
-)
+application = None
+
+
+def _create_application():
+    """Construct the interactive prompt_toolkit application after CLI parsing."""
+    return Application(
+        layout=layout,
+        key_bindings=kb,
+        style=style,
+        mouse_support=MOUSE_ENABLED,
+        full_screen=True,
+        # Without this, prompt_toolkit's default color depth is 256-color, not
+        # true 24-bit - our exact hex values would get approximated to the
+        # nearest of 256 colors, which can quietly collapse contrast between
+        # similar tones. Kitty (and virtually every modern terminal) supports
+        # real 24-bit color, so ask for it explicitly.
+        color_depth=ColorDepth.DEPTH_24_BIT,
+        cursor=SimpleCursorShapeConfig(cursor_shape=CursorShape.BEAM),
+    )
 
 
 def _start_background_tasks(startup_error=None, recovery_source_path=None, offer_any_recovery=False):
@@ -11528,7 +12012,20 @@ def _parse_command_line(argv=None):
 
 
 def main(argv=None):
+    global application
+
+    # argparse handles --help/--version by exiting here, before Carriage
+    # constructs an Application or touches the terminal. This keeps CLI
+    # metadata commands clean in pipes, package managers, and non-TTY shells.
     args = _parse_command_line(argv)
+
+    try:
+        _check_prompt_toolkit_compatibility()
+        _check_prompt_toolkit_private_contract()
+    except RuntimeError as e:
+        print(f"carriage: {e}", file=sys.stderr)
+        return 2
+
     startup_error = None
     _ensure_config_file()
 
@@ -11551,6 +12048,7 @@ def main(argv=None):
             state.disk_snapshot = _MISSING_DISK_SNAPSHOT
 
     _reset_working_state_tracking()
+    application = _create_application()
     application.run(
         pre_run=lambda: _start_background_tasks(
             startup_error,
@@ -11561,4 +12059,4 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
