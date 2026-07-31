@@ -2,52 +2,63 @@
 """
 Carriage - A prose-first Markdown editor for the terminal.
 
-Carriage provides a focused full-screen writing environment built with
-prompt_toolkit. It is designed for writing and revising ordinary Markdown while
-keeping the underlying file portable and readable outside Carriage.
+Carriage is a focused full-screen Markdown editor built with prompt_toolkit. It
+is designed for drafting and revising prose while keeping the underlying source
+portable and readable outside the editor.
 
-Text soft-wraps visually inside an 80-column prose area without inserting source
-line breaks. Lists and ATX heading markers can hang into the left margin so the
-prose itself remains aligned. Edit > Convert for Carriage converts valid
-original Markdown, plus supported pipe tables and footnotes, into Carriage's preferred
-source form. It converts Setext headings to ATX headings, corrects simple ordered-list numbering, and normalizes hard-wrapped prose back to
-logical source lines. Original-Markdown hard breaks made with two trailing
-spaces render as a visible ↵ marker in the editor; the marker is display-only
-and is never written to disk. Export > Hard-Wrapped Markdown creates a separate
-80-column Markdown copy without modifying the working document.
+Prose soft-wraps visually within a configurable writing width without inserting
+source line breaks. Markdown structure is presented without disturbing prose
+alignment: list and heading markers can hang into the left margin, blockquotes
+use a persistent display-only `>` gutter, and original-Markdown hard breaks
+made with two trailing spaces display a visible ↵ marker. Drafting forms such
+as `word---word` and `word -- word` are kept together when they fit on a visual
+line. These display conventions never alter the source.
 
-Convert for Carriage preserves line-sensitive structures in its supported
-Markdown scope, including code blocks, pipe tables, raw block HTML, headings,
-thematic breaks, reference definitions, and footnotes.
+Edit > Convert for Carriage converts valid original Markdown, plus supported
+pipe tables and footnotes, into Carriage's preferred source form. It converts
+Setext headings to ATX headings, corrects simple ordered-list numbering, and
+joins hard-wrapped prose into logical source lines while preserving
+line-sensitive structures and Markdown meaning. Export > Hard-Wrapped Markdown
+creates a separate hard-wrapped Markdown copy at the configured prose width
+without modifying the working file.
 
-Supported pipe tables are folded to compact references such as
-[[Table 1: Movement Rates]] and edited through a dedicated table editor. Simple
-Pandoc-style footnotes are also first-class objects: references display as
-sequential numbers, simple definitions fold out of the prose view, and Tab opens
-the associated footnote editor. More complex footnotes remain ordinary Markdown
-source.
+Supported pipe tables fold into compact references such as
+`[[Table 1: Movement Rates]]` and are edited through a dedicated table editor.
+Simple Pandoc-style footnotes are also first-class objects: references display
+as sequential numbers, simple definitions fold out of the prose view, and Tab
+opens the associated footnote editor. Folded tables and footnotes behave as
+atomic objects in the prose editor; more complex footnotes remain ordinary
+Markdown source.
+
+Carriage includes prose-aware word counting, lightweight Markdown
+highlighting, mouse support, document and section navigation, configurable
+terminal spell checking, and Pandoc export to PDF, DOCX, ODT, HTML, and custom
+formats.
 
 File operations include New, Open, Save, and Save As. Untitled documents use
-the first recognized ATX heading as the suggested .md filename when available.
-Named files can autosave every 30 seconds, while modified documents also receive
-independent crash-recovery snapshots. Saves use durable atomic replacement and protect
-against external file changes.
-
-Carriage includes lightweight Markdown highlighting, mouse support, document
-and section navigation, aspell integration, and Pandoc export to PDF, DOCX, ODT,
-HTML, plain text, and custom formats.
+the first recognized ATX heading as the suggested `.md` filename when
+available. Unsaved working state is continuously protected in a private recovery journal
+without changing the Markdown file. The document on disk advances only through
+explicit Save or Save As operations, which use durable atomic replacement and
+protect against external file changes. Preferences for prose width and scrollbar
+visibility are stored in `config.toml` under the user's standard configuration
+directory. A small set of advanced interface and tool settings can be edited
+there manually.
 
 Requires:
   pip install prompt_toolkit --break-system-packages
 
 Optional:
-  pandoc, for document export.
-  aspell and an appropriate dictionary package, for spell checking.
+  pandoc, for document export (or configure another Pandoc executable)
+  aspell and an appropriate dictionary package, the default spell checker
 
 Usage:
-  ./carriage.py [file.md]
+  carriage [FILE]
+  carriage --help
+  carriage --version
 """
 
+import argparse
 import asyncio
 import copy
 from functools import lru_cache
@@ -62,6 +73,8 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
+import time
 import stat
 from html.parser import HTMLParser
 from dataclasses import dataclass, field
@@ -71,6 +84,7 @@ from prompt_toolkit.cursor_shapes import CursorShape, SimpleCursorShapeConfig
 from prompt_toolkit.output.color_depth import ColorDepth
 from prompt_toolkit.application.current import get_app
 from prompt_toolkit.buffer import Buffer
+from prompt_toolkit.clipboard.base import ClipboardData
 from prompt_toolkit.document import Document
 from prompt_toolkit.data_structures import Point
 from prompt_toolkit.filters import Condition
@@ -92,10 +106,12 @@ from prompt_toolkit.layout.dimension import D
 from prompt_toolkit.layout.layout import Layout
 from prompt_toolkit.layout.margins import Margin
 from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
+from prompt_toolkit.selection import SelectionType
 from prompt_toolkit.styles import Style
 from prompt_toolkit.utils import get_cwidth
 from prompt_toolkit.widgets import (
     Button,
+    Checkbox,
     Dialog,
     Label,
     MenuContainer,
@@ -104,14 +120,251 @@ from prompt_toolkit.widgets import (
 )
 
 APP_NAME = "Carriage"
-APP_VERSION = "1.57"
+APP_VERSION = "1.92"
 
-WRAP_COLUMN = 80
+DEFAULT_WRAP_COLUMN = 80
+DEFAULT_SCROLLBAR_VISIBLE = True
+DEFAULT_STATUSBAR_VISIBLE = True
+DEFAULT_MOUSE_ENABLED = True
+DEFAULT_HARD_BREAK_MARKER_VISIBLE = True
+DEFAULT_PANDOC_EXECUTABLE = "pandoc"
+DEFAULT_SPELLCHECK_COMMAND = ["aspell", "--mode=markdown", "check", "{file}"]
+MIN_WRAP_COLUMN = 40
+MAX_WRAP_COLUMN = 160
+
+
+def _config_directory():
+    """Return Carriage's per-user configuration directory."""
+    config_home = os.environ.get("XDG_CONFIG_HOME")
+    if not config_home:
+        config_home = os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(config_home, "carriage")
+
+
+def _config_path():
+    """Return the XDG-style TOML configuration path."""
+    return os.path.join(_config_directory(), "config.toml")
+
+
+
+def _default_config():
+    return {
+        "prose_width": DEFAULT_WRAP_COLUMN,
+        "scrollbar": DEFAULT_SCROLLBAR_VISIBLE,
+        "statusbar": DEFAULT_STATUSBAR_VISIBLE,
+        "mouse": DEFAULT_MOUSE_ENABLED,
+        "hard_break_marker": DEFAULT_HARD_BREAK_MARKER_VISIBLE,
+        "pandoc": DEFAULT_PANDOC_EXECUTABLE,
+        "spellcheck_command": list(DEFAULT_SPELLCHECK_COMMAND),
+    }
+
+
+def _fallback_parse_toml(text):
+    """Parse the small TOML subset used by Carriage when tomllib is unavailable.
+
+    Carriage itself writes only tables, booleans, integers, quoted strings, and
+    arrays of quoted strings. This fallback keeps Python 3.10 usable without a
+    new dependency; Python 3.11+ uses the standard-library TOML parser below.
+    """
+    result = {}
+    current = result
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            name = line[1:-1].strip()
+            if not name or "." in name:
+                raise ValueError("unsupported TOML table")
+            current = result.setdefault(name, {})
+            if not isinstance(current, dict):
+                raise ValueError("invalid TOML table")
+            continue
+        if "=" not in line:
+            raise ValueError("invalid TOML assignment")
+        key, value = (part.strip() for part in line.split("=", 1))
+        # Carriage's generated file keeps comments on their own lines. The
+        # fallback intentionally accepts that documented subset only.
+        if value == "true":
+            parsed = True
+        elif value == "false":
+            parsed = False
+        elif re.fullmatch(r"[+-]?\d+", value):
+            parsed = int(value)
+        elif value.startswith('"'):
+            parsed = json.loads(value)
+        elif value.startswith("[") and value.endswith("]"):
+            parsed = json.loads(value)
+        else:
+            raise ValueError("unsupported TOML value")
+        current[key] = parsed
+    return result
+
+
+def _read_toml_file(path):
+    with open(path, "rb") as f:
+        data = f.read()
+    try:
+        import tomllib
+    except ImportError:
+        try:
+            import tomli as tomllib
+        except ImportError:
+            tomllib = None
+    if tomllib is not None:
+        return tomllib.loads(data.decode("utf-8"))
+    return _fallback_parse_toml(data.decode("utf-8"))
+
+
+def _validate_config(raw):
+    """Return validated settings, using defaults for missing/invalid values."""
+    cfg = _default_config()
+    if not isinstance(raw, dict):
+        return cfg
+
+    editor = raw.get("editor", {})
+    interface = raw.get("interface", {})
+    tools = raw.get("tools", {})
+    editor = editor if isinstance(editor, dict) else {}
+    interface = interface if isinstance(interface, dict) else {}
+    tools = tools if isinstance(tools, dict) else {}
+
+    width = editor.get("prose_width")
+    if isinstance(width, int) and not isinstance(width, bool) and MIN_WRAP_COLUMN <= width <= MAX_WRAP_COLUMN:
+        cfg["prose_width"] = width
+
+
+    for key in ("scrollbar", "statusbar", "mouse", "hard_break_marker"):
+        value = interface.get(key)
+        if isinstance(value, bool):
+            cfg[key] = value
+
+    pandoc = tools.get("pandoc")
+    if isinstance(pandoc, str) and pandoc.strip():
+        cfg["pandoc"] = pandoc.strip()
+
+    spellcheck = tools.get("spellcheck_command")
+    if (
+        isinstance(spellcheck, list)
+        and spellcheck
+        and all(isinstance(arg, str) and arg for arg in spellcheck)
+        and "{file}" not in spellcheck[0]
+        and any("{file}" in arg for arg in spellcheck)
+    ):
+        cfg["spellcheck_command"] = list(spellcheck)
+
+    return cfg
+
+
+def _load_preferences():
+    """Load Carriage's TOML configuration, falling back to defaults."""
+    try:
+        raw = _read_toml_file(_config_path())
+    except (OSError, UnicodeError, ValueError):
+        return _default_config()
+    return _validate_config(raw)
+
+
+def _toml_string(value):
+    """Return a TOML basic string using JSON-compatible escaping."""
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def _serialize_config_toml(config):
+    spell = ", ".join(_toml_string(arg) for arg in config["spellcheck_command"])
+    return (
+        "# Carriage configuration\n"
+        "# Preferences exposes prose_width and scrollbar.\n"
+        "# Unsaved working state is protected automatically and is not configurable.\n"
+        "# The other settings are advanced options intended for manual editing.\n\n"
+        "[editor]\n"
+        f"prose_width = {int(config['prose_width'])}\n\n"
+        "[interface]\n"
+        f"scrollbar = {str(bool(config['scrollbar'])).lower()}\n\n"
+        "# Advanced: startup/default interface behavior. The status bar can be\n"
+        "# toggled for the current session from the Edit menu.\n"
+        f"statusbar = {str(bool(config['statusbar'])).lower()}\n"
+        f"mouse = {str(bool(config['mouse'])).lower()}\n"
+        f"hard_break_marker = {str(bool(config['hard_break_marker'])).lower()}\n\n"
+        "[tools]\n"
+        "# Advanced: executable used for all Pandoc exports.\n"
+        f"pandoc = {_toml_string(config['pandoc'])}\n\n"
+        "# Advanced: interactive terminal spell checker. The command must edit the\n"
+        "# open file in place and exit when finished. {file} is replaced by the path.\n"
+        f"spellcheck_command = [{spell}]\n"
+    )
+
+
+def _write_preferences_values(prose_width, scrollbar):
+    """Atomically persist preferences while preserving advanced settings."""
+    path = _config_path()
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+
+    # Preferences exposes only two settings. Reload the current config before
+    # writing so advanced values edited manually while Carriage is running are
+    # preserved rather than replaced by the startup-time globals.
+    try:
+        payload = _validate_config(_read_toml_file(path))
+    except FileNotFoundError:
+        payload = _default_config()
+    except (OSError, UnicodeError, ValueError) as exc:
+        # Do not overwrite an existing config that we could not safely parse.
+        # Callers already surface OSError as a Preferences-save failure.
+        raise OSError(
+            f"Could not read existing Carriage configuration: {exc}"
+        ) from exc
+
+    payload.update(
+        {
+            "prose_width": int(prose_width),
+            "scrollbar": bool(scrollbar),
+        }
+    )
+    fd, temp_path = tempfile.mkstemp(prefix=".config-", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            fd = None
+            f.write(_serialize_config_toml(payload))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, path)
+        temp_path = None
+        try:
+            dir_fd = os.open(directory, os.O_RDONLY)
+        except OSError:
+            dir_fd = None
+        if dir_fd is not None:
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if temp_path is not None:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+
+
+_PREFERENCES = _load_preferences()
+WRAP_COLUMN = _PREFERENCES["prose_width"]
+SCROLLBAR_VISIBLE = _PREFERENCES["scrollbar"]
+STATUSBAR_DEFAULT_VISIBLE = _PREFERENCES["statusbar"]
+MOUSE_ENABLED = _PREFERENCES["mouse"]
+HARD_BREAK_MARKER_VISIBLE = _PREFERENCES["hard_break_marker"]
+PANDOC_EXECUTABLE = _PREFERENCES["pandoc"]
+SPELLCHECK_COMMAND = tuple(_PREFERENCES["spellcheck_command"])
+
 STRUCTURE_GUTTER_WIDTH = 8
 TAB_WIDTH = 4
 HARD_BREAK_DISPLAY_CHAR = "↵"
-AUTOSAVE_INTERVAL_SECONDS = 30
-RECOVERY_FORMAT_VERSION = 3
+WORKING_STATE_IDLE_SECONDS = 2.0
+WORKING_STATE_MAX_LATENCY_SECONDS = 10.0
+WORKING_STATE_POLL_SECONDS = 0.25
+RECOVERY_FORMAT_VERSION = 4
 TABLE_SENTINEL = "\u2063"  # zero-width INVISIBLE SEPARATOR; never written to disk
 FOOTNOTE_SENTINEL = "\u2064"  # zero-width INVISIBLE PLUS; never written to disk
 TABLE_PLACEHOLDER_RE = re.compile(
@@ -121,6 +374,26 @@ FOOTNOTE_PLACEHOLDER_RE = re.compile(
     rf"^\[\[Footnote: ([^\]]+)\]\]{FOOTNOTE_SENTINEL}$"
 )
 _FOOTNOTE_REFERENCE_RE = re.compile(r"\[\^([^\]\n]+)\](?!:)")
+_SPACED_DASH_STANDIN_RE = re.compile(
+    r"(?P<left>\S+)(?P<gap1>[ \t]+)(?P<dash>-{2,})(?P<gap2>[ \t]+)(?P<right>\S+)"
+)
+
+# Status-bar word count is intentionally prose-oriented rather than a count of
+# Markdown lexical tokens.  Hyphenated compounds and apostrophe contractions
+# count as one word; dash stand-ins such as ``word---word`` still count the two
+# prose words on either side.
+_PROSE_WORD_RE = re.compile(
+    r"(?:\d+(?:[.,]\d+)+|"
+    r"[^\W_]+(?:[’'][^\W_]+)*(?:-[^\W_]+(?:[’'][^\W_]+)*)*)",
+    re.UNICODE,
+)
+_BARE_URL_OR_EMAIL_RE = re.compile(
+    r"(?i)(?:\bhttps?://[^\s<>]+|\bwww\.[^\s<>]+|"
+    r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b)"
+)
+_AUTOLINK_RE = re.compile(
+    r"(?i)<(?:https?://[^<>\s]+|[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})>"
+)
 
 
 def _markdown_char_is_escaped(text, index):
@@ -133,54 +406,39 @@ def _markdown_char_is_escaped(text, index):
     return bool(backslashes % 2)
 
 
+_RANGE_BISECT_SENTINEL = float("inf")
+
+
 def _range_contains(ranges, position):
-    """Return True when position lies inside one of the sorted ranges."""
-    for start, end in ranges:
-        if position < start:
-            return False
-        if start <= position < end:
-            return True
-    return False
+    """Return True when position lies inside sorted, non-overlapping ranges."""
+    if not ranges:
+        return False
+    index = bisect_right(ranges, (position, _RANGE_BISECT_SENTINEL)) - 1
+    return index >= 0 and position < ranges[index][1]
 
 
-def _matching_link_label_start(text, close_index, protected):
-    """Find the opening [ for a valid-looking Markdown link/image label."""
-    depth = 1
-    i = close_index - 1
-    while i >= 0:
-        if _range_contains(protected, i):
-            i -= 1
-            continue
-        char = text[i]
-        if char == "]" and not _markdown_char_is_escaped(text, i):
-            depth += 1
-        elif char == "[" and not _markdown_char_is_escaped(text, i):
-            depth -= 1
-            if depth == 0:
-                return i
-        elif char == "\n" and depth == 1:
-            # Original Markdown permits inline content in labels, but treating
-            # a prior physical line as the start of a link here would create
-            # surprising footnote exclusions. Reference/inline link syntax
-            # itself remains untouched; this helper only protects destinations.
-            return None
-        i -= 1
-    return None
+def _merge_source_ranges(ranges):
+    """Return sorted, non-overlapping source ranges."""
+    merged = []
+    for start, end in sorted(ranges):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
 
 
-def _inline_footnote_literal_ranges(full_text):
-    """Return inline source ranges where ``[^id]`` must remain literal.
+@lru_cache(maxsize=8)
+def _inline_code_span_ranges(full_text):
+    """Return source ranges occupied by original-Markdown inline code spans.
 
-    Footnotes are an extension layered on original Markdown. Their reference
-    syntax must therefore lose special meaning inside original-Markdown code
-    spans, autolinks/inline HTML, inline link/image destinations, and the
-    second label of reference-style links/images.
+    Markdown.pl permits arbitrary-length backtick delimiters and code-span
+    content may cross physical source lines.  These ranges are shared by
+    footnote recognition and hard-break handling so literal code is never
+    reinterpreted as either extension syntax or a two-space line break.
     """
     ranges = []
     n = len(full_text)
-
-    # Code spans. Markdown.pl 1.0.1 permits arbitrary-length backtick runs and
-    # allows the span content to cross physical newlines.
     i = 0
     while i < n:
         if full_text[i] != "`" or _markdown_char_is_escaped(full_text, i):
@@ -208,15 +466,78 @@ def _inline_footnote_literal_ranges(full_text):
             i = close
         else:
             i = run_end
+    return tuple(ranges)
 
-    ranges.sort()
+
+@lru_cache(maxsize=8)
+def _source_lines(full_text):
+    """Return physical source lines once per document text generation."""
+    return tuple(full_text.split("\n"))
+
+
+@lru_cache(maxsize=8)
+def _source_line_offsets(full_text):
+    """Return global source offsets for the start of every physical line."""
+    offsets = []
+    position = 0
+    lines = full_text.split("\n")
+    for index, line in enumerate(lines):
+        offsets.append(position)
+        position += len(line)
+        if index < len(lines) - 1:
+            position += 1
+    return tuple(offsets)
+
+
+def _matching_link_label_start(text, close_index, protected, additional=()):
+    """Find the opening [ for a valid-looking Markdown link/image label."""
+    depth = 1
+    i = close_index - 1
+    while i >= 0:
+        if _range_contains(protected, i) or _range_contains(additional, i):
+            i -= 1
+            continue
+        char = text[i]
+        if char == "]" and not _markdown_char_is_escaped(text, i):
+            depth += 1
+        elif char == "[" and not _markdown_char_is_escaped(text, i):
+            depth -= 1
+            if depth == 0:
+                return i
+        elif char == "\n" and depth == 1:
+            # Original Markdown permits inline content in labels, but treating
+            # a prior physical line as the start of a link here would create
+            # surprising footnote exclusions. Reference/inline link syntax
+            # itself remains untouched; this helper only protects destinations.
+            return None
+        i -= 1
+    return None
+
+
+def _inline_footnote_literal_ranges(full_text):
+    """Return inline source ranges where ``[^id]`` must remain literal.
+
+    Footnotes are an extension layered on original Markdown. Their reference
+    syntax must therefore lose special meaning inside original-Markdown code
+    spans, autolinks/inline HTML, inline link/image destinations, and the
+    second label of reference-style links/images.
+    """
+    n = len(full_text)
+
+    # Code spans are literal source and can cross physical lines.
+    code_ranges = list(_inline_code_span_ranges(full_text))
 
     # Angle-bracket inline constructs: autolinks and raw inline HTML. Under the
     # valid-Markdown input contract, a complete <...> pair is source whose
     # contents should not be reinterpreted as a footnote reference.
+    angle_ranges = []
     i = 0
     while i < n:
-        if full_text[i] == "<" and not _markdown_char_is_escaped(full_text, i) and not _range_contains(ranges, i):
+        if (
+            full_text[i] == "<"
+            and not _markdown_char_is_escaped(full_text, i)
+            and not _range_contains(code_ranges, i)
+        ):
             quote = None
             end = None
             j = i + 1
@@ -232,22 +553,33 @@ def _inline_footnote_literal_ranges(full_text):
                     break
                 j += 1
             if end is not None:
-                ranges.append((i, end + 1))
+                angle_ranges.append((i, end + 1))
                 i = end + 1
                 continue
         i += 1
-    ranges.sort()
+
+    # Merge once before link scanning. _range_contains() can then use binary
+    # search instead of walking every protected range for every candidate.
+    ranges = _merge_source_ranges(code_ranges + angle_ranges)
 
     # Inline destinations and reference-style second labels. Original
     # Markdown permits an optional space between the two bracket sets of a
     # reference link; inline links require the opening '(' immediately after
-    # the closing ']'.
+    # the closing ']'. Newly discovered ranges are naturally ordered and
+    # non-overlapping because this scan advances past each completed construct,
+    # so they do not need to be re-sorted after every link.
+    link_ranges = []
     i = 0
     while i < n:
-        if full_text[i] != "]" or _markdown_char_is_escaped(full_text, i) or _range_contains(ranges, i):
+        if (
+            full_text[i] != "]"
+            or _markdown_char_is_escaped(full_text, i)
+            or _range_contains(ranges, i)
+            or _range_contains(link_ranges, i)
+        ):
             i += 1
             continue
-        if _matching_link_label_start(full_text, i, ranges) is None:
+        if _matching_link_label_start(full_text, i, ranges, link_ranges) is None:
             i += 1
             continue
 
@@ -271,11 +603,10 @@ def _inline_footnote_literal_ranges(full_text):
                 elif char == ")":
                     depth -= 1
                     if depth == 0:
-                        ranges.append((next_index, j + 1))
+                        link_ranges.append((next_index, j + 1))
                         break
                 j += 1
             i = max(i + 1, j + 1 if j < n else i + 1)
-            ranges.sort()
             continue
 
         j = next_index
@@ -285,8 +616,7 @@ def _inline_footnote_literal_ranges(full_text):
             close = j + 1
             while close < n:
                 if full_text[close] == "]" and not _markdown_char_is_escaped(full_text, close):
-                    ranges.append((j, close + 1))
-                    ranges.sort()
+                    link_ranges.append((j, close + 1))
                     i = close + 1
                     break
                 if full_text[close] == "\n":
@@ -298,15 +628,9 @@ def _inline_footnote_literal_ranges(full_text):
                 continue
         i += 1
 
-    # Merge overlaps so candidate tests are cheap and deterministic.
-    merged = []
-    for start, end in sorted(ranges):
-        if merged and start <= merged[-1][1]:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
-        else:
-            merged.append((start, end))
-    return tuple(merged)
-
+    # Link destinations can contain code/HTML ranges, so merge the two sorted
+    # groups once at the end before returning the canonical protected set.
+    return tuple(_merge_source_ranges(ranges + link_ranges))
 
 @lru_cache(maxsize=8)
 def _footnote_reference_spans(full_text):
@@ -432,26 +756,32 @@ class FootnoteEditorSession:
 class EditorState:
     def __init__(self):
         self.path = None
-        self.auto_save = True
+        self.statusbar_visible = STATUSBAR_DEFAULT_VISIBLE
+        # F6 toggles a portable Extend Selection mode. This is session state,
+        # not a preference, and any document edit returns to normal movement.
+        self.extend_selection_mode = False
         self.saved_text = ""
         # Fingerprint of the exact on-disk bytes last opened or successfully
         # written by Carriage. A save must still see this same version before
         # it is allowed to replace the file.
         self.disk_snapshot = None
-        # Avoid repeatedly opening the same autosave-conflict warning every
-        # 30 seconds while an externally changed file remains unresolved.
-        self.autosave_conflict = False
-        # True while an external interactive process (aspell) has the file
-        # open on disk - autosave pauses during this window to avoid racing
-        # with whatever that process writes back.
+        # True while the configured interactive spell checker has the file open
+        # on disk. The checker works only on an explicitly saved source file.
         self.external_process_running = False
-        # Hidden crash-recovery state for the current working document.
-        # Recovery is deliberately independent of ordinary autosave: it protects
-        # named and untitled documents, including in-progress table/footnote
-        # drafts, and is removed after a successful Save, New, Open, or clean
-        # discard/quit.
+        # Hidden durable working-state protection. The recovery journal tracks
+        # unsaved named and untitled documents, including in-progress table and
+        # footnote drafts, without changing the Markdown source file. It is
+        # removed after a successful explicit Save, New, Open, or clean discard.
         self.recovery_path = None
+        self.recovery_epoch = 0
+        self.recovery_committed_revision = 0
         self.recovery_error = False
+        self.recovery_error_reported = False
+        self.recovery_error_message = None
+        self.working_state_revision = 0
+        self.working_state_persisted_revision = 0
+        self.working_state_first_dirty_at = None
+        self.working_state_last_change_at = None
         self.tables = {}
         self.footnotes = {}
 
@@ -464,6 +794,28 @@ class EditorState:
 
 
 state = EditorState()
+
+
+def _working_state_changed(_buffer=None, *, immediate=False):
+    """Mark unsaved working state for near-continuous durable protection."""
+    now = time.monotonic()
+    state.working_state_revision += 1
+    if immediate:
+        # Meaningful object commits and draft cancellation boundaries should be
+        # journaled on the next scheduler tick rather than waiting for idle.
+        state.working_state_first_dirty_at = now - WORKING_STATE_MAX_LATENCY_SECONDS
+        state.working_state_last_change_at = now - WORKING_STATE_IDLE_SECONDS
+        return
+    if state.working_state_first_dirty_at is None:
+        state.working_state_first_dirty_at = now
+    state.working_state_last_change_at = now
+
+
+def _reset_working_state_tracking():
+    """Mark the current in-memory state as fully accounted for on disk/journal."""
+    state.working_state_persisted_revision = state.working_state_revision
+    state.working_state_first_dirty_at = None
+    state.working_state_last_change_at = None
 
 
 @dataclass(frozen=True)
@@ -537,6 +889,7 @@ class CarriageBuffer(Buffer):
             Document(snapshot.text, cursor_position=snapshot.cursor_position),
             bypass_readonly=True,
         )
+        _working_state_changed()
 
     def undo(self):
         current = self._carriage_state()
@@ -553,12 +906,54 @@ class CarriageBuffer(Buffer):
             snapshot = self._redo_stack.pop()
             self._restore_carriage_state(snapshot)
 
+    # Folded tables and footnote definitions are editor objects, not ordinary
+    # text. Keep all character-level Buffer mutations from entering an object
+    # or deleting either newline that keeps it on its own source line. Program
+    # transformations use set_document()/document directly and are therefore
+    # unaffected by these user-edit guards.
+    def insert_text(self, data, overwrite=False, move_cursor=True, fire_event=True):
+        if _buffer_folded_edit_locked(self, insertion=True):
+            return
+        return super().insert_text(
+            data, overwrite=overwrite, move_cursor=move_cursor, fire_event=fire_event
+        )
+
+    def delete_before_cursor(self, count=1):
+        start = max(0, self.cursor_position - max(0, count))
+        if _folded_edit_range_intersects(self.text, start, self.cursor_position):
+            return ""
+        return super().delete_before_cursor(count)
+
+    def delete(self, count=1):
+        end = min(len(self.text), self.cursor_position + max(0, count))
+        if _folded_edit_range_intersects(self.text, self.cursor_position, end):
+            return ""
+        return super().delete(count)
+
+    def copy_selection(self, _cut=False):
+        if _selection_intersects_folded_object(self):
+            return ClipboardData("")
+        return super().copy_selection(_cut=_cut)
+
+    def cut_selection(self):
+        if _selection_intersects_folded_object(self):
+            return ClipboardData("")
+        return super().cut_selection()
+
+    def paste_clipboard_data(self, data, paste_mode=None, count=1):
+        if _buffer_folded_edit_locked(self, insertion=True):
+            return
+        if paste_mode is None:
+            return super().paste_clipboard_data(data, count=count)
+        return super().paste_clipboard_data(data, paste_mode=paste_mode, count=count)
+
 
 def _set_committed_table(table_number, table):
     """Replace one committed table using copy-on-write for undo snapshots."""
     updated = dict(state.tables)
     updated[table_number] = table
     state.tables = updated
+    _working_state_changed(immediate=True)
 
 
 def _set_committed_footnote(identifier, note):
@@ -566,12 +961,13 @@ def _set_committed_footnote(identifier, note):
     updated = dict(state.footnotes)
     updated[identifier] = note
     state.footnotes = updated
+    _working_state_changed(immediate=True)
 
 
 def _prose_layout_widths(columns):
     """Return left padding, structural gutter, and right padding.
 
-    The 80-column prose body stays centered exactly where it did before the
+    The configured prose body stays centered exactly where it did before the
     hanging-gutter display was introduced. On sufficiently wide terminals, up
     to STRUCTURE_GUTTER_WIDTH cells immediately to the left of that prose body
     are borrowed from the existing left-side breathing room. List markers,
@@ -625,6 +1021,106 @@ class CenterPaddingMargin(Margin):
             if row < height - 1:
                 fragments.append(("", "\n"))
         return fragments
+
+
+def _last_mapped_content_y(yx_to_rowcol, x_min, x_max, y_min, y_max):
+    """Return the last rendered source row inside a Window content rectangle."""
+    mapped = (
+        y
+        for y, x in yx_to_rowcol
+        if y_min <= y < y_max and x_min <= x < x_max
+    )
+    return max(mapped, default=y_min)
+
+
+def _clamp_content_mouse_y(requested_y, y_min, y_max, last_content_y):
+    """Clamp a viewport mouse row to the final rendered source row."""
+    y = max(y_min, min(y_max - 1, requested_y))
+    return min(y, last_content_y)
+
+
+class RenderedScrollbarMargin(Margin):
+    """Scrollbar whose thumb reflects actual soft-wrapped screen rows.
+
+    prompt_toolkit's stock scrollbar measures logical source lines, so a single
+    long paragraph can fill many screen rows while the thumb still appears to
+    represent one line. Carriage uses the same cached rendered-row geometry for
+    drawing, wheel scrolling, clicking, and dragging.
+    """
+
+    def __init__(self, window_getter, display_arrows=True, up_arrow_symbol="^", down_arrow_symbol="v"):
+        self.window_getter = window_getter
+        self.display_arrows = display_arrows
+        self.up_arrow_symbol = up_arrow_symbol
+        self.down_arrow_symbol = down_arrow_symbol
+
+    def get_width(self, get_ui_content):
+        return 1
+
+    def create_margin(self, window_render_info, width, height):
+        if width <= 0 or height <= 0:
+            return []
+
+        display_arrows = bool(self.display_arrows)
+        track_height = height - 2 if display_arrows else height
+        if track_height <= 0:
+            return []
+
+        window = self.window_getter()
+        heights, prefix = window._rendered_height_geometry(
+            ui_content=window_render_info.ui_content,
+            width=window_render_info.window_width,
+        )
+        total_height = prefix[-1] if heights and prefix else 0
+        viewport_height = max(1, window_render_info.window_height)
+
+        if total_height <= 0:
+            thumb_height = track_height
+            thumb_top = 0
+        else:
+            thumb_height = max(1, min(
+                track_height,
+                int(round(track_height * min(1.0, viewport_height / float(total_height)))),
+            ))
+            max_top = max(0, total_height - viewport_height)
+            max_thumb_top = max(0, track_height - thumb_height)
+            if max_top <= 0 or max_thumb_top <= 0:
+                thumb_top = 0
+            else:
+                rendered_top = window._absolute_rendered_scroll(heights, prefix)
+                thumb_top = int(round(max_thumb_top * rendered_top / float(max_top)))
+                thumb_top = max(0, min(max_thumb_top, thumb_top))
+
+        result = []
+        if display_arrows:
+            result.extend([
+                ("class:scrollbar.arrow", self.up_arrow_symbol),
+                ("class:scrollbar", "\n"),
+            ])
+
+        thumb_end = thumb_top + thumb_height
+        for row in range(track_height):
+            in_thumb = thumb_top <= row < thumb_end
+            if in_thumb:
+                style = (
+                    "class:scrollbar.button,scrollbar.end"
+                    if row == thumb_end - 1
+                    else "class:scrollbar.button"
+                )
+            else:
+                style = (
+                    "class:scrollbar.background,scrollbar.start"
+                    if row + 1 == thumb_top
+                    else "class:scrollbar.background"
+                )
+            result.append((style, " "))
+            if row < track_height - 1 or display_arrows:
+                result.append(("", "\n"))
+
+        if display_arrows:
+            result.append(("class:scrollbar.arrow", self.down_arrow_symbol))
+
+        return result
 
 
 class ScrollableWindow(Window):
@@ -846,9 +1342,26 @@ class ScrollableWindow(Window):
             content_y_min = write_position.ypos
             content_y_max = write_position.ypos + write_position.height
 
+            last_content_y = _last_mapped_content_y(
+                yx_to_rowcol,
+                content_x_min,
+                content_x_max,
+                content_y_min,
+                content_y_max,
+            )
+
             def content_handler(mouse_event):
-                y = min(content_y_max - 1, mouse_event.position.y)
+                y = _clamp_content_mouse_y(
+                    mouse_event.position.y,
+                    content_y_min,
+                    content_y_max,
+                    last_content_y,
+                )
                 x = mouse_event.position.x
+
+                # Blank rows below EOF are part of the editor viewport, not a
+                # dead mouse zone. The y coordinate above is clamped to the
+                # final rendered content row before horizontal source lookup.
 
                 # A real click resumes editing at the clicked location. End
                 # manual scrolling before forwarding it to BufferControl; the
@@ -941,12 +1454,6 @@ def _scrollbar_rendered_geometry():
     )
 
 
-def _scrollbar_rendered_heights():
-    """Compatibility helper returning cached rendered logical-line heights."""
-    heights, _prefix = _scrollbar_rendered_geometry()
-    return heights
-
-
 def _move_to_rendered_position(rendered_row):
     """Scroll the viewport to the nearest absolute rendered-row position."""
     info = text_area.window.render_info
@@ -1023,7 +1530,7 @@ def _on_scrollbar_interact(row_in_window, window_height):
 # visual only: ATX headings and inline bold/italic emphasis get styled, while
 # the underlying buffer remains untouched. Fenced code blocks are left
 # unhighlighted so prose markers inside code do not masquerade as Markdown.
-_HIGHLIGHT_ATX_RE = re.compile(r"^\s{0,3}#{1,6}(?!#)")
+_HIGHLIGHT_ATX_RE = re.compile(r"^#{1,6}(?!#)(?=.*\S)")
 _HIGHLIGHT_FENCE_RE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
 
 # Order matters: triple emphasis before bold, then italic. The patterns are
@@ -1100,37 +1607,72 @@ def _highlight_inline_markdown_block(block_lines):
         return []
 
     combined = "\n".join(block_lines)
-    styles = [""] * len(combined)
-
-    for match in _HIGHLIGHT_INLINE_RE.finditer(combined):
-        style_name = _highlight_style_for_match(match)
-        for index in range(match.start(), match.end()):
-            if combined[index] != "\n":
-                styles[index] = style_name
+    spans = [
+        (match.start(), match.end(), _highlight_style_for_match(match))
+        for match in _HIGHLIGHT_INLINE_RE.finditer(combined)
+    ]
 
     rendered = []
     offset = 0
+    span_index = 0
+
     for line in block_lines:
-        fragments = []
+        line_start = offset
+        line_end = line_start + len(line)
+
         if not line:
             rendered.append([("", "")])
-            offset += 1
+            offset = line_end + 1
             continue
 
-        line_styles = styles[offset:offset + len(line)]
-        run_start = 0
-        current_style = line_styles[0] if line_styles else ""
-        for index in range(1, len(line)):
-            if line_styles[index] != current_style:
-                fragments.append((current_style, line[run_start:index]))
-                run_start = index
-                current_style = line_styles[index]
-        fragments.append((current_style, line[run_start:]))
-        rendered.append(fragments)
-        offset += len(line) + 1
+        # Discard matches that ended before this physical line. A match that
+        # spans a hard wrap remains active and is projected onto each line it
+        # intersects.
+        while span_index < len(spans) and spans[span_index][1] <= line_start:
+            span_index += 1
+
+        fragments = []
+        cursor = 0
+        scan_index = span_index
+
+        while scan_index < len(spans):
+            start, end, style_name = spans[scan_index]
+            if start >= line_end:
+                break
+
+            local_start = max(start, line_start) - line_start
+            local_end = min(end, line_end) - line_start
+
+            if local_start > cursor:
+                fragments.append(("", line[cursor:local_start]))
+
+            if local_end > local_start:
+                fragment_text = line[local_start:local_end]
+                # The old character-style map naturally coalesced adjacent
+                # matches with the same style. Preserve that exact fragment
+                # behavior without allocating one style entry per character.
+                if fragments and fragments[-1][0] == style_name:
+                    fragments[-1] = (
+                        style_name,
+                        fragments[-1][1] + fragment_text,
+                    )
+                else:
+                    fragments.append((style_name, fragment_text))
+                cursor = local_end
+
+            scan_index += 1
+
+        if cursor < len(line):
+            fragment_text = line[cursor:]
+            if fragments and fragments[-1][0] == "":
+                fragments[-1] = ("", fragments[-1][1] + fragment_text)
+            else:
+                fragments.append(("", fragment_text))
+
+        rendered.append(fragments or [("", line)])
+        offset = line_end + 1
 
     return rendered
-
 
 def _highlight_special_line(line, row, fenced_lines):
     """Return fixed fragments for structural lines, or None for prose."""
@@ -1164,7 +1706,6 @@ class ProseMarkdownLexer(Lexer):
                 continue
 
             start = row
-            starts_list_item = bool(_HIGHLIGHT_LIST_ITEM_RE.match(lines[row]))
             row += 1
 
             # A hard-wrapped paragraph is one highlighting block. A list item
@@ -1175,8 +1716,6 @@ class ProseMarkdownLexer(Lexer):
                 if _highlight_special_line(lines[row], row, fenced_lines) is not None:
                     break
                 if _HIGHLIGHT_LIST_ITEM_RE.match(lines[row]):
-                    break
-                if not starts_list_item and _HIGHLIGHT_LIST_ITEM_RE.match(lines[row]):
                     break
                 row += 1
 
@@ -1234,7 +1773,7 @@ def _footnote_number_map(full_text):
 
 def _footnote_display_spans(full_text, row):
     """Return source spans replaced by compact footnote UI on one row."""
-    lines = full_text.split("\n")
+    lines = _source_lines(full_text)
     if not (0 <= row < len(lines)):
         return []
     line = lines[row]
@@ -1247,12 +1786,10 @@ def _footnote_display_spans(full_text, row):
         label = f"[[Footnote {number}]]" if number is not None else "[[Footnote ?]]"
         return [(0, len(line), label, identifier, True)]
 
-    # Do not reinterpret literal source inside block-level carve-outs.
-    block_kind = None
-    for block in _analyze_document_layout(full_text, WRAP_COLUMN):
-        if block.start <= row < block.end:
-            block_kind = block.kind
-            break
+    # Do not reinterpret literal source inside block-level carve-outs.  The
+    # owning block is already projected into the cached row map, so this stays
+    # O(1) even when prompt_toolkit transforms every row during geometry rebuild.
+    block_kind = _display_row_layout(full_text, row).block_kind
     if block_kind in {
         "front-matter",
         "code",
@@ -1271,17 +1808,78 @@ def _footnote_display_spans(full_text, row):
     return spans
 
 
-def _hard_break_display_span(full_text, row):
-    """Return a display-only span for an original-Markdown hard line break.
+def _strip_blockquote_container_prefixes(line):
+    """Return content after any explicit nested blockquote markers."""
+    content = line
+    while True:
+        match = _BLOCKQUOTE_LINE_RE.match(content)
+        if match is None:
+            return content
+        content = match.group(1)
 
-    A valid hard break is two or more trailing spaces on a prose-bearing line.
-    The source spaces remain authoritative; only the final trailing space is
-    replaced visually by the marker, so display width and cursor positions stay
-    aligned with the source. Structural blocks where trailing spaces are literal
-    source (for example code, raw HTML, tables, and reference definitions) are
-    deliberately excluded.
+
+@lru_cache(maxsize=8)
+def _footnote_content_row_kinds(full_text):
+    """Return display-only text/code classification for complex footnote rows.
+
+    A single forward pass replaces the old per-row backward walk. Blank rows do
+    not themselves carry a kind, but they keep an indented footnote continuation
+    open so a later continuation row is still classified correctly.
     """
-    lines = full_text.split("\n")
+    lines = _source_lines(full_text)
+    result = [None] * len(lines)
+    active = False
+
+    for row, line in enumerate(lines):
+        if _FOOTNOTE_DEFINITION_RE.match(line):
+            result[row] = "text"
+            active = True
+            continue
+
+        if not active:
+            continue
+
+        if not line.strip():
+            continue
+
+        if line.startswith("\t"):
+            result[row] = "text"
+            continue
+
+        spaces = len(line) - len(line.lstrip(" "))
+        if spaces >= 8:
+            result[row] = "code"
+            continue
+        if spaces >= 4:
+            result[row] = "text"
+            continue
+
+        active = False
+
+    return tuple(result)
+
+
+def _footnote_content_row_kind(full_text, row):
+    """Return ``text``/``code`` for a visible complex footnote row, or None."""
+    kinds = _footnote_content_row_kinds(full_text)
+    if 0 <= row < len(kinds):
+        return kinds[row]
+    return None
+
+
+def _hard_break_display_span(full_text, row):
+    """Return the display-only marker for a real original-Markdown hard break.
+
+    Two or more trailing spaces are a hard break only in prose-bearing source.
+    Spaces inside a multiline inline-code span, block code, raw HTML, tables,
+    headings, and reference definitions are literal and never receive the
+    marker. Nested blockquotes, nested/complex lists, and complex footnotes are
+    included when the physical row itself is prose rather than contained code.
+    """
+    if not HARD_BREAK_MARKER_VISIBLE:
+        return None
+
+    lines = _source_lines(full_text)
     if not (0 <= row < len(lines)):
         return None
 
@@ -1289,29 +1887,90 @@ def _hard_break_display_span(full_text, row):
     if not line.strip() or _hard_break_marker(line) is None:
         return None
 
-    block_kind = None
-    for block in _analyze_document_layout(full_text, WRAP_COLUMN):
-        if block.start <= row < block.end:
-            block_kind = block.kind
-            break
-
-    if block_kind not in {"prose", "list", "list-run", "blockquote"}:
+    # If the final trailing space is inside an inline code span that crosses a
+    # physical line boundary, it is literal code whitespace, not break syntax.
+    offsets = _source_line_offsets(full_text)
+    final_space = offsets[row] + len(line) - 1
+    if _range_contains(_inline_code_span_ranges(full_text), final_space):
         return None
 
-    # Replace only the final trailing space. Keeping the other source spaces
-    # visible-as-spaces preserves the line's display width and gives every
-    # source cursor position a natural display position.
+    block_kind = _display_row_layout(full_text, row).block_kind
+
+    if block_kind in {"prose", "list", "list-run", "blockquote"}:
+        pass
+    elif block_kind == "complex-blockquote":
+        inner = _strip_blockquote_container_prefixes(line)
+        if _is_indented_code(inner):
+            return None
+    elif block_kind == "complex-list":
+        # Four spaces are ordinary list continuation indentation. Eight or more
+        # spaces (or a tab) are the original-Markdown code-block level within a
+        # top-level list item.
+        if line.startswith("\t"):
+            return None
+        leading = len(line) - len(line.lstrip(" "))
+        if leading >= 8:
+            return None
+    elif block_kind == "reference-definition":
+        # Link reference definitions are opaque. A complex footnote definition
+        # uses the same leading syntax, but its prose still benefits from the
+        # hard-break indicator.
+        if _footnote_content_row_kind(full_text, row) != "text":
+            return None
+    elif block_kind == "code":
+        # A four-space row may actually be a continuation of a complex folded-
+        # out footnote. Reclassify only when we can prove that ownership.
+        if _footnote_content_row_kind(full_text, row) != "text":
+            return None
+    else:
+        return None
+
     start = len(line) - 1
     return start, len(line), HARD_BREAK_DISPLAY_CHAR
 
 
+@lru_cache(maxsize=4096)
+def _dash_standin_glue_positions(line, prefix_width, body_width):
+    """Return source-space positions that should not be soft-wrap breakpoints.
+
+    Writers commonly draft an em dash as either ``word---word`` or
+    ``word -- word``.  The unspaced spelling is already one ordinary wrap token;
+    the spaced spelling would normally expose two whitespace breakpoints and can
+    strand ``--`` at a visual line edge.  Treat the whole ``word -- word`` group
+    as one visual prose unit when that group can fit on a line by gluing only the
+    whitespace surrounding a run of two or more hyphens.
+
+    The returned positions refer to the original source line.  Nothing is
+    inserted into or removed from the Markdown source, and groups wider than the
+    available prose width deliberately fall back to ordinary whitespace wrapping.
+    """
+    prefix_width = max(0, min(int(prefix_width or 0), len(line)))
+    body_width = max(1, int(body_width or 1))
+    body = line[prefix_width:]
+    glued = set()
+
+    # A dash stand-in must be a punctuation token between two non-whitespace
+    # tokens.  Two or more hyphens covers the common spaced ``--`` spelling as
+    # well as writers who use ``---`` with spaces.  A single hyphen remains an
+    # ordinary Markdown/list punctuation character.
+    for match in _SPACED_DASH_STANDIN_RE.finditer(body):
+        group = match.group(0)
+        if sum(max(0, get_cwidth(ch)) for ch in group) > body_width:
+            continue
+        for name in ("gap1", "gap2"):
+            start, end = match.span(name)
+            glued.update(prefix_width + pos for pos in range(start, end))
+
+    return frozenset(glued)
+
+
 class ProseLayoutProcessor(Processor):
-    """Render Carriage's hanging gutter and 80-column soft wrapping.
+    """Render Carriage's hanging gutter and configured-width soft wrapping.
 
     Source lines remain authoritative and are never changed by this processor.
     For a physical line wider than its prose budget, display-only padding is
     inserted at word boundaries so prompt_toolkit wraps it cleanly inside the
-    80-column writing area. Structural Markdown prefixes use metadata from the
+    configured writing area. Structural Markdown prefixes use metadata from the
     shared block analysis and hang into the left gutter.
     """
 
@@ -1319,10 +1978,14 @@ class ProseLayoutProcessor(Processor):
         gutter = max(0, min(STRUCTURE_GUTTER_WIDTH, ti.width - (WRAP_COLUMN + 1)))
         row_layout = _display_row_layout(ti.document.text, ti.lineno)
         prefix_width = row_layout.structural_prefix_width
+        quote_depth = row_layout.blockquote_depth
+        quote_marker = _blockquote_gutter_text(quote_depth, gutter)
         if prefix_width > gutter:
             prefix_width = 0
 
+        quote_marker_width = sum(max(0, get_cwidth(ch)) for ch in quote_marker)
         padding = max(0, gutter - prefix_width)
+
         fragments = explode_text_fragments(ti.fragments)
         source_length = len(fragments)
 
@@ -1344,6 +2007,8 @@ class ProseLayoutProcessor(Processor):
                 source_pos = end
                 continue
             style, char = fragments[source_pos][0], fragments[source_pos][1]
+            if quote_depth > 0 and source_pos < prefix_width and char == ">":
+                style = "class:markdown.blockquote-gutter"
             units.append((style, char, source_pos, source_pos + 1))
             source_pos += 1
 
@@ -1352,12 +2017,31 @@ class ProseLayoutProcessor(Processor):
         display_to_source_map = {}
         display_pos = 0
 
-        for _ in range(padding):
-            result.append(("", " "))
-            display_to_source_map[display_pos] = 0
-            display_pos += 1
+        # The first rendered row receives the same canonical quote gutter as
+        # every soft-wrap continuation. Explicit source markers are replaced by
+        # a display-only marker unit below; lazy continuation rows synthesize the
+        # marker entirely inside the gutter and leave source column 0 untouched.
+        if quote_depth > 0 and prefix_width == 0 and quote_marker:
+            quote_padding = max(0, gutter - quote_marker_width)
+            for _ in range(quote_padding):
+                result.append(("", " "))
+                display_to_source_map[display_pos] = 0
+                display_pos += 1
+            result.append(("class:markdown.blockquote-gutter", quote_marker))
+            for offset in range(len(quote_marker)):
+                display_to_source_map[display_pos + offset] = 0
+            display_pos += len(quote_marker)
+        else:
+            for _ in range(padding):
+                result.append(("", " "))
+                display_to_source_map[display_pos] = 0
+                display_pos += 1
 
         body_width = max(1, min(WRAP_COLUMN, ti.width - gutter - 1))
+        source_line = "".join(char for _style, char in fragments)
+        dash_glue_positions = _dash_standin_glue_positions(
+            source_line, prefix_width, body_width
+        )
         measured_parts = []
         for unit_style, text, src_start, _src_end in units:
             if src_start >= prefix_width:
@@ -1374,15 +2058,23 @@ class ProseLayoutProcessor(Processor):
                 display_to_source_map[display_pos] = src_anchor
                 display_pos += 1
 
-        def next_word_width(unit_index):
+        def next_wrap_unit_width(unit_index):
+            """Measure the next visual prose unit, including glued dash gaps."""
             width = 0
             found = False
-            for _style, text, _src_start, _src_end in units[unit_index:]:
-                for char in text:
+            for _style, text, src_start, src_end in units[unit_index:]:
+                for offset, char in enumerate(text):
+                    source_index = min(
+                        src_start + offset,
+                        max(src_start, src_end - 1),
+                    )
                     if char.isspace():
-                        if found:
-                            return width
-                        continue
+                        if not found:
+                            continue
+                        if source_index in dash_glue_positions:
+                            width += max(0, get_cwidth(char))
+                            continue
+                        return width
                     found = True
                     width += max(0, get_cwidth(char))
             return width
@@ -1418,8 +2110,17 @@ class ProseLayoutProcessor(Processor):
                 body_col += sum(max(0, get_cwidth(ch)) for ch in text)
 
             if fallback_wrap and text.isspace():
-                word_width = next_word_width(unit_index + 1)
-                if 0 < word_width <= body_width and body_col + word_width > body_width:
+                # The spaces around a drafted dash stand-in are visual glue,
+                # not line-break opportunities.  The whitespace before the
+                # left-hand word sees the entire ``word -- word`` phrase as the
+                # next unit and moves that phrase together when necessary.
+                if any(
+                    pos in dash_glue_positions
+                    for pos in range(src_start, src_end)
+                ):
+                    continue
+                unit_width = next_wrap_unit_width(unit_index + 1)
+                if 0 < unit_width <= body_width and body_col + unit_width > body_width:
                     fill = max(0, (body_width + 1) - body_col)
                     append_display_padding(fill, src_end - 1 if src_end > src_start else src_start)
                     body_col = 0
@@ -1447,7 +2148,7 @@ class ProseLayoutProcessor(Processor):
 
 
 def _soft_wrap_line_prefix(lineno, wrap_count):
-    """Align display-only soft-wrap continuations with the prose column."""
+    """Render the structural gutter on visual soft-wrap continuations."""
     if wrap_count <= 0:
         return []
     try:
@@ -1457,17 +2158,183 @@ def _soft_wrap_line_prefix(lineno, wrap_count):
     _left, gutter, _right = _prose_layout_widths(columns)
     if gutter <= 0:
         return []
-    return [("class:editor", " " * gutter)]
+
+    try:
+        row_layout = _display_row_layout(text_area.buffer.text, lineno)
+        quote_marker = _blockquote_gutter_text(
+            row_layout.blockquote_depth, gutter
+        )
+    except Exception:
+        quote_marker = ""
+
+    if not quote_marker:
+        return [("class:editor", " " * gutter)]
+
+    marker_width = sum(max(0, get_cwidth(ch)) for ch in quote_marker)
+    padding = max(0, gutter - marker_width)
+    fragments = []
+    if padding:
+        fragments.append(("class:editor", " " * padding))
+    fragments.append(("class:markdown.blockquote-gutter", quote_marker))
+    return fragments
+
+
+_MULTI_CLICK_SECONDS = 0.40
+_MULTI_CLICK_INDEX_TOLERANCE = 1
+
+
+def _word_selection_range(full_text, cursor_position):
+    """Return the source range for the word at ``cursor_position``."""
+    cursor_position = max(0, min(len(full_text), cursor_position))
+    document = Document(full_text, cursor_position=cursor_position)
+    start_delta, end_delta = document.find_boundaries_of_current_word()
+    start = cursor_position + start_delta
+    end = cursor_position + end_delta
+    if end <= start:
+        return None
+    return start, end
+
+
+def _paragraph_selection_range(full_text, cursor_position):
+    """Return the logical Markdown paragraph/block range at the cursor.
+
+    Prose and blockquotes select their full logical block. Inside a supported
+    flat list, triple-click selects only the list item under the pointer rather
+    than the entire adjacent run. Other nonblank Markdown constructs select
+    their own source block. Blank rows do not create a selection.
+    """
+    if not full_text:
+        return None
+
+    cursor_position = max(0, min(len(full_text), cursor_position))
+    document = Document(full_text, cursor_position=cursor_position)
+    row = document.cursor_position_row
+    lines = full_text.split("\n")
+
+    target_start = target_end = None
+    for block in _analyze_document_layout(full_text, WRAP_COLUMN):
+        if not (block.start <= row < block.end):
+            continue
+        if block.kind == "blank":
+            return None
+
+        if block.kind == "list-run" and block.list_items:
+            for item in block.list_items:
+                if item.start <= row < item.end:
+                    target_start, target_end = item.start, item.end
+                    break
+        else:
+            target_start, target_end = block.start, block.end
+        break
+
+    if target_start is None or target_end is None or target_end <= target_start:
+        return None
+
+    start = document.translate_row_col_to_index(target_start, 0)
+    last_row = target_end - 1
+    end = document.translate_row_col_to_index(last_row, len(lines[last_row]))
+    if end <= start:
+        return None
+    return start, end
+
+
+def _select_source_range(buffer, source_range):
+    """Apply one ordinary character selection to ``buffer``."""
+    if source_range is None:
+        return False
+    start, end = source_range
+    start = max(0, min(len(buffer.text), start))
+    end = max(start, min(len(buffer.text), end))
+    if end <= start:
+        return False
+
+    buffer.exit_selection()
+    buffer.cursor_position = start
+    buffer.start_selection(selection_type=SelectionType.CHARACTERS)
+    buffer.cursor_position = end
+    return True
 
 
 class FullWidthSafeBufferControl(BufferControl):
-    """Focus and position the prose editor on the same mouse click."""
+    """Focus, position, and implement Carriage's prose mouse semantics."""
+
+    def _reset_carriage_click_sequence(self):
+        self._carriage_click_count = 0
+        self._carriage_last_click_time = 0.0
+        self._carriage_last_click_index = None
 
     def mouse_handler(self, mouse_event):
+        buffer = self.buffer
+
         if mouse_event.event_type == MouseEventType.MOUSE_DOWN:
             app = get_app()
             if app.layout.current_control is not self:
                 app.layout.current_control = self
+
+            self._carriage_mouse_dragged = False
+            result = super().mouse_handler(mouse_event)
+            # BufferControl has now translated the rendered position back to a
+            # source index. Keep that exact source location for click counting.
+            self._carriage_mouse_down_index = buffer.cursor_position
+            return result
+
+        if (
+            mouse_event.event_type == MouseEventType.MOUSE_MOVE
+            and mouse_event.button != MouseButton.NONE
+        ):
+            self._carriage_mouse_dragged = True
+            self._reset_carriage_click_sequence()
+            return super().mouse_handler(mouse_event)
+
+        if mouse_event.event_type == MouseEventType.MOUSE_UP:
+            # Disable prompt_toolkit's private timestamp-only double-click
+            # heuristic. Carriage owns the complete multi-click policy so a
+            # rapid click elsewhere cannot accidentally count as a double-click.
+            self._last_click_timestamp = None
+            result = super().mouse_handler(mouse_event)
+
+            if getattr(self, "_carriage_mouse_dragged", False):
+                self._reset_carriage_click_sequence()
+                return result
+
+            click_index = getattr(
+                self, "_carriage_mouse_down_index", buffer.cursor_position
+            )
+            now = time.monotonic()
+            previous_time = getattr(self, "_carriage_last_click_time", 0.0)
+            previous_index = getattr(self, "_carriage_last_click_index", None)
+            previous_count = getattr(self, "_carriage_click_count", 0)
+
+            same_spot = (
+                previous_index is not None
+                and abs(click_index - previous_index)
+                <= _MULTI_CLICK_INDEX_TOLERANCE
+            )
+            if same_spot and now - previous_time <= _MULTI_CLICK_SECONDS:
+                click_count = previous_count + 1
+            else:
+                click_count = 1
+
+            self._carriage_click_count = click_count
+            self._carriage_last_click_time = now
+            self._carriage_last_click_index = click_index
+
+            if click_count == 2:
+                _select_source_range(
+                    buffer,
+                    _word_selection_range(buffer.text, click_index),
+                )
+            elif click_count >= 3:
+                _select_source_range(
+                    buffer,
+                    _paragraph_selection_range(buffer.text, click_index),
+                )
+                # A fourth click begins a new sequence rather than repeatedly
+                # cycling word/paragraph selections.
+                self._reset_carriage_click_sequence()
+
+            return result
+
         return super().mouse_handler(mouse_event)
 
 
@@ -1475,7 +2342,7 @@ text_area = TextArea(
     text="",
     lexer=ProseMarkdownLexer(),
     wrap_lines=True,
-    scrollbar=True,
+    scrollbar=False,
     focus_on_click=True,
     input_processors=[ProseLayoutProcessor()],
     style="class:editor",
@@ -1509,16 +2376,15 @@ text_area.window.always_hide_cursor = Condition(
 # processor performs visual word wrapping only; it never inserts source
 # newlines during ordinary editing.
 text_area.window.get_line_prefix = _soft_wrap_line_prefix
-# Keep the prose body at exactly 80 display columns on wide terminals. The
+# Keep the prose body at the configured display width on wide terminals. The
 # ProseLayoutProcessor borrows part of the existing left-side breathing room as
 # a hanging structural gutter, with one spare cursor cell after the prose body.
 # The Window remains full-width so the scrollbar stays flush right.
-_scrollbar_margin = text_area.window.right_margins[-1]
+_scrollbar_margin = RenderedScrollbarMargin(lambda: text_area.window, display_arrows=True)
 text_area.window.left_margins = [CenterPaddingMargin("left")]
-text_area.window.right_margins = [
-    CenterPaddingMargin("right"),
-    _scrollbar_margin,
-]
+text_area.window.right_margins = [CenterPaddingMargin("right")] + (
+    [_scrollbar_margin] if SCROLLBAR_VISIBLE else []
+)
 
 
 def _resume_editor_view(_buffer=None):
@@ -1533,10 +2399,12 @@ def _resume_editor_view(_buffer=None):
 
 
 def _editor_text_changed(_buffer=None):
-    """Reset viewport ownership and invalidate cached soft-wrap geometry."""
+    """Reset viewport ownership, invalidate layout, and protect changed work."""
+    state.extend_selection_mode = False
     text_area.window.end_manual_scroll()
     text_area.window._vertical_preferred_x = None
     text_area.window.invalidate_rendered_height_cache()
+    _working_state_changed()
 
 
 text_area.buffer.on_cursor_position_changed += _resume_editor_view
@@ -1579,16 +2447,29 @@ def close_dialog():
         if dialog_float in floats:
             floats.remove(dialog_float)
 
+    closed_object_editor = False
     if (
         current_table_editor is not None
         and closed_float is current_table_editor.dialog_float
     ):
         current_table_editor = None
+        closed_object_editor = True
     if (
         current_footnote_editor is not None
         and closed_float is current_footnote_editor.dialog_float
     ):
         current_footnote_editor = None
+        closed_object_editor = True
+
+    # An active object-editor draft participates in the protected working-state
+    # journal. Closing that editor, whether by Save or Cancel, changes what the
+    # next recovery should contain even when the main prose buffer is unchanged.
+    if closed_object_editor:
+        if _has_recoverable_changes():
+            _working_state_changed(immediate=True)
+        else:
+            _clear_recovery_file()
+            _reset_working_state_tracking()
 
     app = get_app()
     if dialog_stack:
@@ -1803,7 +2684,7 @@ def _path_is_read_only(path):
 
 
 def _recovery_directory():
-    """Return the per-user directory used for hidden crash-recovery state."""
+    """Return the per-user directory used for protected working-state journals."""
     base = os.environ.get("XDG_STATE_HOME")
     if not base:
         base = os.path.join(os.path.expanduser("~"), ".local", "state")
@@ -1896,7 +2777,7 @@ def _active_table_draft():
 
     The text currently present in an actively edited cell is folded into the
     snapshot using the same newline normalization as a real cell commit. The
-    live table-editor session is never mutated by crash recovery.
+    live table-editor session is never mutated by working-state recovery.
     """
     session = current_table_editor
     if session is None:
@@ -1938,6 +2819,88 @@ def _has_recoverable_changes():
     return False
 
 
+def _linux_boot_id():
+    """Return the current Linux boot identifier when /proc exposes it."""
+    try:
+        with open("/proc/sys/kernel/random/boot_id", "r", encoding="ascii") as f:
+            value = f.read().strip()
+    except (OSError, UnicodeError):
+        return None
+    return value or None
+
+
+def _linux_process_start_ticks(pid):
+    """Return Linux /proc start-time ticks for pid, or None when unavailable.
+
+    /proc/<pid>/stat field 22 is the process start time in clock ticks since
+    boot. The comm field is parenthesized and may contain spaces or ')' chars,
+    so split only after its final closing parenthesis.
+    """
+    if not isinstance(pid, int) or pid <= 0:
+        return None
+    try:
+        with open(f"/proc/{pid}/stat", "r", encoding="utf-8") as f:
+            stat_line = f.read().strip()
+    except (OSError, UnicodeError):
+        return None
+
+    close_paren = stat_line.rfind(")")
+    if close_paren < 0:
+        return None
+    fields = stat_line[close_paren + 1 :].strip().split()
+    # fields[0] is field 3 (state), so field 22 is index 19 here.
+    if len(fields) <= 19:
+        return None
+    start_ticks = fields[19]
+    return start_ticks if start_ticks.isdigit() else None
+
+
+def _posix_process_start_stamp(pid):
+    """Return a stable ps start stamp for pid on POSIX systems as fallback."""
+    if os.name != "posix" or not isinstance(pid, int) or pid <= 0:
+        return None
+    env = os.environ.copy()
+    env["LC_ALL"] = "C"
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(pid)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=1,
+            env=env,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    value = " ".join(result.stdout.split())
+    return value or None
+
+
+def _process_start_identity(pid):
+    """Return a stable identity for one incarnation of pid when possible."""
+    start_ticks = _linux_process_start_ticks(pid)
+    if start_ticks is not None:
+        # Start ticks are unique only within a boot, so include the boot ID when
+        # available. Keeping the prefix makes future formats unambiguous.
+        boot_id = _linux_boot_id()
+        if boot_id is not None:
+            return f"linux:{boot_id}:{start_ticks}"
+        return f"linux-start:{start_ticks}"
+
+    stamp = _posix_process_start_stamp(pid)
+    if stamp is not None:
+        return f"ps:{stamp}"
+    return None
+
+
+_RECOVERY_OWNER_PID = os.getpid()
+_RECOVERY_OWNER_BOOT_ID = _linux_boot_id()
+_RECOVERY_OWNER_START_ID = _process_start_identity(_RECOVERY_OWNER_PID)
+_RECOVERY_IO_LOCK = threading.Lock()
+
+
 def _recovery_payload():
     """Capture recoverable editor state, including active object-editor drafts."""
     tables = {
@@ -1974,7 +2937,9 @@ def _recovery_payload():
 
     return {
         "format": RECOVERY_FORMAT_VERSION,
-        "pid": os.getpid(),
+        "pid": _RECOVERY_OWNER_PID,
+        "boot_id": _RECOVERY_OWNER_BOOT_ID,
+        "process_start_id": _RECOVERY_OWNER_START_ID,
         "source_path": source_path,
         "saved_text": state.saved_text,
         "disk_snapshot": disk_snapshot,
@@ -1987,40 +2952,58 @@ def _recovery_payload():
     }
 
 
-def _ensure_recovery_path():
+def _ensure_recovery_target():
+    """Return the active recovery path and its generation token."""
     directory = _recovery_directory()
-    os.makedirs(directory, mode=0o700, exist_ok=True)
-    try:
-        os.chmod(directory, 0o700)
-    except OSError:
-        # A pre-existing XDG state directory may live on a filesystem where
-        # chmod is unsupported. The recovery file itself is still forced 0600.
-        pass
-
-    if state.recovery_path is None:
-        token = os.urandom(6).hex()
-        state.recovery_path = os.path.join(
-            directory, f"recovery-{os.getpid()}-{token}.json"
-        )
-    return state.recovery_path
+    with _RECOVERY_IO_LOCK:
+        if state.recovery_path is None:
+            token = os.urandom(6).hex()
+            state.recovery_path = os.path.join(
+                directory, f"recovery-{os.getpid()}-{token}.json"
+            )
+            state.recovery_epoch += 1
+            state.recovery_committed_revision = 0
+        return state.recovery_path, state.recovery_epoch
 
 
-def _write_recovery_snapshot():
-    """Atomically persist the current working document for crash recovery."""
-    if not _has_recoverable_changes():
-        _clear_recovery_file()
-        return
+def _claim_recovery_path(path):
+    """Claim an existing recovery journal for this process generation."""
+    with _RECOVERY_IO_LOCK:
+        state.recovery_path = path
+        state.recovery_epoch += 1
+        state.recovery_committed_revision = 0
+        return state.recovery_epoch
 
-    recovery_path = _ensure_recovery_path()
-    directory = os.path.dirname(recovery_path)
-    temp_path = None
-    fd = None
+
+def _recovery_snapshot_data():
+    """Capture one immutable working-state payload on the UI thread."""
+    recovery_path, epoch = _ensure_recovery_target()
     payload = json.dumps(
         _recovery_payload(),
         ensure_ascii=False,
         separators=(",", ":"),
     )
+    return recovery_path, epoch, payload, state.working_state_revision
 
+
+def _write_recovery_payload_atomic(recovery_path, epoch, payload, revision):
+    """Durably commit a captured journal unless its generation was retired.
+
+    The potentially slow temporary-file write and file fsync happen outside the
+    lock. Only the final rename/directory fsync are serialized with journal
+    clearing. If an explicit Save/New/Open retires this recovery generation
+    while the background write is underway, the stale temporary file is simply
+    discarded and can never recreate the old journal afterward.
+    """
+    directory = os.path.dirname(recovery_path)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(directory, 0o700)
+    except OSError:
+        pass
+
+    temp_path = None
+    fd = None
     try:
         fd, temp_path = tempfile.mkstemp(
             prefix=".recovery-",
@@ -2034,9 +3017,19 @@ def _write_recovery_snapshot():
             f.write(payload)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(temp_path, recovery_path)
-        temp_path = None
-        _fsync_directory(directory)
+
+        with _RECOVERY_IO_LOCK:
+            if (
+                state.recovery_path != recovery_path
+                or state.recovery_epoch != epoch
+                or revision < state.recovery_committed_revision
+            ):
+                return False
+            os.replace(temp_path, recovery_path)
+            temp_path = None
+            _fsync_directory(directory)
+            state.recovery_committed_revision = revision
+        return True
     finally:
         if fd is not None:
             os.close(fd)
@@ -2047,46 +3040,69 @@ def _write_recovery_snapshot():
                 pass
 
 
-def _clear_recovery_file():
-    recovery_path = state.recovery_path
-    state.recovery_path = None
+def _record_recovery_success(revision):
+    state.working_state_persisted_revision = max(
+        state.working_state_persisted_revision, revision
+    )
+    if state.working_state_revision == revision:
+        state.working_state_first_dirty_at = None
+        state.working_state_last_change_at = None
     state.recovery_error = False
-    if recovery_path is None:
+    state.recovery_error_reported = False
+    state.recovery_error_message = None
+
+
+def _write_recovery_snapshot():
+    """Synchronously persist the current protected working state.
+
+    Normal editing uses the asynchronous scheduler below. This synchronous path
+    is retained for rare boundary operations such as claiming a restored journal
+    or preserving work after a save-durability warning.
+    """
+    if not _has_recoverable_changes():
+        _clear_recovery_file()
+        _reset_working_state_tracking()
         return
-    try:
-        os.unlink(recovery_path)
-    except FileNotFoundError:
-        pass
-    except OSError:
-        # A failed cleanup is safer than deleting anything else. A stale file
-        # can simply be offered again on a future launch.
-        pass
+
+    recovery_path, epoch, payload, revision = _recovery_snapshot_data()
+    committed = _write_recovery_payload_atomic(recovery_path, epoch, payload, revision)
+    if committed:
+        _record_recovery_success(revision)
+
+
+def _clear_recovery_file():
+    with _RECOVERY_IO_LOCK:
+        recovery_path = state.recovery_path
+        state.recovery_path = None
+        state.recovery_epoch += 1
+        state.recovery_committed_revision = 0
+        if recovery_path is not None:
+            try:
+                os.unlink(recovery_path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                # A failed cleanup is safer than deleting anything else. A stale
+                # file can simply be offered again on a future launch.
+                pass
+    state.recovery_error = False
+    state.recovery_error_reported = False
+    state.recovery_error_message = None
 
 
 def _read_recovery_payload(path):
+    """Read and validate the current Carriage recovery-journal format."""
     with open(path, "r", encoding="utf-8") as f:
         payload = json.load(f)
 
-    # v1 is the untitled-only format written by Carriage 1.06. Keep accepting
-    # it so upgrading Carriage cannot strand an existing recovery file.
-    version = payload.get("format")
-    if version not in (1, 2, RECOVERY_FORMAT_VERSION):
+    if payload.get("format") != RECOVERY_FORMAT_VERSION:
         raise ValueError("Unsupported Carriage recovery format.")
     if not isinstance(payload.get("visible_text"), str):
         raise ValueError("Recovery file does not contain document text.")
     if not isinstance(payload.get("tables"), dict):
         raise ValueError("Recovery file contains invalid table data.")
-    if version >= 3 and not isinstance(payload.get("footnotes"), dict):
+    if not isinstance(payload.get("footnotes"), dict):
         raise ValueError("Recovery file contains invalid footnote data.")
-    payload.setdefault("footnotes", {})
-    payload.setdefault("had_footnote_draft", False)
-
-    if version == 1:
-        payload.setdefault("source_path", None)
-        payload.setdefault("saved_text", "")
-        payload.setdefault("disk_snapshot", None)
-        payload.setdefault("cursor_position", len(payload["visible_text"]))
-        payload.setdefault("had_table_draft", False)
     return payload
 
 def _process_is_running(pid):
@@ -2100,6 +3116,41 @@ def _process_is_running(pid):
         return True
     except OSError:
         return False
+    return True
+
+
+def _recovery_owner_is_live(payload):
+    """Return True only when a recovery still belongs to its live creator.
+
+    Recovery journals bind the PID to the creator's process-start identity and,
+    on Linux, boot identity. If identity cannot be re-read for a live PID, keep
+    the journal suppressed rather than risk offering recovery for a document
+    that may still be open in another Carriage process.
+    """
+    pid = payload.get("pid")
+    if not _process_is_running(pid):
+        return False
+
+    stored_start_id = payload.get("process_start_id")
+    stored_boot_id = payload.get("boot_id")
+
+    if stored_boot_id:
+        current_boot_id = _linux_boot_id()
+        if current_boot_id is not None and current_boot_id != stored_boot_id:
+            return False
+
+    if stored_start_id:
+        live_start_id = _process_start_identity(pid)
+        if live_start_id is not None:
+            return live_start_id == stored_start_id
+        # Identity was recorded but cannot currently be verified. Do not fall
+        # back to treating the PID alone as positive proof; suppress the journal
+        # conservatively until the process is gone.
+        return True
+
+    # A boot ID alone can prove staleness after reboot, but cannot distinguish
+    # PID reuse within the same boot. New Carriage journals normally also carry
+    # process_start_id; this branch is a conservative fallback.
     return True
 
 
@@ -2120,16 +3171,12 @@ def _stale_recovery_files(source_path=None):
     expected_source = _canonical_path(source_path) if source_path else None
     stale = []
     for name in names:
-        if not (
-            name.endswith(".json")
-            and (name.startswith("recovery-") or name.startswith("untitled-"))
-        ):
+        if not (name.startswith("recovery-") and name.endswith(".json")):
             continue
         path = os.path.join(directory, name)
         try:
             payload = _read_recovery_payload(path)
-            pid = payload.get("pid")
-            if _process_is_running(pid):
+            if _recovery_owner_is_live(payload):
                 continue
 
             recovery_source = payload.get("source_path")
@@ -2200,9 +3247,10 @@ def _restore_recovery_file(path):
     else:
         state.disk_snapshot = None
 
-    state.autosave_conflict = False
-    state.recovery_path = path
+    _claim_recovery_path(path)
     state.recovery_error = False
+    state.recovery_error_reported = False
+    state.recovery_error_message = None
 
     # Claim the restored journal for this process immediately so a second
     # concurrently running Carriage instance will not offer it as stale.
@@ -2224,12 +3272,12 @@ def _offer_stale_recovery(source_path=None):
     if recovery_source:
         document_label = os.path.basename(recovery_source) or recovery_source
         description = (
-            f'Carriage found unsaved work for "{document_label}" from an earlier '
+            f'Carriage found protected unsaved work for "{document_label}" from an earlier '
             "session that did not close normally. Restore it?"
         )
     else:
         description = (
-            "Carriage found an untitled document recovery from an earlier "
+            "Carriage found protected unsaved work for an untitled document from an earlier "
             "session that did not close normally. Restore it?"
         )
 
@@ -2349,9 +3397,9 @@ def do_new():
     state.path = None
     state.saved_text = ""
     state.disk_snapshot = None
-    state.autosave_conflict = False
     state.tables = {}
     state.footnotes = {}
+    _reset_working_state_tracking()
 
 
 def do_open():
@@ -2373,7 +3421,7 @@ def do_open():
         state.path = path
         state.saved_text = content
         state.disk_snapshot = disk_snapshot
-        state.autosave_conflict = False
+        _reset_working_state_tracking()
 
     show_input_dialog("Open File", "Path:", state.path or "", cb)
 
@@ -2475,7 +3523,7 @@ def _write_file(path, expected_snapshot, report_conflict=True, report_read_only=
 
             # fsync() above made the new file contents durable. Now make the
             # rename itself durable before Carriage reports a successful save
-            # or removes crash recovery. If this fails, the new bytes are
+            # or removes working-state recovery. If this fails, the new bytes are
             # already visible at the destination, but a sudden crash could
             # still lose the directory update. Keep the document modified and
             # preserve a recovery copy so a later Save can retry safely.
@@ -2484,8 +3532,7 @@ def _write_file(path, expected_snapshot, report_conflict=True, report_read_only=
             except OSError as durability_error:
                 state.path = path
                 state.disk_snapshot = _snapshot_bytes(content.encode("utf-8"))
-                state.autosave_conflict = False
-
+            
                 recovery_detail = (
                     "The new file is visible on disk, but Carriage could not "
                     "confirm that the directory update is durable. The document "
@@ -2496,12 +3543,12 @@ def _write_file(path, expected_snapshot, report_conflict=True, report_read_only=
                 except (OSError, UnicodeError, TypeError, ValueError) as recovery_error:
                     state.recovery_error = True
                     recovery_detail += (
-                        "\n\nCarriage also could not update crash recovery: "
+                        "\n\nCarriage also could not update working-state recovery: "
                         f"{recovery_error}"
                     )
                 else:
                     state.recovery_error = False
-                    recovery_detail += "\n\nCrash recovery has been retained."
+                    recovery_detail += "\n\nWorking-state recovery has been retained."
 
                 show_message(
                     "Save durability warning",
@@ -2520,8 +3567,8 @@ def _write_file(path, expected_snapshot, report_conflict=True, report_read_only=
         state.saved_text = content
         state.path = path
         state.disk_snapshot = _snapshot_bytes(content.encode("utf-8"))
-        state.autosave_conflict = False
         _clear_recovery_file()
+        _reset_working_state_tracking()
         return _SAVE_OK
     except (OSError, UnicodeError) as e:
         show_message("Error saving file", str(e))
@@ -2647,7 +3694,7 @@ def do_quit():
 # shared Markdown structure metadata used by the display layer. Hard-wrap export
 # preserves only the short set of line-sensitive constructs defined below.
 
-_ATX_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}(?!#)")
+_ATX_HEADING_RE = re.compile(r"^#{1,6}(?!#)(?=.*\S)")
 _SETEXT_H1_RE = re.compile(r"^=+[ \t]*$")
 _SETEXT_H2_RE = re.compile(r"^-+[ \t]*$")
 _LIST_ITEM_RE = re.compile(r"^(\s{0,3}(?:[-*+]|\d+\.)\s+)")
@@ -2688,6 +3735,23 @@ def _yaml_front_matter_end(lines):
     return None
 
 
+def _prose_contains_multiline_inline_code(source_lines):
+    """Return True when an inline code span crosses a physical source newline.
+
+    Convert for Carriage deliberately leaves such prose source unchanged.  A
+    newline and any adjacent spaces inside an original-Markdown code span are
+    literal code content, so treating that physical boundary as wrapping (or as
+    a two-space hard break) would rewrite the code span itself.
+    """
+    if len(source_lines) < 2:
+        return False
+    text = "\n".join(source_lines)
+    for start, end in _inline_code_span_ranges(text):
+        if "\n" in text[start:end]:
+            return True
+    return False
+
+
 def _hard_break_marker(line):
     """Return the original-Markdown hard-break marker at line end, if present.
 
@@ -2705,33 +3769,50 @@ def _strip_hard_break_marker(line, marker):
     return line
 
 
+def _prose_heading_guard(line):
+    """Return leading whitespace that keeps a literal # line from becoming ATX.
+
+    Original Markdown ATX headings begin in column zero. Convert for Carriage
+    normally removes incidental wrapping indentation, but it must retain the
+    one-to-three leading spaces that are semantically preventing an ordinary
+    prose line from becoming a heading.
+    """
+    match = re.match(r"^(?P<indent>[ \t]{1,3})#", line)
+    return match.group("indent") if match is not None else ""
+
+
 def _wrap_markdown_prose(source_lines, width, initial_indent="", subsequent_indent=""):
     """Wrap prose while preserving explicit Markdown hard line breaks."""
+    if _prose_contains_multiline_inline_code(source_lines):
+        return list(source_lines)
+
     segments = []
     current = []
+    current_guard = ""
 
     for raw_line in source_lines:
+        if not current:
+            current_guard = _prose_heading_guard(raw_line)
         marker = _hard_break_marker(raw_line)
         text = _strip_hard_break_marker(raw_line, marker)
         current.append(text.strip())
         if marker is not None:
-            segments.append((" ".join(part for part in current if part), marker))
+            segments.append((" ".join(part for part in current if part), marker, current_guard))
             current = []
+            current_guard = ""
 
     if current or not segments:
-        segments.append((" ".join(part for part in current if part), None))
+        segments.append((" ".join(part for part in current if part), None, current_guard))
 
     rendered = []
-    for segment_text, marker in segments:
-        first_indent = initial_indent if not rendered else subsequent_indent
+    for segment_text, marker, guard in segments:
+        base_indent = initial_indent if not rendered else subsequent_indent
+        first_indent = base_indent + guard
         wrapped = textwrap.wrap(
             segment_text,
             width=width,
             initial_indent=first_indent,
             subsequent_indent=subsequent_indent,
-            # Prose wrapping must never manufacture whitespace inside a token.
-            # A long URL, autolink, path, or hyphenated word may exceed the
-            # target width rather than being split and changing Markdown text.
             break_long_words=False,
             break_on_hyphens=False,
         ) or [first_indent.rstrip()]
@@ -3347,7 +4428,7 @@ def _canonicalize_table_placeholders(visible_text, tables=None):
     """Return visible text with folded table labels derived from table data.
 
     The table object is the single source of truth for a folded table title.
-    This is used when restoring crash recovery so an in-progress title draft
+    This is used when restoring working-state recovery so an in-progress title draft
     cannot leave an older placeholder label on screen.
     """
     table_map = state.tables if tables is None else tables
@@ -3447,26 +4528,130 @@ def _materialize_objects(visible_text):
 
     return "\n".join(rendered)
 
-def _table_number_at_cursor():
-    line = text_area.buffer.document.current_line
-    match = TABLE_PLACEHOLDER_RE.match(line)
-    return int(match.group(1)) if match else None
+def _folded_object_spans(text):
+    """Return folded-object source spans in the visible editor buffer.
 
-
-def _table_placeholder_locked():
-    """Return True while the main caret is on a folded table reference.
-
-    Folded references are object labels, not editable Markdown source. The
-    table editor owns the title and content; keeping the label read-only avoids
-    a second, conflicting source of truth.
+    Each tuple is (kind, key, row, start, end), with ``end`` exclusive. The
+    invisible sentinel is part of the span. Objects occupy a complete logical
+    line by contract.
     """
-    return _table_number_at_cursor() is not None
+    spans = []
+    offset = 0
+    for row, line in enumerate(text.split("\n")):
+        table_match = TABLE_PLACEHOLDER_RE.match(line)
+        footnote_match = FOOTNOTE_PLACEHOLDER_RE.match(line)
+        if table_match:
+            spans.append(("table", int(table_match.group(1)), row, offset, offset + len(line)))
+        elif footnote_match:
+            spans.append(("footnote", footnote_match.group(1), row, offset, offset + len(line)))
+        offset += len(line) + 1
+    return tuple(spans)
+
+
+def _folded_object_line(line):
+    return bool(TABLE_PLACEHOLDER_RE.match(line) or FOOTNOTE_PLACEHOLDER_RE.match(line))
+
+
+def _line_bounds_at_position(text, position):
+    position = max(0, min(len(text), position))
+    start = text.rfind("\n", 0, position) + 1
+    end = text.find("\n", position)
+    if end < 0:
+        end = len(text)
+    return start, end
+
+
+def _folded_edit_range_intersects(text, start, end):
+    """Return True when deleting [start,end) would damage a folded object.
+
+    This is intentionally local rather than a whole-document scan because it
+    runs on ordinary Backspace/Delete operations. Besides object text itself,
+    the newline immediately before/after an object is protected so prose can
+    never be merged onto its placeholder line.
+    """
+    start = max(0, min(len(text), start))
+    end = max(start, min(len(text), end))
+    if end <= start:
+        return False
+
+    # If either edge lies on an object line, even a one-character edit is an
+    # object edit. This catches partial placeholder deletion before the hidden
+    # sentinel would otherwise be reached.
+    for probe in {start, max(start, end - 1)}:
+        line_start, line_end = _line_bounds_at_position(text, probe)
+        if _folded_object_line(text[line_start:line_end]):
+            return True
+
+    # For every deleted newline, inspect the line on each side. A newline is
+    # structural when either neighbor is a folded object.
+    newline = text.find("\n", start, end)
+    while newline >= 0:
+        prev_start = text.rfind("\n", 0, newline) + 1
+        prev_line = text[prev_start:newline]
+        next_end = text.find("\n", newline + 1)
+        if next_end < 0:
+            next_end = len(text)
+        next_line = text[newline + 1:next_end]
+        if _folded_object_line(prev_line) or _folded_object_line(next_line):
+            return True
+        newline = text.find("\n", newline + 1, end)
+
+    return False
+
+
+def _folded_insertion_locked(text, position):
+    """Return True when inserting at position would edit a folded label."""
+    start, end = _line_bounds_at_position(text, position)
+    return _folded_object_line(text[start:end])
+
+
+def _selection_intersects_folded_object(buffer):
+    if buffer.selection_state is None:
+        return False
+    for start, end in buffer.document.selection_ranges():
+        if _folded_edit_range_intersects(buffer.text, start, end):
+            return True
+    return False
+
+
+def _buffer_folded_edit_locked(buffer, insertion=False):
+    if _selection_intersects_folded_object(buffer):
+        return True
+    if insertion:
+        return _folded_insertion_locked(buffer.text, buffer.cursor_position)
+    return False
+
+
+def _folded_placeholder_at_cursor(document=None):
+    doc = document or text_area.buffer.document
+    table_match = TABLE_PLACEHOLDER_RE.match(doc.current_line)
+    if table_match:
+        return "table", int(table_match.group(1))
+    footnote_match = FOOTNOTE_PLACEHOLDER_RE.match(doc.current_line)
+    if footnote_match:
+        return "footnote", footnote_match.group(1)
+    return None
+
+
+def _table_number_at_cursor():
+    folded = _folded_placeholder_at_cursor()
+    return folded[1] if folded is not None and folded[0] == "table" else None
+
+
+def _footnote_placeholder_identifier_at_cursor():
+    folded = _folded_placeholder_at_cursor()
+    return folded[1] if folded is not None and folded[0] == "footnote" else None
+
+
+def _folded_placeholder_locked():
+    """Return True while the caret is on a folded table/footnote object."""
+    return _folded_placeholder_at_cursor() is not None
 
 
 # prompt_toolkit's standard insertion/deletion bindings honor Buffer.read_only.
-# Keep navigation and Tab-to-open behavior available while suppressing direct
-# edits to a folded table label in the prose buffer.
-text_area.buffer.read_only = Condition(_table_placeholder_locked)
+# Folded tables and footnote definitions are atomic labels: navigation and
+# object commands remain available, while direct character edits are blocked.
+text_area.buffer.read_only = Condition(_folded_placeholder_locked)
 
 
 def _shift_table_numbers_for_insert(insert_number):
@@ -3563,6 +4748,88 @@ def _refresh_table_placeholder(table_number):
     )
 
 
+def _remove_folded_object_line(lines, row):
+    """Remove one object line and one now-redundant separator blank."""
+    lines = list(lines)
+    if not (0 <= row < len(lines)):
+        return lines or [""], 0
+    del lines[row]
+    if not lines:
+        return [""], 0
+
+    # Object insertion/collapse normally leaves a blank separator around a
+    # block. If deleting the object makes two separator blanks touch, keep one.
+    if 0 < row < len(lines) and not lines[row - 1].strip() and not lines[row].strip():
+        del lines[row]
+    elif row == 0 and len(lines) > 1 and not lines[0].strip():
+        del lines[0]
+    elif row >= len(lines) and len(lines) > 1 and not lines[-1].strip():
+        del lines[-1]
+
+    if not lines:
+        lines = [""]
+    return lines, min(row, len(lines) - 1)
+
+
+def _delete_table_object(table_number):
+    """Delete one folded table and renumber later table labels atomically."""
+    if table_number not in state.tables:
+        return False
+
+    buf = text_area.buffer
+    doc = buf.document
+    target_row = None
+    for row, line in enumerate(doc.lines):
+        match = TABLE_PLACEHOLDER_RE.match(line)
+        if match and int(match.group(1)) == table_number:
+            target_row = row
+            break
+    if target_row is None:
+        return False
+
+    buf.save_to_undo_stack()
+    updated = {}
+    for number in sorted(state.tables):
+        if number == table_number:
+            continue
+        new_number = number - 1 if number > table_number else number
+        updated[new_number] = state.tables[number]
+    state.tables = updated
+
+    lines, cursor_row = _remove_folded_object_line(doc.lines, target_row)
+    for row, line in enumerate(lines):
+        match = TABLE_PLACEHOLDER_RE.match(line)
+        if match:
+            old_number = int(match.group(1))
+            if old_number > table_number:
+                new_number = old_number - 1
+                table = state.tables.get(new_number)
+                if table is not None:
+                    lines[row] = _table_placeholder(new_number, table.title)
+
+    new_text = "\n".join(lines)
+    tmp = Document(new_text)
+    cursor_row = min(cursor_row, tmp.line_count - 1)
+    cursor_col = min(doc.cursor_position_col, len(tmp.lines[cursor_row]))
+    buf.set_document(
+        Document(new_text, tmp.translate_row_col_to_index(cursor_row, cursor_col)),
+        bypass_readonly=True,
+    )
+    return True
+
+
+def do_delete_table_at_cursor():
+    table_number = _table_number_at_cursor()
+    if table_number is None:
+        show_message("No table", "Place the cursor on a folded table first.")
+        return
+    confirm(
+        "Delete table",
+        f"Delete Table {table_number} from the document? This can be undone with Ctrl+Z.",
+        lambda: _delete_table_object(table_number),
+    )
+
+
 def _new_table_data(columns, rows, title=""):
     return TableData(
         headers=[""] * columns,
@@ -3599,14 +4866,68 @@ class _WrapBlock:
 
 @dataclass(frozen=True)
 class _LayoutRow:
-    """Display metadata for one existing physical source row."""
+    """Display metadata for one existing physical source row.
+
+    ``block_kind`` is projected once from the shared block analysis so display
+    processors can classify a source row in O(1) time.  ``blockquote_depth``
+    records the visual quote container independently of the literal source
+    prefix, allowing lazy continuations and soft-wrapped rows to receive the
+    same display-only gutter without changing Markdown on disk.
+    """
 
     role: str = "text"
     structural_prefix_width: int = 0
+    block_kind: str = ""
+    blockquote_depth: int = 0
 
 
-_ATX_DISPLAY_PREFIX_RE = re.compile(r"^\s{0,3}#{1,6}(?!#)[ \t]*")
+_ATX_DISPLAY_PREFIX_RE = re.compile(r"^#{1,6}(?!#)(?=.*\S)[ \t]*")
 _BLOCKQUOTE_LINE_RE = re.compile(r"^\s{0,3}>[ \t]?(.*)$")
+
+
+def _blockquote_prefix_info(line):
+    """Return ``(depth, source_prefix_width)`` for explicit quote markers.
+
+    The parser deliberately follows the same one-marker-at-a-time rule used by
+    Carriage's blockquote handling.  The exact source spelling (``>>``, ``> >``,
+    optional spaces) remains untouched; the display layer can replace it with a
+    consistent gutter while still mapping cursor positions back to the source.
+    """
+    depth = 0
+    consumed = 0
+    remainder = line
+    while True:
+        match = _BLOCKQUOTE_LINE_RE.match(remainder)
+        if match is None:
+            break
+        content = match.group(1)
+        prefix_width = len(remainder) - len(content)
+        if prefix_width <= 0:
+            break
+        depth += 1
+        consumed += prefix_width
+        remainder = content
+    return depth, consumed
+
+
+def _blockquote_gutter_text(depth, gutter_width):
+    """Return a compact canonical quote marker that fits the visual gutter."""
+    depth = max(0, int(depth or 0))
+    gutter_width = max(0, int(gutter_width or 0))
+    if depth <= 0 or gutter_width <= 0:
+        return ""
+
+    spaced = "> " * depth
+    if len(spaced) <= gutter_width:
+        return spaced
+
+    # Deep nesting should never steal columns from the configured prose body.
+    # Compress only the display marker when the fixed gutter is exhausted.
+    marker_count = min(depth, max(1, gutter_width - 1))
+    compact = ">" * marker_count
+    if len(compact) < gutter_width:
+        compact += " "
+    return compact[:gutter_width]
 
 
 def _simple_list_fragment_is_safe(text):
@@ -3673,6 +4994,40 @@ def _simple_list_continuation(line, marker_prefix):
     if prefix_width is None:
         return None
     return line[prefix_width:]
+
+
+def _unlist_simple_list_item(block):
+    """Return a simple list item as ordinary Carriage prose.
+
+    Removing the marker is a structural edit, not merely character deletion.
+    Ordinary hard-wrapped continuation lines collapse to the same logical prose
+    representation produced by Convert for Carriage. Explicit two-space hard
+    breaks remain physical boundaries. Multiline inline code keeps its physical
+    newlines because those newlines are literal code content.
+    """
+    if block.marker is None:
+        return list(block.source_lines)
+
+    if not _prose_contains_multiline_inline_code(block.body_lines or []):
+        return _convert_markdown_prose(block.body_lines or [""])
+
+    marker_width = len(block.marker)
+    converted = []
+    for offset, line in enumerate(block.source_lines):
+        if offset == 0:
+            converted.append(line[marker_width:])
+            continue
+
+        continuation_width = _simple_list_continuation_prefix_width(
+            line, block.marker
+        )
+        if continuation_width is None:
+            # Defensive fallback: preserve source rather than risk deleting
+            # literal code content if parser assumptions ever diverge.
+            converted.append(line)
+        else:
+            converted.append(line[continuation_width:])
+    return converted
 
 
 def _parse_simple_list_item(lines, index, limit=None):
@@ -3743,8 +5098,10 @@ def _list_run_marker_budget(lines, index, limit, base_indent, family):
     return budget
 
 
-def _parse_simple_list_run(lines, index, limit=None, width=WRAP_COLUMN):
+def _parse_simple_list_run(lines, index, limit=None, width=None):
     """Parse the longest supported flat-list prefix beginning at ``index``."""
+    if width is None:
+        width = WRAP_COLUMN
     if not (0 <= index < len(lines)):
         return None
 
@@ -3796,22 +5153,59 @@ def _parse_simple_list_run(lines, index, limit=None, width=WRAP_COLUMN):
 
 
 def _parse_blockquote_run(lines, index):
-    """Parse one supported explicit, single-level prose blockquote run."""
+    """Parse one supported single-level prose blockquote run.
+
+    Original Markdown permits lazy blockquote continuation: once an explicit
+    ``>`` line has opened a quoted paragraph, following nonblank prose lines may
+    omit the marker.  Treat those lines as part of the same quote immediately,
+    rather than exposing them to top-level parsing on the first conversion
+    pass.  That keeps Convert for Carriage idempotent and, more importantly,
+    preserves the original blockquote interpretation.
+
+    Carriage still keeps its deliberately narrow *simple quote* model.  If a
+    nonblank continuation introduces block structure that would require
+    recursive quote parsing (lists, thematic breaks, code, HTML, reference
+    definitions, etc.), return ``None`` so the caller preserves the whole
+    nonblank quote region as ``complex-blockquote``.  A column-zero ATX heading
+    is different: original Markdown lets it interrupt a lazy quoted paragraph,
+    so it ends this quote run and remains a top-level block.
+    """
     if not (0 <= index < len(lines)) or not lines[index].lstrip().startswith(">"):
         return None
 
     end = index
     inner = []
-    while end < len(lines) and lines[end].strip() and lines[end].lstrip().startswith(">"):
-        match = _BLOCKQUOTE_LINE_RE.match(lines[end])
-        if match is None:
+
+    while end < len(lines) and lines[end].strip():
+        line = lines[end]
+        if line.lstrip().startswith(">"):
+            match = _BLOCKQUOTE_LINE_RE.match(line)
+            if match is None:
+                return None
+            content = match.group(1)
+            # Nested quotes are valid Markdown but outside Carriage's simple
+            # single-level conversion model. Preserve the whole region.
+            if re.match(r"^\s{0,3}>", content):
+                return None
+            if content and not _simple_list_fragment_is_safe(content):
+                return None
+            inner.append(content)
+            end += 1
+            continue
+
+        # A real ATX heading at column zero interrupts lazy quote continuation.
+        # Do not absorb it into the quoted paragraph.
+        if _ATX_HEADING_RE.match(line):
+            break
+
+        # Ordinary lazy prose is part of the quote.  If it looks like another
+        # block construct, preserving the complete nonblank quote region is
+        # safer than partially converting it and allowing a later pass to
+        # reinterpret the remainder (the former blockquote/Setext bug).
+        if not _simple_list_fragment_is_safe(line):
             return None
-        content = match.group(1)
-        if re.match(r"^\s{0,3}>", content):
-            return None
-        if content and not _simple_list_fragment_is_safe(content):
-            return None
-        inner.append(content)
+
+        inner.append(line)
         end += 1
 
     return _WrapBlock(
@@ -3837,6 +5231,8 @@ def _make_plain_prose_block(lines, start, end):
 
 def _render_blockquote(block, width):
     """Render a supported blockquote through the shared prose wrapper."""
+    if _prose_contains_multiline_inline_code(block.body_lines or []):
+        return list(block.source_lines)
     body_width = max(10, width - 2)
     rendered = []
     paragraph = []
@@ -3860,8 +5256,10 @@ def _render_blockquote(block, width):
     return rendered or [">"]
 
 
-def _render_wrap_block(block, width=WRAP_COLUMN):
+def _render_wrap_block(block, width=None):
     """Render one logical block according to Carriage's source policy."""
+    if width is None:
+        width = WRAP_COLUMN
     if not block.wrappable:
         return list(block.source_lines)
 
@@ -3869,6 +5267,8 @@ def _render_wrap_block(block, width=WRAP_COLUMN):
         return _wrap_markdown_prose(block.source_lines, width=width)
 
     if block.kind == "list" and block.marker is not None:
+        if _prose_contains_multiline_inline_code(block.body_lines or []):
+            return list(block.source_lines)
         body_width = block.wrap_width
         if body_width is None:
             body_width = max(10, width - len(block.marker))
@@ -3895,7 +5295,7 @@ def _render_wrap_block(block, width=WRAP_COLUMN):
 
 
 def _wrap_measure_text(line):
-    """Return text that counts toward an 80-column wrap decision."""
+    """Return text that counts toward a configured-width wrap decision."""
     marker = _hard_break_marker(line)
     text = _strip_hard_break_marker(line, marker)
     if marker is None and text.endswith(" "):
@@ -4015,10 +5415,12 @@ def _preserved_block_at(lines, index, yaml_end=None, allow_indented_code=True):
 def _setext_heading_at(lines, index):
     """Return a Setext heading block beginning at ``index``, if present.
 
-    Setext headings are part of original Markdown. Convert for Carriage turns
-    them into ATX headings, which are Carriage's canonical heading syntax.
-    Recognition is intentionally contextual: the underline only counts when it
-    immediately follows an ordinary heading-text line.
+    Original Markdown resolves Setext headings before ATX headings, thematic
+    breaks, lists, indented code, and blockquotes.  Therefore a nonblank title
+    line is allowed to *look* like any of those constructs when the following
+    line is a Setext underline.  Carriage-specific preserved structures that
+    must remain opaque (folded objects, fenced code, raw block HTML, reference
+    definitions, and pipe tables) are still excluded here.
     """
     if not (0 <= index + 1 < len(lines)):
         return None
@@ -4027,13 +5429,13 @@ def _setext_heading_at(lines, index):
     if not title_line.strip():
         return None
 
-    # A Setext title is ordinary paragraph text, not another block construct.
-    # Exclude structures that have their own original-Markdown meaning.
+    # These structures are intentionally opaque to Convert for Carriage (or,
+    # for HTML/reference definitions, are handled before block headings in the
+    # original Markdown pipeline).  Do not reinterpret their first line as a
+    # Setext title merely because a dash/equal line happens to follow it.
     if (
-        _is_indented_code(title_line)
-        or _ATX_HEADING_RE.match(title_line)
-        or _LIST_ITEM_RE.match(title_line)
-        or title_line.lstrip().startswith(">")
+        (title_line.startswith("[[Table ") and TABLE_PLACEHOLDER_RE.match(title_line))
+        or (title_line.startswith("[[Footnote: ") and FOOTNOTE_PLACEHOLDER_RE.match(title_line))
         or _REFERENCE_DEF_RE.match(title_line)
         or _is_strong_html_start(title_line)
         or _fence_marker(title_line)
@@ -4058,20 +5460,38 @@ def _setext_heading_at(lines, index):
         wrappable=True,
     )
 
-def _block_starts_at(lines, index, yaml_end=None, width=WRAP_COLUMN, allow_indented_code=True):
-    """Return a recognized non-prose block beginning at ``index``, if any."""
-    preserved = _preserved_block_at(
-        lines, index, yaml_end=yaml_end, allow_indented_code=allow_indented_code
-    )
-    if preserved is not None:
-        return preserved
 
+def _block_starts_at(
+    lines, index, yaml_end=None, width=None, allow_indented_code=True, allow_list=True
+):
+    """Return a recognized non-prose block beginning at ``index``, if any."""
+    if width is None:
+        width = WRAP_COLUMN
+    # Front matter is a Carriage preservation extension and must remain opaque
+    # even when its first two lines could superficially form a Setext heading.
+    if yaml_end is not None and index == 0:
+        preserved = _preserved_block_at(
+            lines, index, yaml_end=yaml_end, allow_indented_code=allow_indented_code
+        )
+        if preserved is not None:
+            return preserved
+
+    # Original Markdown's block pipeline resolves Setext headings before ATX
+    # headings, thematic breaks, lists, indented code, and blockquotes.  Doing
+    # the same here also makes conversion idempotent: normalization cannot
+    # manufacture a Setext heading that appears only on a second pass.
     setext = _setext_heading_at(lines, index)
     if setext is not None:
         return setext
 
+    preserved = _preserved_block_at(
+        lines, index, yaml_end=None, allow_indented_code=allow_indented_code
+    )
+    if preserved is not None:
+        return preserved
+
     stripped = lines[index].lstrip()
-    if stripped[:1] in "-*+0123456789" and _LIST_ITEM_RE.match(lines[index]):
+    if allow_list and stripped[:1] in "-*+0123456789" and _LIST_ITEM_RE.match(lines[index]):
         run_end = _nonblank_run_end(lines, index)
         list_run = _parse_simple_list_run(lines, index, limit=run_end, width=width)
         if list_run is not None:
@@ -4110,7 +5530,7 @@ def _layout_rows_for_block(block):
 
     Source-format width belongs to the hard-wrap exporter. Display width is
     calculated later from the actual viewport, so list markers never reduce
-    the 80-column visual prose area merely because they count toward exported
+    the configured visual prose area merely because they count toward exported
     source width.
     """
     rows = [_LayoutRow() for _ in block.source_lines]
@@ -4119,6 +5539,26 @@ def _layout_rows_for_block(block):
         match = _ATX_DISPLAY_PREFIX_RE.match(block.source_lines[0])
         if match is not None:
             rows[0] = _LayoutRow("heading", len(match.group(0)))
+        return rows
+
+    if block.kind in {"blockquote", "complex-blockquote"}:
+        current_depth = 0
+        for offset, source_line in enumerate(block.source_lines):
+            depth, prefix_width = _blockquote_prefix_info(source_line)
+            if depth > 0:
+                current_depth = depth
+                rows[offset] = _LayoutRow(
+                    "blockquote", prefix_width, "", current_depth
+                )
+            elif source_line.strip() and current_depth > 0:
+                # Complex blockquotes can contain lazy paragraph continuation
+                # lines that omit the literal `>` marker. Keep their visual
+                # container depth without inventing source characters.
+                rows[offset] = _LayoutRow(
+                    "blockquote-lazy", 0, "", current_depth
+                )
+            else:
+                current_depth = 0
         return rows
 
     if block.kind == "list-run" and block.list_items is not None:
@@ -4161,7 +5601,7 @@ def _layout_rows_for_block(block):
 
 
 @lru_cache(maxsize=8)
-def _analyze_document_layout(full_text, width=WRAP_COLUMN):
+def _analyze_document_layout(full_text, width=None):
     """Return the shared logical block layout for the current source text.
 
     Classification is intentionally cheap: it establishes block boundaries,
@@ -4170,6 +5610,8 @@ def _analyze_document_layout(full_text, width=WRAP_COLUMN):
     physical output lines. The display layer consumes the same classification
     and row metadata without changing the source.
     """
+    if width is None:
+        width = WRAP_COLUMN
     lines = full_text.split("\n")
     blocks = []
     i = 0
@@ -4203,7 +5645,7 @@ def _analyze_document_layout(full_text, width=WRAP_COLUMN):
         i += 1
         while i < len(lines) and lines[i].strip():
             if _block_starts_at(
-                lines, i, yaml_end=None, width=width, allow_indented_code=False
+                lines, i, yaml_end=None, width=width, allow_indented_code=False, allow_list=False
             ) is not None:
                 break
             i += 1
@@ -4230,14 +5672,62 @@ def _structural_display_map(full_text):
 
 @lru_cache(maxsize=8)
 def _layout_row_map(full_text):
-    """Return per-source-row metadata from the shared block layout."""
-    lines = full_text.split("\n")
+    """Return per-source-row metadata from the shared block layout.
+
+    The map includes the owning block kind as well as gutter metadata.  Building
+    it is linear in the document size and every later row lookup is constant
+    time, including the repeated transformations used to measure wrapped line
+    heights after an edit.
+    """
+    lines = _source_lines(full_text)
     result = [_LayoutRow() for _ in lines]
-    for block in _analyze_document_layout(full_text, WRAP_COLUMN):
+    blocks = _analyze_document_layout(full_text, WRAP_COLUMN)
+    for block in blocks:
         for offset, row_info in enumerate(_layout_rows_for_block(block)):
             row = block.start + offset
             if 0 <= row < len(result):
-                result[row] = row_info
+                result[row] = _LayoutRow(
+                    row_info.role,
+                    row_info.structural_prefix_width,
+                    block.kind,
+                    row_info.blockquote_depth,
+                )
+
+    # Original Markdown permits lazy blockquote continuation: after an explicit
+    # quote marker, ordinary paragraph lines may omit `>` until a blank line or
+    # another block interrupts the paragraph. The converter now recognizes the
+    # same ordinary lazy continuations; this projection also covers preserved
+    # complex quote regions so the editor draws a continuous quote gutter.
+    active_quote_depth = 0
+    for row, line in enumerate(lines):
+        info = result[row]
+        explicit_depth, _prefix_width = _blockquote_prefix_info(line)
+        if explicit_depth > 0 and info.block_kind in {
+            "blockquote",
+            "complex-blockquote",
+        }:
+            active_quote_depth = explicit_depth
+            continue
+
+        if not line.strip():
+            active_quote_depth = 0
+            continue
+
+        if info.blockquote_depth > 0:
+            active_quote_depth = info.blockquote_depth
+            continue
+
+        if active_quote_depth > 0 and info.block_kind == "prose":
+            result[row] = _LayoutRow(
+                "blockquote-lazy",
+                info.structural_prefix_width,
+                info.block_kind,
+                active_quote_depth,
+            )
+            continue
+
+        active_quote_depth = 0
+
     return tuple(result)
 
 
@@ -4268,8 +5758,10 @@ def _list_continuation_prefix_width(document, row):
     )
 
 
-def _hard_wrap_export_text(full_text, width=WRAP_COLUMN):
+def _hard_wrap_export_text(full_text, width=None):
     """Hard-wrap a derived Markdown export using the explicit carve-outs."""
+    if width is None:
+        width = WRAP_COLUMN
     rendered = []
     for block in _analyze_document_layout(full_text, width):
         rendered.extend(_render_wrap_block(block, width=width))
@@ -4281,11 +5773,19 @@ def _convert_markdown_prose(source_lines):
 
     Each returned line is one logical prose segment. A Markdown hard-break
     marker ends the current segment and is retained at the end of that line.
+    Multiline inline code spans are left byte-identical because their physical
+    newlines and surrounding spaces are literal code content.
     """
+    if _prose_contains_multiline_inline_code(source_lines):
+        return list(source_lines)
+
     rendered = []
     current = []
+    current_guard = ""
 
     for raw_line in source_lines:
+        if not current:
+            current_guard = _prose_heading_guard(raw_line)
         marker = _hard_break_marker(raw_line)
         text = _strip_hard_break_marker(raw_line, marker)
         stripped = text.strip()
@@ -4294,11 +5794,12 @@ def _convert_markdown_prose(source_lines):
 
         if marker is not None:
             joined = " ".join(current)
-            rendered.append(joined + marker)
+            rendered.append(current_guard + joined + marker)
             current = []
+            current_guard = ""
 
     if current or not rendered:
-        rendered.append(" ".join(current))
+        rendered.append(current_guard + " ".join(current))
 
     return rendered
 
@@ -4306,13 +5807,13 @@ def _convert_markdown_prose(source_lines):
 def _atx_heading_parts(line):
     """Return ``(marker, title)`` for an original-Markdown ATX heading.
 
-    Original Markdown accepts ATX headings with or without whitespace after the
-    opening marker. Convert for Carriage emits one canonical form: the marker,
+    Original Markdown ATX headings begin at column zero and may omit
+    whitespace after the opening marker. Convert for Carriage emits one canonical form: the marker,
     exactly one space, and the title. A trailing run of ``#`` characters is
     closing syntax only when whitespace separates it from preceding title text;
     hashes attached directly to the title remain literal text.
     """
-    match = re.match(r"^\s{0,3}(#{1,6})(?!#)(.*)$", line)
+    match = re.match(r"^(#{1,6})(?!#)(?=.*\S)(.*)$", line)
     if match is None:
         return None
 
@@ -4331,8 +5832,31 @@ def _canonical_heading_title(title):
 
 
 def _canonical_atx_heading(marker, title):
-    """Render one heading in Carriage's canonical ATX source form."""
+    """Render one ATX heading in Carriage's canonical source form."""
     title = _canonical_heading_title(title)
+    return f"{marker} {title}" if title else marker
+
+
+def _setext_title_for_atx(title):
+    """Return a Setext title safe to emit inside an ATX heading.
+
+    Hashes at the end of a Setext title are always literal title text.  In
+    Carriage's ATX syntax, however, a whitespace-separated trailing hash run is
+    closing syntax.  Escape only that ambiguous run so Setext -> ATX conversion
+    preserves the title exactly instead of silently deleting literal hashes.
+    """
+    title = title.strip()
+    closing_like = re.match(r"^(.*\S)([ \t]+)(#+)$", title)
+    if closing_like is None:
+        return title
+    hashes = closing_like.group(3)
+    escaped = "".join("\\#" for _ in hashes)
+    return closing_like.group(1) + closing_like.group(2) + escaped
+
+
+def _canonical_setext_atx_heading(marker, title):
+    """Render a Setext heading as semantics-preserving canonical ATX."""
+    title = _setext_title_for_atx(title)
     return f"{marker} {title}" if title else marker
 
 
@@ -4346,6 +5870,11 @@ def _convert_list_item(block, marker=None):
     marker = block.marker if marker is None else marker
     if marker is None:
         return list(block.source_lines)
+    if _prose_contains_multiline_inline_code(block.body_lines or []):
+        source = list(block.source_lines)
+        if source and block.marker is not None and marker != block.marker:
+            source[0] = marker + source[0][len(block.marker):]
+        return source
     segments = _convert_markdown_prose(block.body_lines or [""])
     marker_width = len(marker)
     return [
@@ -4384,12 +5913,236 @@ def _renumbered_ordered_list_markers(items):
     return markers
 
 
-def _convert_wrap_block(block):
+def _ordered_list_run_info(block):
+    """Return ``(indent, first_number)`` for a simple ordered-list run."""
+    if block.kind != "list-run" or not block.list_items:
+        return None
+    first_marker = block.list_items[0].marker
+    if first_marker is None:
+        return None
+    match = _ORDERED_LIST_MARKER_PARTS_RE.match(first_marker)
+    if match is None:
+        return None
+    # Every item in the run must be an ordered marker at the same indentation.
+    indent = match.group("indent")
+    for item in block.list_items:
+        if item.marker is None:
+            return None
+        item_match = _ORDERED_LIST_MARKER_PARTS_RE.match(item.marker)
+        if item_match is None or item_match.group("indent") != indent:
+            return None
+    return indent, int(match.group("number"))
+
+
+def _ordered_list_marker_overrides(blocks):
+    """Return canonical marker lists for ordered runs, including loose lists.
+
+    Blank physical lines do not end an original-Markdown ordered list when the
+    next block is another same-indentation ordered-list run.  The shared block
+    analyzer intentionally keeps blank rows as separate blocks; this conversion
+    plan reconnects those adjacent runs for numbering while preserving every
+    blank row in the source layout.
+    """
+    overrides = {}
+    i = 0
+    while i < len(blocks):
+        info = _ordered_list_run_info(blocks[i])
+        if info is None:
+            i += 1
+            continue
+
+        indent, start_number = info
+        run_indexes = [i]
+        search = i + 1
+        while search < len(blocks):
+            blank_start = search
+            while search < len(blocks) and blocks[search].kind == "blank":
+                search += 1
+            # A loose-list continuation requires at least one intervening blank
+            # row. Adjacent list items are already part of the same list-run.
+            if search == blank_start or search >= len(blocks):
+                break
+            next_info = _ordered_list_run_info(blocks[search])
+            if next_info is None or next_info[0] != indent:
+                break
+            run_indexes.append(search)
+            search += 1
+
+        number = start_number
+        for block_index in run_indexes:
+            block = blocks[block_index]
+            markers = []
+            for item in block.list_items or []:
+                match = _ORDERED_LIST_MARKER_PARTS_RE.match(item.marker or "")
+                if match is None:
+                    markers = []
+                    break
+                markers.append(
+                    f'{match.group("indent")}{number}.{match.group("spacing")}'
+                )
+                number += 1
+            if markers:
+                overrides[block.start] = tuple(markers)
+
+        i = run_indexes[-1] + 1
+    return overrides
+
+
+def _ordered_list_group_at_row(blocks, row):
+    """Return block indexes for the ordered list containing ``row``.
+
+    Carriage's existing conversion model treats same-indentation ordered-list
+    runs separated only by blank rows as one loose list. Reuse that exact model
+    here so Renumber List and Convert for Carriage agree about list boundaries.
+    A blank row counts as part of the list only when another compatible ordered
+    run follows it.
+    """
+    i = 0
+    while i < len(blocks):
+        info = _ordered_list_run_info(blocks[i])
+        if info is None:
+            i += 1
+            continue
+
+        indent, _start_number = info
+        run_indexes = [i]
+        group_start = blocks[i].start
+        group_end = blocks[i].end
+        search = i + 1
+
+        while search < len(blocks):
+            blank_start = search
+            while search < len(blocks) and blocks[search].kind == "blank":
+                search += 1
+
+            # Loose-list continuation requires at least one blank row followed
+            # by another ordered run at the same source indentation.
+            if search == blank_start or search >= len(blocks):
+                break
+
+            next_info = _ordered_list_run_info(blocks[search])
+            if next_info is None or next_info[0] != indent:
+                break
+
+            run_indexes.append(search)
+            group_end = blocks[search].end
+            search += 1
+
+        if group_start <= row < group_end:
+            return tuple(run_indexes)
+
+        i = run_indexes[-1] + 1
+
+    return ()
+
+
+def _renumber_list_item_source(lines, item, new_marker, cursor_row, cursor_col):
+    """Rewrite one item's marker and marker-aligned continuation indentation.
+
+    Only source indentation that exactly follows the old marker width changes.
+    Standard four-space and lazy continuations remain untouched. This keeps a
+    simple list valid when, for example, ``9.`` becomes ``10.`` without
+    normalizing or reflowing the item's prose.
+    """
+    old_marker = item.marker or ""
+    if not old_marker or not item.source_lines:
+        return cursor_col
+
+    first_row = item.start
+    if lines[first_row].startswith(old_marker):
+        lines[first_row] = new_marker + lines[first_row][len(old_marker):]
+        if cursor_row == first_row:
+            if cursor_col >= len(old_marker):
+                cursor_col += len(new_marker) - len(old_marker)
+            else:
+                cursor_col = min(cursor_col, len(new_marker))
+
+    if len(new_marker) == len(old_marker):
+        return cursor_col
+
+    for offset, source_line in enumerate(item.source_lines[1:], start=1):
+        row = first_row + offset
+        prefix_width = _simple_list_continuation_prefix_width(
+            source_line, old_marker
+        )
+        if prefix_width != len(old_marker):
+            continue
+
+        # This branch is reached only for body-aligned space indentation.
+        # Replace that indentation with the new marker width and preserve the
+        # continuation text byte-for-byte.
+        lines[row] = (" " * len(new_marker)) + source_line[prefix_width:]
+        if cursor_row == row:
+            if cursor_col >= prefix_width:
+                cursor_col += len(new_marker) - prefix_width
+            else:
+                cursor_col = min(cursor_col, len(new_marker))
+
+    return cursor_col
+
+
+def renumber_ordered_list_with_cursor(full_text, cursor_position):
+    """Renumber only the ordered list containing the cursor.
+
+    The first item's number is authoritative, matching Markdown semantics and
+    Convert for Carriage. Item text, blank rows, and non-list Markdown remain
+    untouched. Returns ``(text, cursor, found)`` where ``found`` is False when
+    the cursor is not inside a supported ordered list.
+    """
+    cursor_position = max(0, min(len(full_text), cursor_position))
+    source_document = Document(full_text, cursor_position=cursor_position)
+    cursor_row = source_document.cursor_position_row
+    cursor_col = source_document.cursor_position_col
+
+    blocks = _analyze_document_layout(full_text, WRAP_COLUMN)
+    group_indexes = _ordered_list_group_at_row(blocks, cursor_row)
+    if not group_indexes:
+        return full_text, cursor_position, False
+
+    first_block = blocks[group_indexes[0]]
+    first_info = _ordered_list_run_info(first_block)
+    if first_info is None:
+        return full_text, cursor_position, False
+
+    _indent, number = first_info
+    lines = full_text.split("\n")
+
+    for block_index in group_indexes:
+        block = blocks[block_index]
+        for item in block.list_items or []:
+            match = _ORDERED_LIST_MARKER_PARTS_RE.match(item.marker or "")
+            if match is None:
+                return full_text, cursor_position, False
+
+            new_marker = (
+                f'{match.group("indent")}{number}.{match.group("spacing")}'
+            )
+            cursor_col = _renumber_list_item_source(
+                lines,
+                item,
+                new_marker,
+                cursor_row,
+                cursor_col,
+            )
+            number += 1
+
+    new_text = "\n".join(lines)
+    if new_text == full_text:
+        return full_text, cursor_position, True
+
+    new_document = Document(new_text)
+    new_row = min(cursor_row, new_document.line_count - 1)
+    new_col = min(cursor_col, len(new_document.lines[new_row]))
+    new_cursor = new_document.translate_row_col_to_index(new_row, new_col)
+    return new_text, new_cursor, True
+
+
+def _convert_wrap_block(block, ordered_markers=None):
     """Convert one block into Carriage's preferred Markdown representation."""
     if block.kind == "setext-heading" and block.source_lines:
         level = block.marker or "#"
         title = block.source_lines[0].strip()
-        return [_canonical_atx_heading(level, title)]
+        return [_canonical_setext_atx_heading(level, title)]
 
     if block.kind == "heading" and block.source_lines:
         parsed = _atx_heading_parts(block.source_lines[0])
@@ -4407,9 +6160,11 @@ def _convert_wrap_block(block):
 
     if block.kind == "list-run" and block.list_items is not None:
         rendered = []
-        ordered_markers = _renumbered_ordered_list_markers(block.list_items)
-        if ordered_markers is not None:
-            for item, marker in zip(block.list_items, ordered_markers):
+        markers = ordered_markers
+        if markers is None:
+            markers = _renumbered_ordered_list_markers(block.list_items)
+        if markers is not None:
+            for item, marker in zip(block.list_items, markers):
                 rendered.extend(_convert_list_item(item, marker=marker))
         else:
             for item in block.list_items:
@@ -4417,6 +6172,8 @@ def _convert_wrap_block(block):
         return rendered
 
     if block.kind == "blockquote":
+        if _prose_contains_multiline_inline_code(block.body_lines or []):
+            return list(block.source_lines)
         rendered = []
         paragraph = []
 
@@ -4440,6 +6197,26 @@ def _convert_wrap_block(block):
     return list(block.source_lines)
 
 
+def _conversion_needs_blank_after_setext(previous_block, previous_lines, current_lines):
+    """Return True when Setext -> ATX would create a new Setext pair.
+
+    A Setext heading consumes two physical source lines but converts to one ATX
+    line. If the immediately following block begins with another ``---`` or
+    ``===`` line, simply concatenating the converted blocks would make that line
+    become an underline for the new ATX line on the next conversion pass. Insert
+    one blank source line to preserve the original block boundary and make Convert
+    for Carriage idempotent.
+    """
+    if previous_block is None or previous_block.kind != "setext-heading":
+        return False
+    if not previous_lines or not current_lines:
+        return False
+    if not previous_lines[-1].strip():
+        return False
+    first = current_lines[0]
+    return bool(_SETEXT_H1_RE.match(first) or _SETEXT_H2_RE.match(first))
+
+
 def convert_for_carriage_text(full_text):
     """Convert valid Markdown into Carriage's preferred source representation.
 
@@ -4451,9 +6228,22 @@ def convert_for_carriage_text(full_text):
     boundaries. Line-sensitive structural blocks are preserved when Carriage
     does not have a safe compatibility transformation for them.
     """
+    blocks = _analyze_document_layout(full_text, WRAP_COLUMN)
+    marker_overrides = _ordered_list_marker_overrides(blocks)
     rendered = []
-    for block in _analyze_document_layout(full_text, WRAP_COLUMN):
-        rendered.extend(_convert_wrap_block(block))
+    previous_block = None
+    previous_lines = None
+    for block in blocks:
+        target_lines = _convert_wrap_block(
+            block, ordered_markers=marker_overrides.get(block.start)
+        )
+        if _conversion_needs_blank_after_setext(
+            previous_block, previous_lines, target_lines
+        ):
+            rendered.append("")
+        rendered.extend(target_lines)
+        previous_block = block
+        previous_lines = target_lines
     return "\n".join(rendered)
 
 
@@ -4522,7 +6312,7 @@ def _map_local_text_cursor(source_text, target_text, source_position):
 
 def _atx_heading_source_span(line):
     """Return source coordinates for an ATX marker and its semantic title."""
-    match = re.match(r"^\s{0,3}(#{1,6})(?!#)(.*)$", line)
+    match = re.match(r"^(#{1,6})(?!#)(?=.*\S)(.*)$", line)
     if match is None:
         return None
 
@@ -4548,17 +6338,24 @@ def _map_heading_cursor(block, target_lines, source_row, source_col):
         source = block.source_lines[0]
         stripped = source.strip()
         leading = len(source) - len(source.lstrip())
-        title = _canonical_heading_title(stripped)
         title_start = leading
-        # Setext titles have no ATX closing syntax, but Convert applies the
-        # canonical trailing-hash rule to the emitted ATX title.
-        semantic_end = title_start + len(title)
+        title_end = title_start + len(stripped)
         target_prefix = len(block.marker or "#") + 1
         if source_col <= title_start:
             return target_prefix
-        if source_col >= semantic_end:
+        if source_col >= title_end:
             return len(target)
-        return min(len(target), target_prefix + (source_col - title_start))
+
+        # Setext trailing hashes may gain one escaping backslash per hash when
+        # emitted as ATX.  Preserve the caret's semantic position around those
+        # inserted characters rather than mapping by raw target width.
+        local_col = max(0, min(len(stripped), source_col - title_start))
+        closing_like = re.match(r"^(.*\S)([ \t]+)(#+)$", stripped)
+        if closing_like is not None:
+            hash_start = closing_like.start(3)
+            if local_col > hash_start:
+                local_col += min(local_col, len(stripped)) - hash_start
+        return min(len(target), target_prefix + local_col)
 
     parsed = _atx_heading_source_span(block.source_lines[0])
     if parsed is None:
@@ -4642,7 +6439,9 @@ def _map_blockquote_cursor(block, target_lines, source_row, source_col):
     )
 
 
-def _map_cursor_in_converted_block(block, target_lines, source_row, source_col):
+def _map_cursor_in_converted_block(
+    block, target_lines, source_row, source_col, ordered_markers=None
+):
     """Map the caret only through the block whose source actually changed."""
     source_text = "\n".join(block.source_lines)
     target_text = "\n".join(target_lines)
@@ -4663,12 +6462,14 @@ def _map_cursor_in_converted_block(block, target_lines, source_row, source_col):
         )
 
     if block.kind == "list-run" and block.list_items:
-        ordered_markers = _renumbered_ordered_list_markers(block.list_items)
+        markers = ordered_markers
+        if markers is None:
+            markers = _renumbered_ordered_list_markers(block.list_items)
         converted_prefix = 0
         for index, item in enumerate(block.list_items):
             marker = (
-                ordered_markers[index]
-                if ordered_markers is not None
+                markers[index]
+                if markers is not None
                 else (item.marker or "")
             )
             item_lines = _convert_list_item(item, marker=marker)
@@ -4700,17 +6501,33 @@ def convert_for_carriage_with_cursor(full_text, cursor_position):
     source_row = source_document.cursor_position_row
     source_col = source_document.cursor_position_col
 
+    blocks = _analyze_document_layout(full_text, WRAP_COLUMN)
+    marker_overrides = _ordered_list_marker_overrides(blocks)
     rendered = []
     rendered_length = 0
     mapped_cursor = None
+    previous_block = None
+    previous_lines = None
 
-    for block in _analyze_document_layout(full_text, WRAP_COLUMN):
-        target_lines = _convert_wrap_block(block)
+    for block in blocks:
+        ordered_markers = marker_overrides.get(block.start)
+        target_lines = _convert_wrap_block(block, ordered_markers=ordered_markers)
+        insert_boundary_blank = _conversion_needs_blank_after_setext(
+            previous_block, previous_lines, target_lines
+        )
+        if insert_boundary_blank:
+            if rendered:
+                rendered_length += 1  # newline before inserted blank row
+            rendered.append("")
+            # The join between the inserted blank row and this block is counted
+            # below by the normal ``if rendered`` separator path.
+
         block_start = rendered_length + (1 if rendered else 0)
 
         if block.start <= source_row < block.end:
             mapped_cursor = block_start + _map_cursor_in_converted_block(
-                block, target_lines, source_row, source_col
+                block, target_lines, source_row, source_col,
+                ordered_markers=ordered_markers,
             )
 
         if rendered:
@@ -4718,11 +6535,35 @@ def convert_for_carriage_with_cursor(full_text, cursor_position):
         rendered.extend(target_lines)
         rendered_length += sum(len(line) for line in target_lines)
         rendered_length += max(0, len(target_lines) - 1)
+        previous_block = block
+        previous_lines = target_lines
 
     new_text = "\n".join(rendered)
     if mapped_cursor is None:
         mapped_cursor = len(new_text)
     return new_text, max(0, min(len(new_text), mapped_cursor))
+
+
+def do_renumber_list():
+    """Renumber the ordered list containing the cursor, preserving its start."""
+    buf = text_area.buffer
+    new_text, new_cursor, found = renumber_ordered_list_with_cursor(
+        buf.text, buf.cursor_position
+    )
+    if not found:
+        show_message(
+            "No numbered list",
+            "Place the cursor inside a supported numbered list first.",
+        )
+        return
+    if new_text == buf.text:
+        return
+
+    buf.save_to_undo_stack()
+    buf.set_document(
+        Document(text=new_text, cursor_position=new_cursor),
+        bypass_readonly=True,
+    )
 
 
 def do_convert_for_carriage():
@@ -4751,35 +6592,176 @@ def do_redo():
     text_area.buffer.redo()
 
 
+def _folded_edit_warning():
+    show_message(
+        "Folded object",
+        "Tables and folded footnote definitions are atomic objects. "
+        "Use their Tools menu commands to edit or delete them.",
+    )
+
+
+def _leave_extend_selection_mode():
+    """Return F6 selection movement to ordinary editor navigation."""
+    state.extend_selection_mode = False
+
+
 def do_cut():
-    if _table_placeholder_locked():
-        show_message(
-            "Folded table",
-            "The folded table reference is read-only. Press Tab to edit the table.",
-        )
+    buf = text_area.buffer
+    if buf.selection_state is None:
+        _leave_extend_selection_mode()
         return
-    data = text_area.buffer.cut_selection()
+    if _folded_placeholder_locked() or _selection_intersects_folded_object(buf):
+        _folded_edit_warning()
+        return
+    data = buf.cut_selection()
     get_app().clipboard.set_data(data)
+    _leave_extend_selection_mode()
 
 
 def do_copy():
-    data = text_area.buffer.copy_selection()
+    buf = text_area.buffer
+    if buf.selection_state is None:
+        _leave_extend_selection_mode()
+        return
+    # Do not leak Carriage's invisible object sentinels into the clipboard or
+    # create pasted pseudo-objects that have no attached object data.
+    if _selection_intersects_folded_object(buf):
+        _folded_edit_warning()
+        return
+    data = buf.copy_selection()
     get_app().clipboard.set_data(data)
+    _leave_extend_selection_mode()
 
 
 def do_paste():
-    if _table_placeholder_locked():
-        show_message(
-            "Folded table",
-            "The folded table reference is read-only. Press Tab to edit the table.",
-        )
+    buf = text_area.buffer
+    if _folded_placeholder_locked() or _selection_intersects_folded_object(buf):
+        _folded_edit_warning()
         return
-    text_area.buffer.paste_clipboard_data(get_app().clipboard.get_data())
+    # Standard editor Paste replaces an active selection rather than inserting
+    # beside it. Keep that behavior for both keyboard and menu invocation.
+    if buf.selection_state is not None:
+        buf.cut_selection()
+    buf.paste_clipboard_data(get_app().clipboard.get_data())
+    _leave_extend_selection_mode()
 
 
 
-def do_toggle_autosave():
-    state.auto_save = not state.auto_save
+def _persist_current_preferences():
+    _write_preferences_values(WRAP_COLUMN, SCROLLBAR_VISIBLE)
+
+
+def _ensure_config_file():
+    """Create config.toml on first launch without replacing an existing file."""
+    if os.path.exists(_config_path()):
+        return
+    try:
+        _persist_current_preferences()
+    except OSError:
+        # A read-only/missing config home must never prevent the editor from
+        # starting. Preferences will report the write error if the user later
+        # tries to save settings explicitly.
+        pass
+
+
+
+def _apply_scrollbar_visibility():
+    """Apply the persistent scrollbar preference without changing scrolling."""
+    text_area.window.right_margins = [CenterPaddingMargin("right")] + (
+        [_scrollbar_margin] if SCROLLBAR_VISIBLE else []
+    )
+    text_area.window.invalidate_rendered_height_cache()
+
+
+def _invalidate_width_dependent_layout():
+    """Drop display/layout caches whose results depend on prose width."""
+    _analyze_document_layout.cache_clear()
+    _structural_display_map.cache_clear()
+    _layout_row_map.cache_clear()
+    _dash_standin_glue_positions.cache_clear()
+    text_area.window.invalidate_rendered_height_cache()
+
+
+def do_toggle_statusbar():
+    """Toggle the status bar for this session only."""
+    state.statusbar_visible = not state.statusbar_visible
+    get_app().invalidate()
+
+
+def do_preferences():
+    """Open Carriage's intentionally small persistent Preferences dialog."""
+    width_field = TextArea(
+        text=str(WRAP_COLUMN),
+        multiline=False,
+        width=D(preferred=8),
+        style="class:input-field",
+    )
+    scrollbar_box = Checkbox(text="Show scrollbar", checked=SCROLLBAR_VISIBLE)
+
+    def save_preferences():
+        global WRAP_COLUMN, SCROLLBAR_VISIBLE
+
+        try:
+            prose_width = int(width_field.text.strip())
+        except ValueError:
+            show_message(
+                "Invalid prose width",
+                f"Enter a whole number from {MIN_WRAP_COLUMN} to {MAX_WRAP_COLUMN}.",
+            )
+            return
+        if not MIN_WRAP_COLUMN <= prose_width <= MAX_WRAP_COLUMN:
+            show_message(
+                "Invalid prose width",
+                f"Enter a whole number from {MIN_WRAP_COLUMN} to {MAX_WRAP_COLUMN}.",
+            )
+            return
+
+        try:
+            _write_preferences_values(prose_width, scrollbar_box.checked)
+        except OSError as e:
+            show_message(
+                "Preferences not saved",
+                "Carriage could not update its preferences file.\n\n" + str(e),
+            )
+            return
+
+        width_changed = prose_width != WRAP_COLUMN
+        scrollbar_changed = scrollbar_box.checked != SCROLLBAR_VISIBLE
+
+        WRAP_COLUMN = prose_width
+        SCROLLBAR_VISIBLE = scrollbar_box.checked
+
+        if width_changed:
+            _invalidate_width_dependent_layout()
+        if scrollbar_changed:
+            _apply_scrollbar_visibility()
+
+        close_dialog()
+        get_app().invalidate()
+
+    save_button = Button(text="Save", handler=save_preferences)
+    dialog = Dialog(
+        title="Preferences",
+        body=HSplit(
+            [
+                Label(text=f"Prose width ({MIN_WRAP_COLUMN}–{MAX_WRAP_COLUMN} columns)"),
+                width_field,
+                Window(height=1),
+                scrollbar_box,
+                Window(height=1),
+                Label(
+                    text=(
+                        "Unsaved work is protected automatically in a private "
+                        "recovery journal; the Markdown file changes only when "
+                        "you explicitly Save or Save As."
+                    )
+                ),
+            ]
+        ),
+        buttons=[save_button, Button(text="Cancel", handler=close_dialog)],
+        width=D(preferred=66),
+    )
+    show_dialog(dialog, focus=width_field)
 
 
 # ---------------------------------------------------------------------------
@@ -4805,7 +6787,7 @@ def _table_mode_hint(session):
         return "Editing: Enter saves cell · Esc discards cell edit · Ctrl+S saves table"
     return (
         "Nav: ←↑↓→ move · Enter edit · Shift+Tab at first cell title · "
-        "^R row · ^C col · ^S save · Esc cancel"
+        "R row · C col · ^S save · Esc cancel"
     )
 
 
@@ -4971,6 +6953,7 @@ def _insert_table_editor_row(where):
         return
 
     session.working.dirty = True
+    _working_state_changed()
     _load_table_editor_cell(session)
 
 
@@ -4988,6 +6971,7 @@ def _delete_table_editor_row():
     del session.working.rows[session.selected_row - 1]
     session.selected_row = min(session.selected_row, len(session.working.rows))
     session.working.dirty = True
+    _working_state_changed()
     _load_table_editor_cell(session)
 
 
@@ -5018,6 +7002,7 @@ def _insert_table_editor_column(where):
     session.working.alignments.insert(insert_at, "default")
     session.selected_col = insert_at
     session.working.dirty = True
+    _working_state_changed()
     _load_table_editor_cell(session)
 
 
@@ -5043,6 +7028,7 @@ def _delete_table_editor_column():
         del session.working.alignments[delete_at]
     session.selected_col = min(delete_at, session.working.column_count - 1)
     session.working.dirty = True
+    _working_state_changed()
     _load_table_editor_cell(session)
 
 
@@ -5291,11 +7277,11 @@ def open_table_editor(table_number):
         else:
             _move_table_editor_cell(-1)
 
-    @table_nav_kb.add("c-r")
+    @table_nav_kb.add("r")
     def _nav_row_commands(event):
         _show_table_row_menu()
 
-    @table_nav_kb.add("c-c")
+    @table_nav_kb.add("c")
     def _nav_column_commands(event):
         _show_table_column_menu()
 
@@ -5333,6 +7319,8 @@ def open_table_editor(table_number):
         height=D(preferred=3),
         style="class:table.cell-editor",
     )
+    title_editor.buffer.on_text_changed += _working_state_changed
+    cell_editor.buffer.on_text_changed += _working_state_changed
 
     # Cell editing is intentionally separate from table navigation. Arrow keys
     # retain normal caret behavior here. Enter commits the cell and hands
@@ -5352,6 +7340,25 @@ def open_table_editor(table_number):
         _finish_table_cell_edit()
         _save_table_editor()
 
+    @table_cell_kb.add("c-x", eager=True)
+    def _cut_from_cell(event):
+        buf = event.current_buffer
+        if buf.selection_state is not None:
+            get_app().clipboard.set_data(buf.cut_selection())
+
+    @table_cell_kb.add("c-c")
+    def _copy_from_cell(event):
+        buf = event.current_buffer
+        if buf.selection_state is not None:
+            get_app().clipboard.set_data(buf.copy_selection())
+
+    @table_cell_kb.add("c-v")
+    def _paste_into_cell(event):
+        buf = event.current_buffer
+        if buf.selection_state is not None:
+            buf.cut_selection()
+        buf.paste_clipboard_data(get_app().clipboard.get_data())
+
     cell_editor.control.key_bindings = table_cell_kb
 
     table_title_kb = KeyBindings()
@@ -5366,6 +7373,25 @@ def open_table_editor(table_number):
     def _save_from_title(event):
         _commit_table_editor_title(session)
         _save_table_editor()
+
+    @table_title_kb.add("c-x", eager=True)
+    def _cut_from_title(event):
+        buf = event.current_buffer
+        if buf.selection_state is not None:
+            get_app().clipboard.set_data(buf.cut_selection())
+
+    @table_title_kb.add("c-c")
+    def _copy_from_title(event):
+        buf = event.current_buffer
+        if buf.selection_state is not None:
+            get_app().clipboard.set_data(buf.copy_selection())
+
+    @table_title_kb.add("c-v")
+    def _paste_into_title(event):
+        buf = event.current_buffer
+        if buf.selection_state is not None:
+            buf.cut_selection()
+        buf.paste_clipboard_data(get_app().clipboard.get_data())
 
     title_editor.control.key_bindings = table_title_kb
 
@@ -5413,10 +7439,10 @@ def do_edit_table_at_cursor():
 
 
 def do_insert_table():
-    if _table_placeholder_locked():
+    if _folded_placeholder_locked():
         show_message(
-            "Folded table",
-            "Move the cursor off the folded table reference before inserting another table.",
+            "Folded object",
+            "Move the cursor off the folded table or footnote before inserting another table.",
         )
         return
     title_field = TextArea(text="", multiline=False, style="class:input-field")
@@ -5595,6 +7621,7 @@ def open_footnote_editor(identifier):
         height=D(preferred=8, max=14),
         style="class:footnote.editor",
     )
+    editor.buffer.on_text_changed += _working_state_changed
     session.editor = editor
 
     note_kb = KeyBindings()
@@ -5603,6 +7630,25 @@ def open_footnote_editor(identifier):
     @note_kb.add("c-s")
     def _save_note(event):
         _save_footnote_editor()
+
+    @note_kb.add("c-x", eager=True)
+    def _cut_from_note(event):
+        buf = event.current_buffer
+        if buf.selection_state is not None:
+            get_app().clipboard.set_data(buf.cut_selection())
+
+    @note_kb.add("c-c")
+    def _copy_from_note(event):
+        buf = event.current_buffer
+        if buf.selection_state is not None:
+            get_app().clipboard.set_data(buf.copy_selection())
+
+    @note_kb.add("c-v")
+    def _paste_into_note(event):
+        buf = event.current_buffer
+        if buf.selection_state is not None:
+            buf.cut_selection()
+        buf.paste_clipboard_data(get_app().clipboard.get_data())
 
     @note_kb.add("escape")
     def _cancel_note(event):
@@ -5618,7 +7664,7 @@ def open_footnote_editor(identifier):
             [
                 Label(text=f"Source ID: {identifier}"),
                 editor,
-                Label(text="Enter/Ctrl+S saves · Esc cancels"),
+                Label(text="Enter/Ctrl+S saves · Ctrl+X/C/V cut/copy/paste · Esc cancels"),
             ]
         ),
         buttons=[
@@ -5640,13 +7686,16 @@ def do_edit_footnote_at_cursor():
 
 def do_insert_footnote():
     """Insert a stable reference and append its simple definition object."""
-    if _table_placeholder_locked():
+    if _folded_placeholder_locked():
         show_message(
-            "Folded table",
-            "Move the cursor off the folded table reference before inserting a footnote.",
+            "Folded object",
+            "Move the cursor off the folded table or footnote before inserting a footnote.",
         )
         return
     buf = text_area.buffer
+    if _selection_intersects_folded_object(buf):
+        _folded_edit_warning()
+        return
 
     # The complete insertion, including replacement of any selected prose, is
     # one logical edit. Save before touching either text or object state.
@@ -5675,117 +7724,173 @@ def do_insert_footnote():
     open_footnote_editor(identifier)
 
 
-async def _autosave_loop():
-    while True:
-        await asyncio.sleep(AUTOSAVE_INTERVAL_SECONDS)
+def _delete_footnote_object(identifier):
+    """Delete one folded footnote definition and all of its references."""
+    if identifier not in state.footnotes:
+        return False
 
-        # Crash recovery is independent of normal autosave. It runs for every
-        # modified document, even when autosave is disabled, the source file is
-        # conflicted/read-only, or a modal (including the table editor) is open.
-        if _has_recoverable_changes():
-            try:
-                _write_recovery_snapshot()
-            except (OSError, UnicodeError, TypeError, ValueError) as e:
-                # Do not stack a warning over another modal. Leave the flag
-                # clear in that case so the warning can be shown on a later
-                # pass after the modal closes.
-                if current_float is None and not state.recovery_error:
-                    state.recovery_error = True
-                    show_message(
-                        "Recovery unavailable",
-                        "Carriage could not update the crash-recovery copy for "
-                        f"this document.\n\n{e}",
-                    )
-            else:
-                state.recovery_error = False
-        else:
-            _clear_recovery_file()
+    buf = text_area.buffer
+    old_text = buf.text
+    old_cursor = buf.cursor_position
+    ranges = [
+        (start, end)
+        for start, end, ref_id, _row, _start_col, _end_col
+        in _footnote_reference_spans(old_text)
+        if ref_id == identifier
+    ]
 
-        # Everything below this point concerns the user's actual source file.
-        if not state.auto_save:
-            get_app().invalidate()
-            continue
-        if state.path is None:
-            get_app().invalidate()
-            continue
-        if state.external_process_running:
-            get_app().invalidate()
-            continue
-        if current_float is not None:
-            # Source autosave must not write behind Open/Save/Export dialogs or
-            # commit a table/footnote editor draft that the user has not saved yet.
-            get_app().invalidate()
-            continue
-        if not state.is_modified(text_area.text):
-            get_app().invalidate()
-            continue
+    # Remove references first, right-to-left, while maintaining an approximate
+    # prose cursor position. The folded definition is then removed as a block.
+    new_text = old_text
+    new_cursor = old_cursor
+    for start, end in sorted(ranges, reverse=True):
+        if start < new_cursor:
+            new_cursor -= min(end, new_cursor) - start
+        new_text = new_text[:start] + new_text[end:]
 
-        try:
-            if _path_is_read_only(state.path):
-                if not state.autosave_conflict:
-                    state.autosave_conflict = True
-                    show_message(
-                        "Autosave paused",
-                        "The current file is marked read-only. Autosave will not "
-                        "replace it. Your working copy is still protected by crash "
-                        "recovery. Use Save As to write your changes elsewhere.",
-                    )
-                get_app().invalidate()
-                continue
-            disk_snapshot = _disk_snapshot(state.path)
-        except OSError as e:
-            if not state.autosave_conflict:
-                state.autosave_conflict = True
-                show_message(
-                    "Autosave paused",
-                    "Carriage could not verify the file on disk, so it did not "
-                    f"save. Your working copy is still protected by crash recovery.\n\n{e}",
-                )
-            get_app().invalidate()
-            continue
+    doc = Document(new_text, cursor_position=max(0, min(len(new_text), new_cursor)))
+    target_row = None
+    for row, line in enumerate(doc.lines):
+        match = FOOTNOTE_PLACEHOLDER_RE.match(line)
+        if match and match.group(1) == identifier:
+            target_row = row
+            break
+    if target_row is None:
+        return False
 
-        if state.disk_snapshot is None or disk_snapshot != state.disk_snapshot:
-            if not state.autosave_conflict:
-                state.autosave_conflict = True
-                show_message(
-                    "Autosave paused",
-                    "The file changed, was replaced, or was deleted outside Carriage. "
-                    "Autosave will not overwrite that version. Your working copy is "
-                    "still protected by crash recovery. Use Save to choose Save As, "
-                    "Overwrite, or Cancel.",
-                )
-            get_app().invalidate()
-            continue
+    buf.save_to_undo_stack()
+    updated = dict(state.footnotes)
+    del updated[identifier]
+    state.footnotes = updated
 
-        state.autosave_conflict = False
-        result = _write_file(
-            state.path,
-            expected_snapshot=state.disk_snapshot,
-            report_conflict=False,
-            report_read_only=False,
+    lines, cursor_row = _remove_folded_object_line(doc.lines, target_row)
+    result = "\n".join(lines)
+    tmp = Document(result)
+    # If the original caret was on the definition, use its replacement row;
+    # otherwise retain the cursor after reference removal as closely as possible.
+    original_row = buf.document.cursor_position_row
+    if original_row == target_row:
+        final_cursor = tmp.translate_row_col_to_index(
+            min(cursor_row, tmp.line_count - 1), 0
         )
-        if result == _SAVE_CONFLICT and not state.autosave_conflict:
-            state.autosave_conflict = True
+    else:
+        final_cursor = max(0, min(len(result), new_cursor))
+    buf.set_document(Document(result, final_cursor), bypass_readonly=True)
+    return True
+
+
+def do_delete_footnote_at_cursor():
+    identifier = _footnote_identifier_at_cursor()
+    if identifier is None or identifier not in state.footnotes:
+        show_message(
+            "No footnote",
+            "Place the cursor on a folded footnote or one of its references first.",
+        )
+        return
+    number = _footnote_number_map(text_area.text).get(identifier)
+    label = f"Footnote {number}" if number is not None else f"Footnote {identifier!r}"
+    confirm(
+        "Delete footnote",
+        f"Delete {label}, including all of its inline references? This can be undone with Ctrl+Z.",
+        lambda: _delete_footnote_object(identifier),
+    )
+
+
+async def _working_state_loop():
+    """Persist unsaved working state after idle pauses and during long bursts."""
+    while True:
+        await asyncio.sleep(WORKING_STATE_POLL_SECONDS)
+
+        # A failed checkpoint is visible in the status bar immediately. The
+        # modal warning waits until no other dialog is open so it never stacks
+        # on top of an unrelated user decision.
+        if (
+            state.recovery_error
+            and not state.recovery_error_reported
+            and current_float is None
+        ):
+            state.recovery_error_reported = True
+            detail = state.recovery_error_message or "Unknown recovery error."
             show_message(
-                "Autosave paused",
-                "The file changed while autosave was running. Nothing was overwritten. "
-                "Your working copy is still protected by crash recovery. Use Save to "
-                "choose how to resolve the conflict.",
+                "Recovery unavailable",
+                "Carriage could not update the protected working-state journal. "
+                "Your Markdown file has not been changed; use Save to commit work "
+                f"manually.\n\n{detail}",
             )
-        elif result == _SAVE_READ_ONLY and not state.autosave_conflict:
-            state.autosave_conflict = True
-            show_message(
-                "Autosave paused",
-                "The file became read-only while autosave was running. Nothing was "
-                "overwritten. Your working copy is still protected by crash recovery. "
-                "Use Save As to write your changes elsewhere.",
+
+        if not _has_recoverable_changes():
+            if state.recovery_path is not None:
+                _clear_recovery_file()
+            _reset_working_state_tracking()
+            continue
+
+        # Persist only states that changed after the last successful journal
+        # commit. Main prose edits, object commits, and active table/footnote
+        # drafts all signal revisions through the shared mutation hook.
+        if state.working_state_revision <= state.working_state_persisted_revision:
+            continue
+
+        now = time.monotonic()
+        if state.working_state_first_dirty_at is None:
+            state.working_state_first_dirty_at = now
+        if state.working_state_last_change_at is None:
+            state.working_state_last_change_at = now
+
+        idle_due = (
+            now - state.working_state_last_change_at >= WORKING_STATE_IDLE_SECONDS
+        )
+        max_due = (
+            now - state.working_state_first_dirty_at
+            >= WORKING_STATE_MAX_LATENCY_SECONDS
+        )
+        if not (idle_due or max_due):
+            continue
+
+        recovery_path, epoch, payload, revision = _recovery_snapshot_data()
+        try:
+            committed = await asyncio.to_thread(
+                _write_recovery_payload_atomic,
+                recovery_path,
+                epoch,
+                payload,
+                revision,
             )
-        get_app().invalidate()
+        except (OSError, UnicodeError, TypeError, ValueError) as e:
+            state.recovery_error = True
+            state.recovery_error_reported = False
+            state.recovery_error_message = str(e)
+            # Avoid a tight retry loop after an I/O failure. New edits will
+            # update last_change_at naturally; otherwise retry after the normal
+            # idle interval.
+            retry_at = time.monotonic()
+            state.working_state_first_dirty_at = retry_at
+            state.working_state_last_change_at = retry_at
+            get_app().invalidate()
+            continue
+
+        if committed:
+            _record_recovery_success(revision)
+            get_app().invalidate()
+
 
 
 # ---------------------------------------------------------------------------
 # Pandoc export
 # ---------------------------------------------------------------------------
+
+def _resolve_executable(executable):
+    """Resolve a configured executable name/path, or return None."""
+    candidate = os.path.expanduser(os.path.expandvars(str(executable).strip()))
+    if not candidate:
+        return None
+    if os.path.sep in candidate:
+        return candidate if os.path.isfile(candidate) and os.access(candidate, os.X_OK) else None
+    return shutil.which(candidate)
+
+
+def _configured_pandoc():
+    return _resolve_executable(PANDOC_EXECUTABLE)
+
 
 def _default_export_path(ext):
     base = os.path.splitext(state.path)[0] if state.path else "untitled"
@@ -5928,7 +8033,7 @@ def _request_text_export(out_path, content):
 
 
 def do_export_hard_wrapped_markdown():
-    """Write a separate 80-column Markdown copy of the current document."""
+    """Write a separate hard-wrapped Markdown copy at the configured width."""
     def do_export(raw_path):
         out_path = os.path.expanduser(raw_path.strip())
         if not out_path:
@@ -6012,7 +8117,10 @@ def _perform_pandoc_export(out_path, source_text, extra_args, expected_snapshot)
         # Keep the real destination out of Pandoc's hands entirely. The
         # staging filename retains the requested extension so Pandoc can infer
         # PDF/DOCX/ODT/HTML/plain output exactly as before.
-        cmd = ["pandoc", "-f", "markdown"] + list(extra_args or []) + ["-o", temp_path]
+        pandoc = _configured_pandoc()
+        if pandoc is None:
+            raise OSError(f"Configured Pandoc executable not found: {PANDOC_EXECUTABLE}")
+        cmd = [pandoc, "-f", "markdown"] + list(extra_args or []) + ["-o", temp_path]
         subprocess.run(
             cmd,
             input=source_text,
@@ -6116,11 +8224,11 @@ def _request_pandoc_export(out_path, source_text, extra_args=None):
 
 
 def export_via_pandoc(fmt_label, ext, extra_args=None):
-    if shutil.which("pandoc") is None:
+    if _configured_pandoc() is None:
         show_message(
             "Pandoc not found",
-            "pandoc isn't on PATH. Install it (e.g. `sudo dnf install pandoc`)"
-            " and try again.",
+            f"Configured Pandoc executable not found: {PANDOC_EXECUTABLE}\n\n"
+            f"Edit {_config_path()} to change the Pandoc executable.",
         )
         return
 
@@ -6169,8 +8277,12 @@ def do_custom_export():
         close_dialog()
         if not out_path:
             return
-        if shutil.which("pandoc") is None:
-            show_message("Pandoc not found", "pandoc isn't on PATH.")
+        if _configured_pandoc() is None:
+            show_message(
+                "Pandoc not found",
+                f"Configured Pandoc executable not found: {PANDOC_EXECUTABLE}\n\n"
+                f"Edit {_config_path()} to change the Pandoc executable.",
+            )
             return
         try:
             source_text = _materialize_objects(text_area.text)
@@ -6199,10 +8311,15 @@ def do_custom_export():
 
 
 # ---------------------------------------------------------------------------
-# Spell check (aspell)
+# Spell check
 # ---------------------------------------------------------------------------
 
-def do_run_aspell():
+def _spellcheck_argv(path):
+    """Return the configured spell-check command with {file} substituted."""
+    return [arg.replace("{file}", path) for arg in SPELLCHECK_COMMAND]
+
+
+def do_run_spellcheck():
     if state.path is None:
         show_message(
             "Save first", "Save the file before running the spell checker."
@@ -6210,40 +8327,46 @@ def do_run_aspell():
         return
 
     def proceed():
-        do_save(on_saved=_launch_aspell)
+        do_save(on_saved=_launch_spellcheck)
 
     if state.is_modified(text_area.text):
         confirm(
             "Unsaved changes",
-            "aspell checks the file on disk. Save your changes first?",
+            "The spell checker works on the file on disk. Save your changes first?",
             proceed,
         )
     else:
-        _launch_aspell()
+        _launch_spellcheck()
 
 
-def _launch_aspell():
-    if shutil.which("aspell") is None:
+def _launch_spellcheck():
+    argv = _spellcheck_argv(state.path)
+    executable = _resolve_executable(argv[0])
+    if executable is None:
         show_message(
-            "aspell not found",
-            "aspell isn't on PATH. Install it (e.g. `sudo dnf install aspell"
-            " aspell-en`) and try again.",
+            "Spell checker not found",
+            f"Configured spell-check executable not found: {argv[0]}\n\n"
+            f"Edit {_config_path()} to change spellcheck_command.",
         )
         return
+    argv[0] = executable
 
     async def run_and_reload():
-        cmd = f"aspell --mode=markdown check {shlex.quote(state.path)}"
+        # prompt_toolkit hands run_system_command a shell command string. Quote
+        # every array element after substitution so the TOML array retains
+        # argument boundaries even when the document path contains spaces.
+        cmd = " ".join(shlex.quote(arg) for arg in argv)
         state.external_process_running = True
         try:
             await application.run_system_command(cmd, wait_for_enter=False)
         except Exception as e:
-            show_message("aspell error", str(e))
+            show_message("Spell checker error", str(e))
             return
         finally:
             state.external_process_running = False
 
-        # aspell edits the file on disk directly - reload it into the buffer
-        # and make that exact edited version the new conflict-detection baseline.
+        # The configured checker edits the file in place. Reload that file and
+        # make the exact edited bytes the new conflict-detection baseline.
         try:
             content, disk_snapshot = _read_utf8_file_with_snapshot(state.path)
         except (OSError, UnicodeError) as e:
@@ -6253,7 +8376,8 @@ def _launch_aspell():
         text_area.buffer.reset(Document(text=visible))
         state.saved_text = content
         state.disk_snapshot = disk_snapshot
-        state.autosave_conflict = False
+        _clear_recovery_file()
+        _reset_working_state_tracking()
 
     get_app().create_background_task(run_and_reload())
 
@@ -6287,10 +8411,17 @@ KEYBINDING_ROWS = [
     ("Ctrl+N", "New file"),
     ("Ctrl+O", "Open file"),
     ("Ctrl+S", "Save"),
+    ("F9", "Save"),
     ("Ctrl+Z", "Undo"),
     ("Ctrl+R", "Redo"),
+    ("Ctrl+X", "Cut"),
+    ("Ctrl+C", "Copy"),
+    ("Ctrl+V", "Paste"),
     ("Ctrl+Q", "Quit"),
-    ("F7", "Spell check with aspell"),
+    ("F1", "Carriage Help"),
+    ("F6", "Toggle Extend Selection mode"),
+    ("F7", "Spell check"),
+    ("F8", "Renumber numbered list"),
     ("F10", "Open menu bar"),
     ("Ctrl+Space", "Open menu bar"),
     ("Ctrl+Home", "Go to top of document"),
@@ -6324,32 +8455,62 @@ def _format_help_notes(width=62):
     """Keep only the practical reminders that do not fit in the cheatsheet."""
     paragraphs = [
         (
-            "Selection: Shift+Arrow or Shift+Home/End selects text. "
-            "Ctrl+W cuts, Alt+W copies, and Ctrl+Y pastes. "
-            "Cut/copy use Carriage's internal clipboard."
+            "Selection: F6 toggles Extend Selection mode. While it is active, "
+            "Left/Right selects by character, Up/Down by display row, "
+            "Ctrl+Left/Right by word, Home/End to the current line boundary, "
+            "and Ctrl+Home/End to the document boundary. Press F6 again to leave "
+            "Extend Selection while preserving the selection. The usual "
+            "Shift+Arrow, Shift+Home/End, Ctrl+Shift+Left/Right, and "
+            "Ctrl+Shift+Home/End shortcuts remain available when the terminal "
+            "passes them through. With mouse support enabled, double-click selects "
+            "a word and triple-click selects the current paragraph or list item. "
+            "Ctrl+X cuts, Ctrl+C copies, and Ctrl+V pastes. Cut/copy use "
+            "Carriage's internal clipboard."
         ),
         (
-            "Wrapping: Carriage soft-wraps visually at 80 columns without "
-            "changing source line breaks. Edit > Convert for Carriage rewrites "
-            "original Markdown plus pipe tables and footnotes into Carriage's "
-            "preferred source form: Setext "
-            "headings become ATX headings, simple ordered lists are renumbered "
-            "consecutively from their first item, and hard-wrapped prose becomes logical "
-            "source lines. Original Markdown hard breaks use two trailing spaces and "
-            "display as ↵ in the editor; that marker is never written to the file. "
-            "Export > Hard-Wrapped Markdown writes a separate 80-column Markdown copy."
+            "Wrapping: Carriage soft-wraps visually at the configured prose width "
+            "without changing source line breaks. Edit > Convert for Carriage is a "
+            "document-wide normalization command: it converts Setext headings to ATX, "
+            "renumbers simple ordered lists from their existing first number, and joins "
+            "hard-wrapped prose into logical source lines while preserving supported "
+            "Markdown structure. Original Markdown hard breaks use two trailing spaces "
+            "and display as ↵ when the hard-break marker is enabled; the marker is "
+            "visual only. Export > Hard-Wrapped Markdown writes a separate Markdown "
+            "copy at the configured prose width."
         ),
         (
-            "Tables: Arrow keys navigate table cells. Enter edits the "
-            "selected cell; Enter again commits it. Shift+Tab from the first "
-            "cell focuses the title field; Tab or Enter returns to the grid. "
-            "Ctrl+R and Ctrl+C open row and column commands."
+            "Renumber List: F8 or Edit > Renumber List renumbers only the supported "
+            "numbered list containing the cursor. The first item's number is preserved "
+            "and the following items are made consecutive; surrounding Markdown and "
+            "prose are left unchanged."
         ),
         (
-            "Footnotes: Tools > Insert Footnote creates a standard Markdown "
-            "reference and a folded single-paragraph definition. References "
-            "display as [1], [2], and so on; Tab opens a simple note editor. "
-            "Complex footnotes remain ordinary source."
+            "Folded objects: Supported tables and simple footnote definitions appear "
+            "as compact objects while editing, but save and export as ordinary Markdown. "
+            "Use Tab or the Tools menu to edit them rather than changing the folded "
+            "labels directly."
+        ),
+        (
+            "Saving and recovery: Carriage continuously protects unsaved working "
+            "state in a private recovery journal without changing the Markdown file. "
+            "The journal is normally updated two seconds after editing becomes idle "
+            "and at least every ten seconds during sustained editing. Ctrl+S, F9, "
+            "or File > Save explicitly advances the Markdown file and clears the "
+            "protected unsaved state. After an abnormal exit, Carriage offers to "
+            "restore or discard recovered work."
+        ),
+        (
+            "Tables: Arrow keys navigate table cells. Enter edits the selected cell; "
+            "Enter again commits it. Shift+Tab from the first cell focuses the title "
+            "field; Tab or Enter returns to the grid. In navigation mode, R opens row "
+            "commands and C opens column commands. Ctrl-based editing shortcuts retain "
+            "their normal meanings inside editable text fields."
+        ),
+        (
+            "Footnotes: Tools > Insert Footnote creates a standard Markdown reference "
+            "and a folded single-paragraph definition. References display as [1], [2], "
+            "and so on; Tab opens a simple note editor. Complex footnotes remain "
+            "ordinary source."
         ),
     ]
     return "\n\n".join(
@@ -6378,7 +8539,7 @@ ABOUT_PARAGRAPHS = [
         "or source-code mechanics."
     ),
     (
-        "Markdown soft-wraps visually inside an 80-column writing area without "
+        "Markdown soft-wraps visually inside the configured prose width without "
         "changing ordinary source line breaks. Hard wrapping is available only as "
         "a separate Markdown export. Supported tables and simple footnotes are "
         "folded into compact editing objects in the prose view, while the file "
@@ -6440,6 +8601,13 @@ def _build_markdown_help(width=62):
             ],
         ),
         (
+            "Horizontal rules",
+            [
+                "    ---    ***    ___",
+                "Use three or more matching -, *, or _ characters.",
+            ],
+        ),
+        (
             "Links",
             [
                 "    [link text](https://example.com)",
@@ -6460,15 +8628,18 @@ def _build_markdown_help(width=62):
                 "Tools > Insert Footnote creates a simple standard footnote.",
                 "Carriage folds single-paragraph definitions and displays",
                 "references sequentially as [1], [2], and so on.",
+                "Use Tools > Delete Footnote at Cursor to remove a folded",
+                "footnote and all of its inline references safely.",
             ],
         ),
         (
             "Tables",
             [
                 "Use Tools > Insert Table to create a table, or edit a folded",
-                "table placeholder with Tab or Tools > Edit Table at Cursor.",
+                "table object with Tab or Tools > Edit Table at Cursor.",
+                "Use Tools > Delete Table at Cursor to remove one safely.",
                 "Optional titles use Pandoc table captions and appear in the",
-                "placeholder as [[Table N: Title]].",
+                "prose-view label as [[Table N: Title]].",
             ],
         ),
     ]
@@ -6496,7 +8667,7 @@ def _build_markdown_help(width=62):
 MARKDOWN_HELP_TEXT = _build_markdown_help()
 
 def do_show_help():
-    _show_help_reference("Keybindings", HELP_TEXT)
+    _show_help_reference("Carriage Help", HELP_TEXT)
 
 
 def do_show_markdown_help():
@@ -6649,11 +8820,12 @@ def _status_section_width(terminal_columns):
     fixed_other_width = (
         4  # progress field ("100%")
         + 15  # word-count field
-        + 12  # save field ("save:paused")
         + 20  # command hint
-        + (3 * 4)  # four " | " separators
+        + (3 * 3)  # three ordinary " | " separators
         + 2  # outer padding
     )
+    if state.recovery_error:
+        fixed_other_width += 14 + 3  # "recovery:error" plus one separator
     available = max(1, terminal_columns - fixed_other_width)
     desired = max(16, round(terminal_columns * 0.38))
     return max(1, min(60, desired, available))
@@ -6665,22 +8837,165 @@ def _status_section_field(title, terminal_columns):
     return _fit_status_field(label, width)
 
 
+def _blank_source_ranges(text, ranges):
+    """Replace source-only inline ranges with spaces without joining words."""
+    if not ranges:
+        return text
+    chars = list(text)
+    for start, end in ranges:
+        start = max(0, start)
+        end = min(len(chars), end)
+        for index in range(start, end):
+            chars[index] = " "
+    return "".join(chars)
+
+
+def _prose_inline_text_for_count(text):
+    """Return inline Markdown reduced to the prose that a writer actually wrote.
+
+    Code spans, link destinations/reference labels, autolinks/raw inline HTML,
+    and live footnote-reference markers are source mechanics rather than prose.
+    Link labels and ordinary emphasized text remain, because they are visible
+    document language. Bare URLs/e-mail addresses count as one token.
+    """
+    if not text:
+        return ""
+
+    # Original-Markdown autolinks render their address as visible document
+    # text, so count each as one word. Raw inline HTML remains excluded below.
+    text = _AUTOLINK_RE.sub(" proseurl ", text)
+    protected = list(_inline_footnote_literal_ranges(text))
+    reduced = _blank_source_ranges(text, protected)
+
+    # Footnote references outside literal/protected ranges are annotations, not
+    # prose words. Keep escaped ``\[^id]`` source literal.
+    chars = list(reduced)
+    for match in _FOOTNOTE_REFERENCE_RE.finditer(reduced):
+        if _markdown_char_is_escaped(reduced, match.start()):
+            continue
+        for index in range(match.start(), match.end()):
+            chars[index] = " "
+    reduced = "".join(chars)
+
+    # A bare URL or e-mail address behaves like one word in ordinary writing,
+    # rather than contributing each domain/path component separately.
+    reduced = _BARE_URL_OR_EMAIL_RE.sub(" proseurl ", reduced)
+    return reduced
+
+
+def _count_prose_fragment(text):
+    return len(_PROSE_WORD_RE.findall(_prose_inline_text_for_count(str(text))))
+
+
+def _count_table_prose(table):
+    """Count table language without pipes, alignment syntax, or table numbers."""
+    total = _count_prose_fragment(table.title)
+    for cell in table.headers:
+        total += _count_prose_fragment(cell)
+    for row in table.rows:
+        for cell in row:
+            total += _count_prose_fragment(cell)
+    return total
+
+
+def _count_raw_pipe_table_prose(source_lines):
+    """Count prose in a visible pipe table that has not been folded yet."""
+    if len(source_lines) < 2 or not _is_pipe_table_separator(source_lines[1]):
+        return sum(_count_prose_fragment(line) for line in source_lines)
+    total = 0
+    for row_index, line in enumerate(source_lines):
+        if row_index == 1:
+            continue
+        for cell in _table_cells_from_line(line):
+            total += _count_prose_fragment(cell)
+    return total
+
+
+def _prose_word_count(visible_text):
+    """Return a writer-facing word count for the current Carriage document.
+
+    Markdown block/inline syntax does not count as language. Folded object
+    content is counted from its in-memory data, so the status bar reflects what
+    will be saved without counting placeholder labels or table separators.
+    """
+    total = 0
+
+    for block in _analyze_document_layout(visible_text, WRAP_COLUMN):
+        if block.kind in {
+            "blank",
+            "front-matter",
+            "code",
+            "block-html",
+            "thematic-break",
+        }:
+            continue
+
+        if block.kind == "reference-definition":
+            # Ordinary link reference definitions are source infrastructure. A
+            # footnote definition, however, contains document prose. Simple
+            # notes are normally folded, but this keeps the live count sensible
+            # while a writer is typing one directly into the buffer.
+            first = _FOOTNOTE_DEFINITION_RE.match(block.source_lines[0])
+            if first is not None:
+                total += _count_prose_fragment(first.group(2))
+                for continuation in block.source_lines[1:]:
+                    body = _footnote_continuation_text(continuation)
+                    if body is not None:
+                        total += _count_prose_fragment(body)
+            continue
+
+        if block.kind == "table":
+            # Folded tables are counted from the authoritative TableData object.
+            if len(block.source_lines) == 1:
+                match = TABLE_PLACEHOLDER_RE.match(block.source_lines[0])
+                if match is not None:
+                    table = state.tables.get(int(match.group(1)))
+                    if table is not None:
+                        total += _count_table_prose(table)
+                    continue
+            total += _count_raw_pipe_table_prose(block.source_lines)
+            continue
+
+        if block.kind == "footnote-placeholder":
+            match = FOOTNOTE_PLACEHOLDER_RE.match(block.source_lines[0])
+            if match is not None:
+                note = state.footnotes.get(match.group(1))
+                if note is not None:
+                    total += _count_prose_fragment(note.text)
+            continue
+
+        source_lines = block.source_lines
+        if block.kind == "setext-heading":
+            source_lines = source_lines[:1]
+
+        for source_line in source_lines:
+            text = source_line
+
+            # Ordered-list numbers are syntax. Unordered markers contain no
+            # word characters, but stripping all markers keeps the rule clear.
+            if block.kind in {"list", "list-run", "complex-list"}:
+                list_match = _LIST_ITEM_RE.match(text)
+                if list_match is not None:
+                    text = text[list_match.end():]
+
+            # A manually typed (not-yet-folded) simple footnote definition
+            # counts its body but not the identifier. Continuation lines are
+            # ordinary prose and fall through naturally.
+            footnote_match = _FOOTNOTE_DEFINITION_RE.match(text)
+            if footnote_match is not None:
+                text = footnote_match.group(2)
+
+            total += _count_prose_fragment(text)
+
+    return total
+
+
+
 def get_statusbar_text():
     doc = text_area.buffer.document
-    try:
-        count_text = _materialize_objects(text_area.text)
-    except ValueError:
-        count_text = text_area.text
-
-    words = len(re.findall(r"\S+", count_text))
+    words = _prose_word_count(text_area.text)
     section = _current_section_title(doc)
     progress = _document_progress(doc)
-    if not state.auto_save:
-        save_status = "off"
-    elif state.autosave_conflict or state.recovery_error:
-        save_status = "paused"
-    else:
-        save_status = "on"
 
     try:
         terminal_columns = get_app().output.get_size().columns
@@ -6690,14 +9005,19 @@ def get_statusbar_text():
     section_field = _status_section_field(section, terminal_columns)
     word_field = f"{words:,} words".ljust(15)
     progress_field = f"{progress:>3}%"
-    state_field = f"save:{save_status}"
-    command_field = "^Space menu  ^Q quit"
+    command_field = (
+        "EXTEND  F6 end" if state.extend_selection_mode else "^Space menu  ^Q quit"
+    )
+
+    # Working-state protection is normally silent. Surface only a failure.
+    fields = [progress_field, section_field, word_field]
+    if state.recovery_error:
+        fields.append("recovery:error")
+    fields.append(command_field)
 
     # Keep navigation information together at the left, followed by
     # document/editor state and finally command hints.
-    status = " | ".join(
-        [progress_field, section_field, word_field, state_field, command_field]
-    )
+    status = " | ".join(fields)
     return [("class:status", f" {status} ")]
 
 
@@ -6713,12 +9033,25 @@ title_bar = Window(
 )
 title_divider = Window(height=1, char="─", style="class:divider")
 
+status_divider = ConditionalContainer(
+    Window(height=1, char="─", style="class:divider"),
+    filter=Condition(lambda: state.statusbar_visible),
+)
+status_bar = ConditionalContainer(
+    Window(
+        content=FormattedTextControl(get_statusbar_text),
+        height=1,
+        style="class:status",
+    ),
+    filter=Condition(lambda: state.statusbar_visible),
+)
+
 body = HSplit(
     [
         Window(height=1, style="class:editor"),
         text_area,
-        Window(height=1, char="─", style="class:divider"),
-        Window(content=FormattedTextControl(get_statusbar_text), height=1, style="class:status"),
+        status_divider,
+        status_bar,
     ]
 )
 
@@ -6786,7 +9119,7 @@ menu_container = EdgeAlignedMenuContainer(
             children=[
                 MenuItem("New          Ctrl+N", handler=with_unsaved_changes_check(do_new)),
                 MenuItem("Open...      Ctrl+O", handler=with_unsaved_changes_check(do_open)),
-                MenuItem("Save         Ctrl+S", handler=do_save),
+                MenuItem("Save      Ctrl+S / F9", handler=do_save),
                 MenuItem("Save As...", handler=do_save_as),
                 MenuItem("-", disabled=True),
                 MenuItem("Quit         Ctrl+Q", handler=with_unsaved_changes_check(do_quit)),
@@ -6798,12 +9131,15 @@ menu_container = EdgeAlignedMenuContainer(
                 MenuItem("Undo         Ctrl+Z", handler=do_undo),
                 MenuItem("Redo         Ctrl+R", handler=do_redo),
                 MenuItem("-", disabled=True),
-                MenuItem("Cut          Ctrl+W", handler=do_cut),
-                MenuItem("Copy         Alt+W", handler=do_copy),
-                MenuItem("Paste        Ctrl+Y", handler=do_paste),
+                MenuItem("Cut          Ctrl+X", handler=do_cut),
+                MenuItem("Copy         Ctrl+C", handler=do_copy),
+                MenuItem("Paste        Ctrl+V", handler=do_paste),
                 MenuItem("-", disabled=True),
+                MenuItem("Renumber List   F8", handler=do_renumber_list),
                 MenuItem("Convert for Carriage", handler=do_convert_for_carriage),
-                MenuItem("Toggle Auto-Save", handler=do_toggle_autosave),
+                MenuItem("-", disabled=True),
+                MenuItem("Preferences...", handler=do_preferences),
+                MenuItem("Toggle Status Bar", handler=do_toggle_statusbar),
             ],
         ),
         MenuItem(
@@ -6833,29 +9169,27 @@ menu_container = EdgeAlignedMenuContainer(
                         "HTML", "html", ["--standalone"]
                     ),
                 ),
-                MenuItem(
-                    "Plain text (.txt)",
-                    handler=lambda: export_via_pandoc("plain text", "txt", ["-t", "plain"]),
-                ),
                 MenuItem("Custom pandoc command...", handler=do_custom_export),
             ],
         ),
         MenuItem(
             "  Tools  ",
             children=[
-                MenuItem("Spell Check (aspell)   F7", handler=do_run_aspell),
+                MenuItem("Spell Check   F7", handler=do_run_spellcheck),
                 MenuItem("-", disabled=True),
                 MenuItem("Insert Table...", handler=do_insert_table),
                 MenuItem("Edit Table at Cursor   Tab", handler=do_edit_table_at_cursor),
+                MenuItem("Delete Table at Cursor...", handler=do_delete_table_at_cursor),
                 MenuItem("-", disabled=True),
                 MenuItem("Insert Footnote", handler=do_insert_footnote),
                 MenuItem("Edit Footnote at Cursor   Tab", handler=do_edit_footnote_at_cursor),
+                MenuItem("Delete Footnote at Cursor...", handler=do_delete_footnote_at_cursor),
             ],
         ),
         MenuItem(
             "  Help  ",
             children=[
-                MenuItem("Keybindings", handler=do_show_help),
+                MenuItem("Carriage Help   F1", handler=do_show_help),
                 MenuItem("Markdown Syntax", handler=do_show_markdown_help),
                 MenuItem("-", disabled=True),
                 MenuItem("About Carriage", handler=do_show_about),
@@ -6892,7 +9226,11 @@ def _(event):
 
 
 @kb.add("c-s", filter=editor_focused)
+@kb.add("f9", filter=editor_focused)
 def _(event):
+    # F9 is the single-keystroke function-key alias for the same explicit
+    # manual Save operation as Ctrl+S. Keep one code path so both commands
+    # share atomic replacement, conflict detection, and journal clearing.
     do_save()
 
 
@@ -6901,14 +9239,49 @@ def _(event):
     with_unsaved_changes_check(do_quit)()
 
 
+@kb.add("c-x", filter=editor_focused, eager=True)
+def _(event):
+    # Ctrl+X is an Emacs prefix in prompt_toolkit's defaults. eager=True makes
+    # the standard desktop Cut command immediate inside Carriage.
+    do_cut()
+
+
+@kb.add("c-c", filter=editor_focused)
+def _(event):
+    do_copy()
+
+
+@kb.add("c-v", filter=editor_focused)
+def _(event):
+    do_paste()
+
+
+# Carriage previously inherited prompt_toolkit's Emacs clipboard vocabulary.
+# Consume those legacy chords so the documented Ctrl+X/C/V mapping is the one
+# keyboard interface rather than an additional set of aliases.
+@kb.add("c-w", filter=editor_focused)
+@kb.add("escape", "w", filter=editor_focused)
+@kb.add("c-y", filter=editor_focused)
+def _(event):
+    pass
+
+
 @kb.add("c-home", filter=editor_focused)
 def _(event):
-    do_go_top()
+    if state.extend_selection_mode:
+        _extend_selection_to_position(0)
+    else:
+        event.current_buffer.exit_selection()
+        do_go_top()
 
 
 @kb.add("c-end", filter=editor_focused)
 def _(event):
-    do_go_end()
+    if state.extend_selection_mode:
+        _extend_selection_to_position(len(text_area.text))
+    else:
+        event.current_buffer.exit_selection()
+        do_go_end()
 
 
 # Most terminals encode Alt+Arrow as Escape followed by the arrow key.
@@ -6932,9 +9305,19 @@ def _(event):
     event.current_buffer.redo()
 
 
+@kb.add("f6", filter=editor_focused)
+def _(event):
+    _toggle_extend_selection_mode()
+
+
 @kb.add("f7", filter=editor_focused)
 def _(event):
-    do_run_aspell()
+    do_run_spellcheck()
+
+
+@kb.add("f8", filter=editor_focused)
+def _(event):
+    do_renumber_list()
 
 
 no_dialog_open = Condition(lambda: current_float is None)
@@ -7072,14 +9455,7 @@ def _(event):
     if block is None or block.marker is None:
         return
 
-    prefix_width = len(block.marker)
-    converted = []
-    for offset, line in enumerate(block.source_lines):
-        if offset == 0:
-            converted.append(line[prefix_width:])
-        else:
-            converted.append(line[prefix_width:])
-
+    converted = _unlist_simple_list_item(block)
     lines[block.start:block.end] = converted
     new_text = "\n".join(lines)
     tmp = Document(text=new_text)
@@ -7145,8 +9521,12 @@ def _(event):
 
 @kb.add("enter", filter=editor_focused)
 def _(event):
-    if _table_placeholder_locked():
-        do_edit_table_at_cursor()
+    folded = _folded_placeholder_at_cursor()
+    if folded is not None:
+        if folded[0] == "table":
+            do_edit_table_at_cursor()
+        else:
+            open_footnote_editor(folded[1])
         return
 
     # Keep Return deliberately literal in the prose editor. prompt_toolkit's
@@ -7351,6 +9731,66 @@ def _move_editor_cursor_visual_rows(delta):
     return True
 
 
+def _toggle_extend_selection_mode():
+    """Toggle Word-style keyboard selection while preserving any selection."""
+    buf = text_area.buffer
+    if state.extend_selection_mode:
+        state.extend_selection_mode = False
+        get_app().invalidate()
+        return
+
+    state.extend_selection_mode = True
+    if buf.selection_state is None and buf.text:
+        buf.start_selection(selection_type=SelectionType.CHARACTERS)
+    if buf.selection_state is not None:
+        # Keep prompt_toolkit's normal replace-selection behavior for typing,
+        # while Carriage's F6-specific movement bindings prevent unmodified
+        # navigation keys from cancelling the selection until F6 is pressed again.
+        buf.selection_state.enter_shift_mode()
+    get_app().invalidate()
+
+
+def _extend_selection_to_position(target):
+    """Move the active end of the F6 selection to an absolute source index."""
+    buf = text_area.buffer
+    target = max(0, min(len(buf.text), int(target)))
+    original_position = buf.cursor_position
+
+    if buf.selection_state is None:
+        if not buf.text:
+            return False
+        buf.start_selection(selection_type=SelectionType.CHARACTERS)
+
+    buf.cursor_position = target
+    if buf.selection_state is not None:
+        anchor = buf.selection_state.original_cursor_position
+        if buf.cursor_position == anchor:
+            buf.exit_selection()
+    get_app().invalidate()
+    return buf.cursor_position != original_position
+
+
+def _extend_selection_by_word(delta):
+    """Extend the F6 selection one ordinary word boundary left or right."""
+    doc = text_area.buffer.document
+    if delta < 0:
+        amount = doc.find_previous_word_beginning()
+    else:
+        amount = doc.find_next_word_beginning()
+        if amount is None and doc.cursor_position < len(doc.text):
+            amount = len(doc.text) - doc.cursor_position
+    if amount is None:
+        return False
+    return _extend_selection_to_position(doc.cursor_position + amount)
+
+
+def _extend_selection_to_line_boundary(end=False):
+    """Extend the F6 selection to the current physical line boundary."""
+    doc = text_area.buffer.document
+    amount = doc.get_end_of_line_position() if end else doc.get_start_of_line_position()
+    return _extend_selection_to_position(doc.cursor_position + amount)
+
+
 def _move_editor_selection_visual_rows(delta):
     """Extend a Shift selection by one rendered row."""
     buf = text_area.buffer
@@ -7378,7 +9818,7 @@ def _move_editor_selection_across_lines(delta):
 
     prompt_toolkit's stock Shift+Left/Right bindings use raw source-character
     movement. Carriage has a slightly different visible-character model around
-    folded table sentinels and hidden list-continuation indentation, so selection
+    folded-object sentinels and hidden list-continuation indentation, so selection
     movement must use the same cross-line path as ordinary Left/Right. This also
     makes Shift+Left at the start of a physical line select the newline and land
     at the end of the previous line, as users expect.
@@ -7419,8 +9859,12 @@ def _move_editor_cursor_across_lines(delta):
     row = doc.cursor_position_row
     col = doc.cursor_position_col
 
-    placeholder = FOOTNOTE_PLACEHOLDER_RE.match(doc.current_line)
-    if placeholder:
+    folded_placeholder = _folded_placeholder_at_cursor(doc)
+    if folded_placeholder is not None:
+        # A folded object is one visible navigation unit. Once the caret is on
+        # its line, Left/Right jumps to the object's edge rather than walking
+        # through the label character by character. Shift+Arrow inherits this
+        # behavior, so keyboard selections include the object whole.
         if delta > 0 and col < len(doc.current_line):
             buf.cursor_position = doc.translate_row_col_to_index(row, len(doc.current_line))
             return
@@ -7489,12 +9933,20 @@ def _(event):
 
 @kb.add("up", filter=editor_focused)
 def _(event):
-    _move_editor_cursor_visual_rows(-1)
+    if state.extend_selection_mode:
+        _move_editor_selection_visual_rows(-1)
+    else:
+        event.current_buffer.exit_selection()
+        _move_editor_cursor_visual_rows(-1)
 
 
 @kb.add("down", filter=editor_focused)
 def _(event):
-    _move_editor_cursor_visual_rows(1)
+    if state.extend_selection_mode:
+        _move_editor_selection_visual_rows(1)
+    else:
+        event.current_buffer.exit_selection()
+        _move_editor_cursor_visual_rows(1)
 
 
 @kb.add("s-right", filter=editor_focused)
@@ -7509,17 +9961,53 @@ def _(event):
 
 @kb.add("right", filter=editor_focused)
 def _(event):
-    _move_editor_cursor_across_lines(1)
+    if state.extend_selection_mode:
+        _move_editor_selection_across_lines(1)
+    else:
+        event.current_buffer.exit_selection()
+        _move_editor_cursor_across_lines(1)
 
 
 @kb.add("left", filter=editor_focused)
 def _(event):
-    _move_editor_cursor_across_lines(-1)
+    if state.extend_selection_mode:
+        _move_editor_selection_across_lines(-1)
+    else:
+        event.current_buffer.exit_selection()
+        _move_editor_cursor_across_lines(-1)
+
+
+extend_selection_mode = Condition(lambda: state.extend_selection_mode)
+
+
+@kb.add("c-left", filter=editor_focused & extend_selection_mode)
+def _(event):
+    _extend_selection_by_word(-1)
+
+
+@kb.add("c-right", filter=editor_focused & extend_selection_mode)
+def _(event):
+    _extend_selection_by_word(1)
+
+
+@kb.add("home", filter=editor_focused & extend_selection_mode)
+def _(event):
+    _extend_selection_to_line_boundary(end=False)
+
+
+@kb.add("end", filter=editor_focused & extend_selection_mode)
+def _(event):
+    _extend_selection_to_line_boundary(end=True)
 
 
 @kb.add("c-s", filter=table_editor_active)
 def _(event):
     _save_table_editor()
+
+
+@kb.add("f1", filter=no_dialog_open)
+def _(event):
+    do_show_help()
 
 
 @kb.add("f10", filter=no_dialog_open)
@@ -7585,6 +10073,14 @@ style = Style.from_dict(
         "markdown.table-ref": f"{EF_AQUA} bold",
         "markdown.footnote-ref": f"{EF_AQUA} bold",
         "markdown.hard-break": f"{EF_GREY1} bold",
+        "markdown.blockquote-gutter": EF_GREY1,
+        # Rendered scrollbar: subdued Everforest chrome. Keep the track close
+        # to the surrounding UI and let the thumb/arrows remain legible without
+        # competing with the prose area.
+        "scrollbar": f"bg:{EF_BG3}",
+        "scrollbar.background": f"bg:{EF_BG3}",
+        "scrollbar.button": f"bg:{EF_GREY1}",
+        "scrollbar.arrow": f"bg:{EF_BG3} {EF_GREY1}",
         "footnote.editor": f"bg:{EF_BG3} {EF_FG}",
         "table.border": EF_GREY1,
         "table.header": f"{EF_GREEN} bold",
@@ -7627,7 +10123,7 @@ application = Application(
     layout=layout,
     key_bindings=kb,
     style=style,
-    mouse_support=True,
+    mouse_support=MOUSE_ENABLED,
     full_screen=True,
     # Without this, prompt_toolkit's default color depth is 256-color, not
     # true 24-bit - our exact hex values would get approximated to the
@@ -7640,7 +10136,7 @@ application = Application(
 
 
 def _start_background_tasks(startup_error=None, recovery_source_path=None, offer_any_recovery=False):
-    application.create_background_task(_autosave_loop())
+    application.create_background_task(_working_state_loop())
     if startup_error is not None:
         title, message = startup_error
         show_message(title, message)
@@ -7650,11 +10146,38 @@ def _start_background_tasks(startup_error=None, recovery_source_path=None, offer
         _offer_stale_recovery()
 
 
-def main():
-    startup_error = None
+def _parse_command_line(argv=None):
+    """Parse Carriage's intentionally small command-line interface."""
+    parser = argparse.ArgumentParser(
+        prog="carriage",
+        description="A prose-first Markdown editor for the terminal.",
+        epilog=(
+            "With no FILE, Carriage opens an untitled document. "
+            "If FILE does not exist, it becomes the path used on first save. "
+            "Use -- before a filename beginning with '-'."
+        ),
+    )
+    parser.add_argument(
+        "file",
+        nargs="?",
+        metavar="FILE",
+        help="Markdown file to open, or path to use for a new document",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {APP_VERSION}",
+    )
+    return parser.parse_args(argv)
 
-    if len(sys.argv) > 1:
-        path = os.path.expanduser(sys.argv[1])
+
+def main(argv=None):
+    args = _parse_command_line(argv)
+    startup_error = None
+    _ensure_config_file()
+
+    if args.file is not None:
+        path = os.path.expanduser(args.file)
         if os.path.exists(path):
             try:
                 content, disk_snapshot = _read_utf8_file_with_snapshot(path)
@@ -7671,11 +10194,12 @@ def main():
             state.path = path  # new file at this path on first save
             state.disk_snapshot = _MISSING_DISK_SNAPSHOT
 
+    _reset_working_state_tracking()
     application.run(
         pre_run=lambda: _start_background_tasks(
             startup_error,
-            recovery_source_path=(state.path if len(sys.argv) > 1 else None),
-            offer_any_recovery=(len(sys.argv) == 1),
+            recovery_source_path=(state.path if args.file is not None else None),
+            offer_any_recovery=(args.file is None),
         )
     )
 
