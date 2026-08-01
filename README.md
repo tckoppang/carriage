@@ -10,6 +10,10 @@
 
 > **Carriage is beta software.** It has received extensive automated testing, but it has not yet received the breadth of real-world use expected of a mature text editor. Keep important work backed up or under version control, and do not rely on Carriage as the only copy of a document.
 
+<p align="center">
+  <img src="assets/carriage-screenshot.png" width="1200" alt="Carriage editing a Markdown document in a terminal">
+</p>
+
 Carriage is built around writing documents rather than editing source code. It gives ordinary prose a focused, configurable writing area, keeps Markdown structure out of the way where practical, and leaves the file on disk as ordinary, portable Markdown.
 
 The goal is not to hide Markdown or replace it with a proprietary document format. Carriage is intended to make Markdown feel more like a writing environment while preserving the advantages of plain text.
