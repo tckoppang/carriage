@@ -1,11 +1,5 @@
 <p align="center">
-  <img src="assets/carriage-logo.svg" width="350" alt="Carriage Logo">
-</p>
-
-<h1 align="center">Carriage</h1>
-
-<p align="center">
-  <strong>A prose-first Markdown editor for the terminal.</strong>
+  <img src="assets/carriage-title.png" width="1200" alt="Carriage: A prose-first Markdown editor for the terminal">
 </p>
 
 > **Carriage is beta software.** It has received extensive automated testing, but it has not yet received the breadth of real-world use expected of a mature text editor. Keep important work backed up or under version control, and do not rely on Carriage as the only copy of a document.
@@ -184,12 +178,12 @@ Carriage is a terminal application. It does not require GTK, Qt, or another grap
 
 ## Installation from the development script
 
-Carriage is currently distributed during development as a versioned Python file such as `carriage_v1.157.py`.
+Carriage is currently distributed during development as a versioned Python file such as `carriage_v1.158.py`.
 
 Clone or download the repository and open a terminal in its directory. Create a stable `carriage.py` symlink so aliases and commands do not need to change with each development version:
 
 ```bash
-ln -s carriage_v1.157.py carriage.py
+ln -s carriage_v1.158.py carriage.py
 ```
 
 Create and activate a virtual environment:
