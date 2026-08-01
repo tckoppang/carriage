@@ -2,66 +2,55 @@
   <img src="assets/carriage-logo.svg" width="350" alt="Carriage Logo">
 </p>
 
-<p>
-  <h1 align="center">Carriage</h1>
-</p>
+<h1 align="center">Carriage</h1>
 
 <p align="center">
   <strong>A prose-first Markdown editor for the terminal.</strong>
 </p>
 
-Carriage is built around writing documents rather than editing source code. It gives ordinary prose a focused writing area that is 80 columns wide by default, keeps Markdown structure out of the way where practical, and leaves the document on disk as ordinary, portable Markdown.
+> **Carriage is beta software.** It has received extensive automated testing, but it has not yet received the breadth of real-world use expected of a mature text editor. Keep important work backed up or under version control, and do not rely on Carriage as the only copy of a document.
+
+Carriage is built around writing documents rather than editing source code. It gives ordinary prose a focused, configurable writing area, keeps Markdown structure out of the way where practical, and leaves the file on disk as ordinary, portable Markdown.
 
 The goal is not to hide Markdown or replace it with a proprietary document format. Carriage is intended to make Markdown feel more like a writing environment while preserving the advantages of plain text.
 
 ## Writing first
 
-Carriage treats prose as the primary unit of work.
+Ordinary paragraphs soft-wrap visually at the configured prose width without inserting line breaks into the Markdown source. On wide terminals, the prose area is centered. ATX heading and list markers can hang into the left margin, and blockquotes use a display-only gutter so the prose itself remains aligned.
 
-Ordinary paragraphs soft-wrap visually within a configurable prose width, 80 columns by default, without inserting line breaks into the Markdown source. On wide terminals, the prose area is centered, while list markers and ATX heading markers can hang into the left margin and blockquotes use a display-only gutter so the prose itself remains aligned.
+Markdown hard line breaks made with two trailing spaces can display a visible `↵` marker. The marker exists only in the editor and is never written to the file.
 
-The result is a document that reads naturally in Carriage without filling the underlying Markdown file with editor-specific formatting.
-
-Carriage takes a deliberately conservative approach to Markdown. It handles the straightforward structures it intentionally supports, does not try to repair malformed Markdown, and leaves line-sensitive structures outside its conversion model unchanged rather than guessing at their meaning.
+Carriage takes a deliberately conservative approach to Markdown. It handles straightforward structures it understands and preserves structural, complex, or ambiguous Markdown rather than attempting to repair or reinterpret it.
 
 ## Markdown stays Markdown
 
-Carriage works directly with ordinary Markdown files.
+There is no Carriage document format. A file written in Carriage can be opened in another text editor, tracked in Git, processed with Pandoc, or moved into another Markdown workflow.
 
-There is no Carriage document format. A file written in Carriage can still be opened in another text editor, tracked in Git, processed with Pandoc, or moved to another Markdown workflow.
+Carriage may actively reformat:
 
-### Convert for Carriage
+- ordinary prose paragraphs
+- simple flat ordered and unordered lists
+- simple single-level blockquotes
 
-Existing Markdown can be normalized with **Edit > Convert for Carriage**.
+Carriage preserves structures whose layout or meaning should not be guessed, including fenced or indented code, YAML front matter, raw block HTML, reference definitions, complex containers, and unfamiliar or ambiguous Markdown.
 
-Conversion brings supported, valid Markdown into Carriage's preferred source form while preserving line-sensitive structures that Carriage does not safely reflow. Among other things, it:
+Input is read as UTF-8. CRLF and CR line endings are normalized to LF.
 
-- converts Setext headings to ATX headings
-- normalizes supported ATX heading form
-- renumbers simple ordered lists consecutively from the first item's existing number
-- normalizes straightforward underscore-delimited emphasis to Carriage's preferred asterisk form
-- joins supported hard-wrapped prose into logical source lines
-- preserves original Markdown hard breaks and structural blocks whose physical layout is significant
+## Convert for Carriage
 
-Conversion is intentionally conservative. It is a normalization command, not a Markdown repair tool; complex structures outside Carriage's supported conversion model are left unchanged.
+**Edit > Convert for Carriage** normalizes valid Markdown where Carriage can do so safely. It can:
 
-### Emphasis
+- convert supported Setext headings to ATX headings
+- join supported hard-wrapped prose into logical source lines
+- renumber straightforward ordered lists from their existing first number
+- convert straightforward underscore emphasis to Carriage's preferred asterisk form
+- recognize supported pipe tables and simple footnotes as Carriage objects
 
-Carriage uses asterisks as its preferred emphasis style: `*italic*`, `**bold**`, and `***bold italic***`. Select text and press `F2` to toggle italic or `F3` to toggle bold. The two attributes are independent, so applying both shortcuts to the same selection produces bold italic text.
-
-The selected words remain selected after a successful toggle, which makes successive formatting commands practical. Leading and trailing whitespace stays outside the emphasis markers. Carriage-generated emphasis always uses asterisks, but ordinary editing respects clear preexisting `_italic_`, `__bold__`, and `___bold italic___` forms. **Edit > Convert for Carriage** can normalize straightforward underscore emphasis to asterisks.
-
-Formatting is deliberately selection-based rather than modal. F2 and F3 do not start an italic or bold typing mode. If a selection crosses a source line, overlaps protected Markdown syntax, contains mixed or ambiguous emphasis, or otherwise cannot be changed confidently, Carriage leaves the source and selection untouched and briefly explains the no-op on the status line.
-
-### Hard line breaks
-
-Markdown hard line breaks made with two trailing spaces are preserved.
-
-Because trailing spaces are otherwise invisible, Carriage displays a `↵` marker at a valid hard break by default. The marker exists only in the editor and is never written to the Markdown file; its display can be disabled through the advanced configuration file.
+Conversion is intentionally conservative. Unsupported, complex, or ambiguous structures are preserved rather than repaired.
 
 ## Tables
 
-Supported Markdown pipe tables become first-class objects in Carriage.
+Supported pipe tables become first-class editing objects.
 
 In the prose view, a table is folded into a compact reference such as:
 
@@ -69,127 +58,147 @@ In the prose view, a table is folded into a compact reference such as:
 [[Table 1: Movement Rates]]
 ```
 
-Pressing `Tab` on the reference opens the table editor for supported tables of two through six columns. `F4` or **Tools > Insert Table** creates a new table. Tables can have titles, and rows, columns, headers, and cell contents can be edited without turning the main writing view into a grid of Markdown syntax. Existing Markdown column alignment is preserved when tables are edited.
+Press `Tab` on the reference to open the table editor. The basic editor can create and edit tables with 2 to 6 columns and 1 to 20 data rows. It supports an optional title, headers, alignment, row and column commands, cell navigation, and visually wrapped cell contents.
 
-The table editor has a navigation mode and a cell-editing mode. Arrow keys move among cells, `Enter` edits the selected cell, `R` opens row commands, and `C` opens column commands. In editable table text, the normal `Ctrl+X`, `Ctrl+C`, and `Ctrl+V` cut, copy, and paste shortcuts remain available.
+Imported tables wider than six columns are preserved as Markdown and participate in saving and recovery, but they cannot be opened in the basic table editor.
 
-On disk, the table remains a Markdown pipe table; optional titles use Pandoc-style table captions. Recognized tables wider than six columns can remain folded in the prose view but are not editable in the basic table editor. Table-like structures Carriage does not recognize remain ordinary Markdown source.
+On disk, every table remains an ordinary Markdown pipe table. Optional titles use Pandoc table captions.
 
 ## Footnotes
 
-Carriage also provides first-class support for simple Pandoc-style Markdown footnotes.
+Carriage provides first-class support for simple Pandoc-style Markdown footnotes.
 
-References are displayed as sequential footnote numbers in the prose view, while their definitions are folded out of the main text. `F5` or **Tools > Insert Footnote** creates a new footnote, and pressing `Tab` at an existing footnote opens its dedicated editor. The footnote editor uses the same `Ctrl+X`, `Ctrl+C`, and `Ctrl+V` cut, copy, and paste shortcuts as the main editor. `Enter` or `Ctrl+S` saves the footnote, and `Esc` cancels.
+Inline references display as sequential numbers such as `[1]` and `[2]`, while supported single-paragraph definitions fold out of the main prose view. Press `Tab` at a reference or folded definition to open the footnote editor.
 
-The saved document uses Pandoc-style Markdown footnote syntax. More complex footnotes that Carriage does not support as objects remain ordinary source.
+Adjacent references remain separate atomic objects. Complex or multiline footnotes that Carriage cannot safely model remain ordinary Markdown source.
 
 ## Undo and redo
 
-Undo and redo operate across the document rather than only on visible prose.
-
-Changes to prose, tables, footnotes, and their associated document state participate in the same chronological undo history. Editing a table or footnote therefore behaves as part of editing the document, rather than as a separate operation outside normal undo and redo.
+Undo and redo operate across the document, not only the visible prose. Prose changes, table edits, footnote edits, object insertion and deletion, conversion, and the associated object state participate in one chronological undo history.
 
 ## Saving and recovery
 
-Carriage separates **protecting unsaved work** from **saving the Markdown file**.
+The Markdown file changes only through explicit **Save** or **Save As**. Carriage does not silently autosave the source file.
 
-While you edit, Carriage continuously protects the current working state in a private recovery journal without changing the document during ordinary editing. After editing has been idle for about two seconds, Carriage schedules a checkpoint. During sustained editing, it schedules one after about ten seconds even without an idle pause, so continuous typing cannot postpone protection indefinitely. The journal includes prose, tables, footnotes, the cursor position, and in-progress table or footnote drafts. Untitled documents are protected too.
+Unsaved working state is protected separately in a private recovery journal. The journal is normally updated two seconds after editing becomes idle and at least every ten seconds during sustained editing. After an abnormal exit, Carriage offers to restore or discard recovered work.
 
-During ordinary editing, Carriage writes changes to the Markdown file only when you explicitly use **Save**, **Save As**, `Ctrl+S`, or `F9`. A successful save uses durable atomic replacement, makes the current working state the new saved baseline, and removes the now-unneeded recovery journal. Choosing **Don't Save** when leaving a modified document deliberately discards the protected changes and leaves the last manually saved Markdown file intact. Spell checking is a separate user-invoked operation: the configured external spell checker may edit the source file in place, after which Carriage reloads it.
+Save and Save As use durable atomic replacement. Carriage also:
 
-After an abnormal exit, Carriage detects an abandoned recovery journal and offers to restore the protected work, discard it, or leave it for later. Recovery is a safety mechanism, not version history or a substitute for backups.
+- detects when another program has changed the file on disk
+- leaves an unchanged file untouched rather than replacing it unnecessarily
+- preserves supported permissions, ownership, and extended attributes
+- refuses unsafe atomic replacement of a file with multiple hard links
+- synchronizes completed file and directory updates before reporting success
 
-Carriage also tracks the exact version of the source file that was opened or last successfully saved. If another program changes, replaces, or deletes that file before the next manual save, Carriage detects the conflict rather than silently overwriting the external changes.
+Recovery reduces the chance of losing unsaved work, but it is not a substitute for backups or version control.
 
-## Configuration
+## Opening files
 
-Carriage has no Preferences dialog. Persistent settings are stored in `$XDG_CONFIG_HOME/carriage/config.toml`, or `~/.config/carriage/config.toml` when `XDG_CONFIG_HOME` is not set. Carriage creates the file on first launch, and configuration changes take effect the next time Carriage starts.
+Carriage opens one document at a time. Files larger than 8 MiB require explicit confirmation before loading. The file is decoded incrementally as UTF-8 so large input is not read through one unrestricted allocation.
 
-The principal settings are `editor.prose_width`, from 40 to 160 columns, and `interface.scrollbar`, which controls whether the editor scrollbar is shown. The same file also contains lower-level settings for startup status-bar visibility, mouse support, the hard-break marker, the Pandoc executable, and the external spell-check command.
+For an untitled document, Save As suggests a filename from the first recognized ATX heading. The suggestion:
 
-Working-state protection is automatic and is not configurable. The **Edit > Toggle Status Bar** command changes status-bar visibility for the current session only.
+- uses the visible heading text rather than raw Markdown
+- uses only the title before a subtitle colon
+- removes emphasis, link destinations, code delimiters, HTML tags, and escapes
+- neutralizes unsafe filename characters and reserved names
+- shortens long titles only at a word boundary, preferring a descriptive ending
 
 ## Export
 
-Carriage can create a separate hard-wrapped Markdown copy of a document without changing the working file.
+**Export > Hard-Wrapped Markdown** creates a separate Markdown copy wrapped at the configured prose width. It does not modify the working document and does not require Pandoc.
 
-**Export > Hard-Wrapped Markdown** produces Markdown wrapped to the configured prose width while preserving structures that should not be reflowed.
-
-With Pandoc installed, Carriage has built-in export commands for:
+With Pandoc installed, Carriage can export to:
 
 - PDF
 - DOCX
 - ODT
-- HTML
+- standalone HTML
+- custom Pandoc formats and arguments
 
-**Export > Custom pandoc command** also allows other Pandoc conversions by supplying an output path and additional Pandoc arguments. Plain-text export is not a built-in Carriage export option.
+Pandoc exports use an immutable snapshot of the document, run without blocking the editor, protect the destination from external changes, and allow only one Pandoc export at a time.
 
-Pandoc is optional and is not required for normal editing.
+## Spell checking
 
-## Other features
+The default spell checker is Aspell in Markdown mode. The command is configurable.
 
-Carriage also includes:
+Spell checking works on a saved file. If the document contains unsaved changes, Carriage offers to save them first. The terminal is handed to the checker, and the file is reloaded only if the checker exits successfully.
 
-- lightweight Markdown highlighting
-- prose-aware word counting
-- mouse support and scrolling
-- menus and keyboard shortcuts
-- document and section navigation
-- configurable external terminal spell checking, with Aspell as the default
-- built-in keybinding reference
-- built-in Markdown syntax reference
-- New, Open, Save, and Save As
-- automatic filename suggestions for untitled documents based on the first ATX heading
+An appropriate Aspell dictionary must be installed for the language being checked.
 
-Highlighting and other display features are visual only. They do not add Carriage-specific markup to the saved file.
+## Configuration
 
-## Beta status
+Carriage creates and reads:
 
-> **Carriage is beta software.**
->
-> It is under active development and has not yet received the breadth of real-world testing expected of a mature text editor. Although Carriage includes atomic saving, external-change detection, and continuous working-state recovery, important writing should still be backed up or kept under version control.
+```text
+$XDG_CONFIG_HOME/carriage/config.toml
+```
+
+If `XDG_CONFIG_HOME` is unset, the path is:
+
+```text
+~/.config/carriage/config.toml
+```
+
+Carriage has no Preferences dialog. Settings are read at startup and edited manually. The generated file includes:
+
+```toml
+[editor]
+prose_width = 80
+
+[interface]
+scrollbar = true
+statusbar = true
+mouse = true
+hard_break_marker = true
+
+[tools]
+pandoc = "pandoc"
+spellcheck_command = ["aspell", "--mode=markdown", "check", "{file}"]
+```
+
+`prose_width` accepts values from 40 through 160. Invalid TOML or unsupported settings produce a startup warning. A bad individual setting is ignored without discarding valid neighboring settings.
+
+Python 3.11 and newer use the standard-library TOML parser. On Python 3.10, Carriage can read the subset it writes itself; installing the optional `tomli` package enables general TOML parsing.
 
 ## Requirements
 
 Carriage requires:
 
 - Python 3.10 or newer
-- `prompt_toolkit`
+- `prompt_toolkit>=3.0.52,<3.0.54`
+
+The narrow prompt_toolkit range is intentional. Carriage relies on audited prompt_toolkit behavior for cursor geometry, scrolling, mouse handling, and unified undo.
 
 Optional external tools provide additional features:
 
-- **Aspell plus an appropriate dictionary**: the default spell-check setup; another interactive terminal spell checker that accepts the supplied document path, edits that file in place, and returns when finished can be configured manually
-- **Pandoc**: PDF, DOCX, ODT, HTML, and custom document export
-- a PDF engine supported by Pandoc: PDF export only
+- **Aspell** and a dictionary package for spell checking
+- **Pandoc** for PDF, DOCX, ODT, HTML, and custom export
+- a PDF engine supported by Pandoc for PDF export
 
-## Installation
+Carriage is a terminal application. It does not require GTK, Qt, or another graphical toolkit.
 
-### Recommended: Python virtual environment
+## Installation from the development script
 
-Clone or download Carriage and open a terminal in its directory.
+Carriage is currently distributed during development as a versioned Python file such as `carriage_v1.157.py`.
 
-Release files use the `carriage_vY.XX.py` naming scheme. Create a stable `carriage.py` symlink pointing to the version you installed:
+Clone or download the repository and open a terminal in its directory. Create a stable `carriage.py` symlink so aliases and commands do not need to change with each development version:
 
 ```bash
-ln -s carriage_vY.XX.py carriage.py
+ln -s carriage_v1.157.py carriage.py
 ```
 
-Create a virtual environment:
+Create and activate a virtual environment:
 
 ```bash
 python3 -m venv .venv
-```
-
-Activate it:
-
-```bash
 source .venv/bin/activate
 ```
 
-Install the required dependency:
+Install the audited dependency range:
 
 ```bash
-python -m pip install prompt_toolkit
+python -m pip install 'prompt_toolkit>=3.0.52,<3.0.54'
 ```
 
 Run Carriage:
@@ -198,132 +207,103 @@ Run Carriage:
 python carriage.py
 ```
 
-Or open a Markdown file directly:
+Open a document directly:
 
 ```bash
 python carriage.py document.md
 ```
 
-### Fedora
-
-Fedora users can install `prompt_toolkit` from the system repositories instead:
+Display command-line help or the version:
 
 ```bash
-sudo dnf install python3-prompt-toolkit
+python carriage.py --help
+python carriage.py --version
 ```
 
-Optional default spell-checking and export tools can also be installed through DNF:
+Use `--` before a filename beginning with a dash:
+
+```bash
+python carriage.py -- -draft.md
+```
+
+When installing a later development version, update the stable symlink:
+
+```bash
+ln -sf carriage_vY.XXX.py carriage.py
+```
+
+### Fedora packages
+
+Fedora users can install optional external tools with DNF:
 
 ```bash
 sudo dnf install aspell aspell-en pandoc-cli pandoc-pdf
 ```
 
-`aspell-en` supplies the English dictionary for Aspell. `pandoc-pdf` installs Fedora's Pandoc PDF-support metapackage; it is not needed for DOCX, ODT, or HTML export.
-
-Then run:
+Fedora also provides `python3-prompt-toolkit`, but its installed version must fall within Carriage's audited range. Check it with:
 
 ```bash
-python3 carriage.py
+python3 -c "import prompt_toolkit; print(prompt_toolkit.__version__)"
 ```
 
-You can also make the script executable:
-
-```bash
-chmod +x carriage.py
-./carriage.py
-```
+Use a virtual environment when the system package falls outside the required range.
 
 ## Create a `carriage` command
 
-Using the stable `carriage.py` symlink means your shell configuration does not need to change when Carriage is updated.
-
-If Carriage uses its own virtual environment, add the following to `~/.zshrc` or `~/.bashrc`, replacing `/path/to/carriage` with the actual directory:
+If Carriage uses its own virtual environment, add an alias to `~/.zshrc` or `~/.bashrc`, replacing `/path/to/carriage` with the actual directory:
 
 ```bash
 alias carriage='/path/to/carriage/.venv/bin/python /path/to/carriage/carriage.py'
 ```
 
-If `prompt_toolkit` is installed system-wide:
+If the required prompt_toolkit version is installed system-wide:
 
 ```bash
 alias carriage='python3 /path/to/carriage/carriage.py'
 ```
 
-You can then open Carriage from anywhere:
+Then run:
 
 ```bash
 carriage
-```
-
-Or open a document:
-
-```bash
 carriage document.md
 ```
 
-When installing a new release, update the stable symlink:
+## Essential controls
 
-```bash
-ln -sf carriage_vY.XX.py carriage.py
-```
+Press `F10` or `Ctrl+Space` to activate the menu bar. `F1` opens Carriage Help.
 
-## Using Carriage
-
-Press `F10` or `Ctrl+Space` to activate the menu bar. The **Help** menu contains the current Carriage keybinding reference and a concise Markdown syntax reference.
-
-Carriage uses familiar editing shortcuts where the terminal permits them:
-
-| Shortcut | Action |
-| --- | --- |
+| Command | Action |
+|---|---|
 | `Ctrl+N` | New file |
 | `Ctrl+O` | Open file |
-| `Ctrl+S` | Save |
-| `F9` | Save |
-| `Ctrl+Z` | Undo |
-| `Ctrl+R` | Redo |
-| `Ctrl+X` | Cut |
-| `Ctrl+C` | Copy |
-| `Ctrl+V` | Paste |
-| `Ctrl+Q` | Quit |
-| `F1` | Carriage Help |
-| `F2` | Toggle italic on selected text |
-| `F3` | Toggle bold on selected text |
-| `F4` | Insert table |
-| `F5` | Insert footnote |
+| `Ctrl+S` or `F9` | Save |
+| `Ctrl+Z` / `Ctrl+R` | Undo / redo |
+| `Ctrl+X` / `Ctrl+C` / `Ctrl+V` | Internal cut / copy / paste |
+| `F2` / `F3` | Toggle italic / bold on selected text |
+| `F4` / `F5` | Insert table / footnote |
 | `F6` | Toggle Extend Selection mode |
 | `F7` | Spell check |
 | `F8` | Renumber the numbered list at the cursor |
-| `F10` / `Ctrl+Space` | Open the menu bar |
-| `Home` / `End` | Go to start / end of the current displayed row |
-| `Ctrl+Home` / `Ctrl+End` | Go to top / end of document |
-| `Alt+Up` / `Alt+Down` | Previous / next section; align the target ATX heading at the top of the editor |
-| `Tab` | Indent, or open a folded table or footnote |
+| `Ctrl+Home` / `Ctrl+End` | Top / end of document |
+| `Alt+Up` / `Alt+Down` | Previous / next ATX section |
+| `Tab` | Edit a folded table or footnote at the cursor |
 
-### Selection
+Carriage uses its own internal clipboard. It does not automatically exchange text with the desktop clipboard.
 
-The usual Shift-based selection shortcuts remain available when the terminal emulator passes them through. Because some terminal emulators reserve combinations such as `Ctrl+Shift+Left` and `Ctrl+Shift+Right`, Carriage also provides a portable Extend Selection mode.
+## Documentation
 
-Press `F6` to enter Extend Selection mode. While it is active:
-
-- `Left` / `Right` extends by character
-- `Up` / `Down` extends by displayed row
-- `Ctrl+Left` / `Ctrl+Right` extends by word
-- `Home` / `End` extends to the current displayed-row boundary
-- `Ctrl+Home` / `Ctrl+End` extends to the document boundary
-
-Press `F6` again to leave Extend Selection mode while keeping the selection. Structural Markdown displayed in the hanging gutter is not a cursor destination: keyboard and mouse navigation stop at the visible prose boundary. Backspace at that boundary can still remove the associated structure, such as a list marker, heading marker, or blockquote marker. With mouse support enabled, clicking in the left prose gutter moves the cursor to the beginning of that displayed row, while clicking in the right prose gutter moves it to the end. The scrollbar remains reserved for scrolling. Double-click selects a word and triple-click selects the current paragraph or list item.
-
-Status-bar visibility is controlled from **Edit > Toggle Status Bar** rather than by a dedicated keyboard shortcut. Transient notices temporarily take over the full status line. When the normal status bar is hidden, those notices still appear briefly in the same bottom-line position. The interface is intended to expose document operations through menus without requiring users to memorize a large command set.
+- `CARRIAGE_HELP.md` mirrors the practical built-in help.
+- `MARKDOWN_REFERENCE.md` mirrors the built-in Markdown syntax reference.
+- `CONFIGURATION.md` documents every current configuration setting.
 
 ## Design philosophy
 
-Carriage is deliberately not a full Markdown IDE.
+Carriage is deliberately not a full Markdown IDE. It is a writing tool built around a narrower idea: make ordinary Markdown prose comfortable to write in a terminal while keeping the document portable, predictable, and understandable outside the application.
 
-It is a writing tool built around a narrower idea: make ordinary Markdown prose comfortable to write in a terminal while keeping the document portable, predictable, and understandable outside the application.
+Where Carriage understands the structure, it can provide a better writing interface for it. Where it does not, it preserves the Markdown rather than guessing.
 
-Where Carriage understands the structure, it can provide a better writing interface for it. Where structure falls outside its supported editing and conversion model, Carriage avoids trying to repair it or turn it into something else.
-
-The file belongs to the writer, not the editor.
+**The file belongs to the writer, not the editor.**
 
 ## License
 

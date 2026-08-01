@@ -3,50 +3,58 @@
 Carriage - A prose-first Markdown editor for the terminal.
 
 Carriage is a focused full-screen Markdown editor built with prompt_toolkit. It
-is designed for drafting and revising prose while keeping the underlying source
-portable and readable outside the editor.
+is designed for drafting and revising prose while leaving the document as
+ordinary, portable Markdown that remains readable outside Carriage.
 
-Prose soft-wraps visually within a configurable writing width without inserting
-source line breaks. Markdown structure is presented without disturbing prose
-alignment: list and heading markers can hang into the left margin, blockquotes
-use a persistent display-only `>` gutter, and original-Markdown hard breaks
-made with two trailing spaces display a visible ↵ marker. Drafting forms such
-as `word---word` and `word -- word` are kept together when they fit on a visual
-line. These display conventions never alter the source.
+Ordinary paragraphs soft-wrap visually within a configurable prose width
+without inserting source line breaks. ATX heading and list markers can hang in
+the left margin, blockquotes use a display-only gutter, and Markdown hard
+breaks made with two trailing spaces can display a visible ↵ marker. These are
+editing conventions only and never add Carriage-specific markup to the file.
 
-Edit > Convert for Carriage converts valid original Markdown, plus supported
-pipe tables and footnotes, into Carriage's preferred source form. It converts
-Setext headings to ATX headings, corrects simple ordered-list numbering,
-normalizes straightforward underscore emphasis to Carriage's preferred
-asterisk form, and joins hard-wrapped prose into logical source lines while
-preserving line-sensitive structures and Markdown meaning. Export > Hard-Wrapped Markdown
-creates a separate hard-wrapped Markdown copy at the configured prose width
-without modifying the working file.
+Carriage deliberately handles a conservative Markdown subset. It can reformat
+ordinary paragraphs, simple flat lists, and simple single-level blockquotes.
+Fenced or indented code, YAML front matter, raw block HTML, reference
+definitions, complex containers, and unfamiliar or ambiguous structures are
+preserved rather than repaired or reinterpreted.
 
-Supported pipe tables fold into compact references such as
-`[[Table 1: Movement Rates]]` and are edited through a dedicated table editor.
-Simple Pandoc-style footnotes are also first-class objects: references display
-as sequential numbers, simple definitions fold out of the prose view, and Tab
-opens the associated footnote editor. Folded tables and footnotes behave as
-atomic objects in the prose editor; more complex footnotes remain ordinary
-Markdown source.
+Edit > Convert for Carriage normalizes valid Markdown where Carriage can do so
+safely. It converts supported Setext headings to ATX, renumbers straightforward
+ordered lists, changes straightforward underscore emphasis to asterisks, joins
+supported hard-wrapped prose into logical source lines, and folds supported pipe
+tables and simple footnotes into editing objects. Export > Hard-Wrapped Markdown
+creates a separate wrapped Markdown copy without modifying the working file.
+
+Supported pipe tables appear in the prose view as references such as
+`[[Table 1: Movement Rates]]`. Simple Pandoc-style footnote definitions fold out
+of the prose view and references display as sequential numbers. Tab opens the
+associated table or footnote editor. On Save and export, both object types are
+materialized as standard Markdown. Unsupported tables and complex footnotes
+remain ordinary source.
 
 Carriage includes selection-based italic and bold toggles, prose-aware word
-counting, lightweight Markdown highlighting, mouse support, document and section
+counting, lightweight visual highlighting, mouse support, document and section
 navigation, configurable terminal spell checking, and Pandoc export to PDF,
 DOCX, ODT, HTML, and custom formats.
 
-File operations include New, Open, Save, and Save As. Untitled documents use
-the first recognized ATX heading as the suggested `.md` filename when
-available. Unsaved working state is continuously protected in a private recovery journal
-without changing the Markdown file. The document on disk advances only through
-explicit Save or Save As operations, which use durable atomic replacement and
-protect against external file changes. Persistent settings, including prose width
-and scrollbar visibility, are stored in `config.toml` under the user's standard
-configuration directory and can be edited manually.
+The Markdown file changes only through explicit Save or Save As. Unsaved work
+is protected separately in a private recovery journal. Saves use durable atomic
+replacement, detect external changes, preserve supported file metadata, and
+refuse unsafe replacement of hard-linked files. Files larger than 8 MiB require
+confirmation before loading. Input line endings are normalized to LF.
+
+Untitled documents use the first recognized ATX heading for the suggested `.md`
+filename. The visible title before a subtitle colon is preferred, Markdown
+formatting is removed, unsafe filename characters are neutralized, and long
+suggestions are shortened at a useful word boundary.
+
+Persistent settings are read at startup from `config.toml` in the user's XDG
+configuration directory. Carriage has no Preferences dialog. Invalid settings
+are ignored with a warning while valid neighboring settings continue to load.
 
 Requires:
-  pip install 'prompt_toolkit>=3.0.52,<3.0.54'
+  Python 3.10 or newer
+  prompt_toolkit>=3.0.52,<3.0.54
 
 Optional:
   pandoc, for document export (or configure another Pandoc executable)
@@ -56,6 +64,7 @@ Usage:
   carriage [FILE]
   carriage --help
   carriage --version
+  carriage -- -filename-starting-with-a-dash.md
 """
 
 import argparse
@@ -85,7 +94,7 @@ from html.parser import HTMLParser
 from dataclasses import dataclass, field
 
 APP_NAME = "Carriage"
-APP_VERSION = "1.156"
+APP_VERSION = "1.157"
 
 
 def _build_command_line_parser():
@@ -11439,13 +11448,12 @@ def _show_help_reference(title, text):
 KEYBINDING_ROWS = [
     ("Ctrl+N", "New file"),
     ("Ctrl+O", "Open file"),
-    ("Ctrl+S", "Save"),
-    ("F9", "Save"),
+    ("Ctrl+S / F9", "Save"),
     ("Ctrl+Z", "Undo"),
     ("Ctrl+R", "Redo"),
-    ("Ctrl+X", "Cut"),
-    ("Ctrl+C", "Copy"),
-    ("Ctrl+V", "Paste"),
+    ("Ctrl+X", "Cut to Carriage clipboard"),
+    ("Ctrl+C", "Copy to Carriage clipboard"),
+    ("Ctrl+V", "Paste from Carriage clipboard"),
     ("Ctrl+Q", "Quit"),
     ("F1", "Carriage Help"),
     ("F2", "Toggle italic on selected text"),
@@ -11457,13 +11465,13 @@ KEYBINDING_ROWS = [
     ("F8", "Renumber numbered list"),
     ("F10", "Open menu bar"),
     ("Ctrl+Space", "Open menu bar"),
-    ("Home / End", "Go to start / end of displayed row"),
-    ("Ctrl+Home", "Go to top of document"),
-    ("Ctrl+End", "Go to end of document"),
-    ("Alt+Up", "Go to previous section; align heading at top"),
-    ("Alt+Down", "Go to next section; align heading at top"),
+    ("Home / End", "Start / end of displayed row"),
+    ("Ctrl+Home", "Top of document"),
+    ("Ctrl+End", "End of document"),
+    ("Alt+Up", "Previous section; align heading at top"),
+    ("Alt+Down", "Next section; align heading at top"),
     ("1-6", "Jump to File/Edit/Go/Export/Tools/Help"),
-    ("Tab", "Indent normally; on a table or footnote, open its editor"),
+    ("Tab", "Indent; on a folded table or footnote, edit it"),
     ("Esc", "Close menu or dialog"),
 ]
 
@@ -11486,88 +11494,90 @@ def _format_keybinding_rows(rows, width=62, command_width=12):
 
 
 def _format_help_notes(width=62):
-    """Keep only the practical reminders that do not fit in the cheatsheet."""
+    """Build practical guidance that complements the shortcut list."""
     paragraphs = [
         (
-            "Selection: F6 toggles Extend Selection mode. While it is active, "
-            "Left/Right selects by character, Up/Down by display row, "
-            "Ctrl+Left/Right by word, Home/End to the current displayed-row boundary, "
-            "and Ctrl+Home/End to the document boundary. Press F6 again to leave "
-            "Extend Selection while preserving the selection. The usual "
-            "Shift+Arrow, Shift+Home/End, Ctrl+Shift+Left/Right, and "
-            "Ctrl+Shift+Home/End shortcuts remain available when the terminal "
-            "passes them through. Structural Markdown displayed in the hanging gutter "
-            "is not a cursor destination; navigation stops at the visible prose boundary, "
-            "while Backspace there can still remove structure such as a list marker. "
-            "With mouse support enabled, clicking the left or right prose gutter moves "
-            "to the beginning or end of that displayed row; "
-            "double-click selects a word and triple-click selects the current paragraph "
-            "or list item. "
-            "Ctrl+X cuts, Ctrl+C copies, and Ctrl+V pastes. Cut/copy use "
-            "Carriage's internal clipboard."
+            "Selection: F6 toggles Extend Selection mode. While active, Left/Right "
+            "selects by character, Up/Down by displayed row, Ctrl+Left/Right by word, "
+            "Home/End to the displayed-row boundary, and Ctrl+Home/End to the document "
+            "boundary. Press F6 again to leave the mode while keeping the selection. "
+            "The usual Shift combinations remain available when the terminal passes "
+            "them through. Double-click selects a word and triple-click selects the "
+            "current paragraph or list item. Structural Markdown shown in the hanging "
+            "gutter is not a cursor destination."
         ),
         (
-            "Emphasis: Select text and press F2 for italic or F3 for bold. The two "
-            "attributes toggle independently, so applying both produces bold italic. "
-            "Carriage-generated emphasis uses asterisks; straightforward existing "
-            "underscore emphasis is respected during ordinary toggling. Leading and "
-            "trailing selection whitespace remains outside the markers. If Carriage "
-            "cannot identify a safe toggle, the source and selection are left unchanged "
-            "and a brief explanation appears on the status line."
+            "Clipboard: Ctrl+X, Ctrl+C, and Ctrl+V use Carriage's internal clipboard. "
+            "They do not automatically exchange text with the desktop clipboard."
         ),
         (
-            "Wrapping: Carriage soft-wraps visually at the configured prose width "
-            "without changing source line breaks. Edit > Convert for Carriage is a "
-            "document-wide normalization command: it converts Setext headings to ATX, "
-            "renumbers simple ordered lists from their existing first number, normalizes "
-            "straightforward underscore emphasis to Carriage's preferred asterisk form, "
-            "and joins hard-wrapped prose into logical source lines while preserving supported "
-            "Markdown structure. Original Markdown hard breaks use two trailing spaces "
-            "and display as ↵ when the hard-break marker is enabled; the marker is "
-            "visual only. Export > Hard-Wrapped Markdown writes a separate Markdown "
-            "copy at the configured prose width."
+            "Emphasis: Select text and press F2 for italic or F3 for bold. The attributes "
+            "toggle independently, so both can produce bold italic. Carriage writes "
+            "asterisks and leaves leading or trailing selection whitespace outside the "
+            "markers. If a safe change cannot be identified, the source is left alone "
+            "and the reason appears on the status line."
         ),
         (
-            "Renumber List: F8 or Edit > Renumber List renumbers only the supported "
-            "numbered list containing the cursor. The first item's number is preserved "
-            "and the following items are made consecutive; surrounding Markdown and "
-            "prose are left unchanged."
+            "Wrapping and conversion: Ordinary prose soft-wraps at the configured width "
+            "without changing source line breaks. Edit > Convert for Carriage converts "
+            "supported Setext headings to ATX, renumbers straightforward ordered lists, "
+            "normalizes straightforward underscore emphasis to asterisks, joins "
+            "supported hard-wrapped prose, and recognizes supported tables and footnotes. "
+            "Ambiguous or line-sensitive Markdown is preserved. Export > Hard-Wrapped "
+            "Markdown writes a separate wrapped copy."
         ),
         (
-            "Folded objects: Supported tables and simple footnote definitions appear "
-            "as compact objects while editing, but save and export as ordinary Markdown. "
-            "Use Tab or the Tools menu to edit them rather than changing the folded "
-            "labels directly."
+            "Hard breaks: Two trailing spaces create a Markdown hard line break. When "
+            "enabled, Carriage displays that break as ↵. The marker is visual only."
         ),
         (
-            "Configuration: Persistent settings are read at startup from "
+            "Renumber List: F8 or Edit > Renumber List changes only the supported numbered "
+            "list containing the cursor. It preserves the first item's number and makes "
+            "the following items consecutive."
+        ),
+        (
+            "Saving and recovery: The Markdown file advances only through explicit Save "
+            "or Save As. Carriage protects unsaved work separately in a private recovery "
+            "journal, normally two seconds after editing becomes idle and at least every "
+            "ten seconds during sustained editing. Saves use durable atomic replacement "
+            "and detect external file changes. After an abnormal exit, Carriage offers "
+            "to restore or discard recovered work. Recovery is not a substitute for "
+            "backups or version control."
+        ),
+        (
+            "Opening and naming: Carriage reads UTF-8 Markdown, normalizes line endings to "
+            "LF, and asks before loading files larger than 8 MiB. Save As suggests a name "
+            "from the first recognized ATX heading. It uses visible heading text, stops "
+            "before a subtitle colon, removes Markdown formatting, and shortens a long "
+            "title only at a useful word boundary."
+        ),
+        (
+            "Tables: F4 or Tools > Insert Table creates a basic table with 2-6 columns and "
+            "1-20 data rows. Arrow keys navigate cells; Enter edits and commits a cell. "
+            "Shift+Tab from the first cell focuses the optional title. R and C open row "
+            "and column commands in navigation mode. Imported wider tables are preserved "
+            "as Markdown but cannot be opened in the basic table editor."
+        ),
+        (
+            "Footnotes: F5 or Tools > Insert Footnote creates a standard inline reference "
+            "and folded single-paragraph definition. References display as [1], [2], and "
+            "so on. Tab opens the note editor. Adjacent references remain separate atomic "
+            "objects. Complex footnotes remain ordinary source."
+        ),
+        (
+            "Spell check and export: Spell check works on a saved file and offers to save "
+            "unsaved changes first. The file is reloaded only when the configured checker "
+            "exits successfully. Pandoc exports run without blocking editing; only one can "
+            "run at a time. Built-in targets are PDF, DOCX, ODT, and HTML, plus a custom "
+            "Pandoc command. Hard-wrapped Markdown does not require Pandoc."
+        ),
+        (
+            "Configuration: Settings are read at startup from "
             "$XDG_CONFIG_HOME/carriage/config.toml, or ~/.config/carriage/config.toml "
-            "when XDG_CONFIG_HOME is not set. Prose width and scrollbar visibility "
-            "are configured there along with the smaller set of interface and tool "
-            "settings. Carriage does not provide a Preferences dialog."
-        ),
-        (
-            "Saving and recovery: Carriage continuously protects unsaved working "
-            "state in a private recovery journal without changing the Markdown file. "
-            "The journal is normally updated two seconds after editing becomes idle "
-            "and at least every ten seconds during sustained editing. Ctrl+S, F9, "
-            "or File > Save explicitly advances the Markdown file and clears the "
-            "protected unsaved state. After an abnormal exit, Carriage offers to "
-            "restore or discard recovered work."
-        ),
-        (
-            "Tables: F4 or Tools > Insert Table creates a new table. Arrow keys navigate "
-            "table cells. Enter edits the selected cell; "
-            "Enter again commits it. Shift+Tab from the first cell focuses the title "
-            "field; Tab or Enter returns to the grid. In navigation mode, R opens row "
-            "commands and C opens column commands. Ctrl-based editing shortcuts retain "
-            "their normal meanings inside editable text fields."
-        ),
-        (
-            "Footnotes: F5 or Tools > Insert Footnote creates a standard Markdown reference "
-            "and a folded single-paragraph definition. References display as [1], [2], "
-            "and so on; Tab opens a simple note editor. Complex footnotes remain "
-            "ordinary source."
+            "when XDG_CONFIG_HOME is unset. The file controls prose width, scrollbar, "
+            "startup status bar, mouse support, hard-break marker, Pandoc executable, and "
+            "spell-check command. Carriage has no Preferences dialog. Invalid entries are "
+            "reported and ignored without discarding valid neighboring settings."
         ),
     ]
     return "\n\n".join(
@@ -11590,21 +11600,24 @@ HELP_TEXT = (
 ABOUT_PARAGRAPHS = [
     f"{APP_NAME} v{APP_VERSION}",
     (
-        "Carriage is a prose-first Markdown editor inspired by the focused "
-        "writing experience of a typewriter. It is designed to keep attention "
-        "on sentences, paragraphs, and sections rather than on Markdown syntax "
-        "or source-code mechanics."
+        "Carriage is a prose-first Markdown editor for the terminal. It is "
+        "designed to keep attention on sentences, paragraphs, and sections "
+        "while leaving the document as ordinary, portable Markdown."
     ),
     (
-        "Markdown soft-wraps visually inside the configured prose width without "
-        "changing ordinary source line breaks. Hard wrapping is available only as "
-        "a separate Markdown export. Supported tables and simple footnotes are "
-        "folded into compact editing objects in the prose view, while the file "
-        "on disk remains ordinary, portable Markdown."
+        "Prose soft-wraps visually inside the configured writing width. "
+        "Supported tables and simple footnotes become compact editing objects, "
+        "while Save and export always materialize standard Markdown. Structural "
+        "or ambiguous source is preserved rather than repaired speculatively."
+    ),
+    (
+        "The Markdown file changes only through explicit Save or Save As. "
+        "Unsaved work is protected separately by a private recovery journal, "
+        "and saves use durable atomic replacement with external-change checks."
     ),
     (
         "The guiding principle is simple: help with writing where Carriage can "
-        "do so confidently, and preserve the author's text when it cannot."
+        "do so confidently, and preserve the writer's text when it cannot."
     ),
 ]
 
@@ -11630,11 +11643,20 @@ ABOUT_TEXT = _wrap_about_text()
 def _build_markdown_help(width=62):
     """Build Carriage's concise prose-oriented Markdown reference."""
     rule = "─" * width
+    intro = (
+        "This is a Markdown syntax reference, not a list of everything Carriage "
+        "actively reformats. Carriage may normalize ordinary prose, simple flat "
+        "lists, and simple single-level blockquotes. Code, YAML, raw HTML, complex "
+        "containers, reference definitions, and ambiguous structures are preserved. "
+        "Highlighting and folded-object labels are visual only."
+    )
     sections = [
         (
             "Headings",
             [
                 "    # H1    ## H2    ...    ###### H6",
+                "ATX headings are Carriage's preferred form. Convert for Carriage can",
+                "normalize supported Setext headings to ATX.",
             ],
         ),
         (
@@ -11644,7 +11666,8 @@ def _build_markdown_help(width=62):
                 "    **bold**",
                 "    ***bold italic***",
                 "F2 toggles italic and F3 toggles bold on selected text.",
-                "Carriage writes asterisks; Convert for Carriage can normalize straightforward underscore emphasis.",
+                "Carriage writes asterisks; conversion can normalize straightforward",
+                "underscore emphasis.",
             ],
         ),
         (
@@ -11652,12 +11675,14 @@ def _build_markdown_help(width=62):
             [
                 "    - unordered item",
                 "    1. ordered item",
+                "Carriage actively reformats only straightforward flat prose lists.",
             ],
         ),
         (
             "Blockquotes",
             [
                 "    > quoted text",
+                "Carriage actively reformats only simple single-level prose blockquotes.",
             ],
         ),
         (
@@ -11668,16 +11693,25 @@ def _build_markdown_help(width=62):
             ],
         ),
         (
-            "Links",
+            "Links and images",
             [
                 "    [link text](https://example.com)",
+                "    ![alt text](image.png)",
+            ],
+        ),
+        (
+            "Code",
+            [
+                "    `inline code`",
+                "Use matching triple backticks or tildes for a fenced code block.",
+                "Carriage preserves code rather than reflowing it.",
             ],
         ),
         (
             "Hard line breaks",
             [
-                "End a line with two spaces to force a line break. Carriage displays",
-                "that break as ↵; the marker is visual only.",
+                "End a line with two spaces to force a Markdown line break.",
+                "Carriage can display that break as ↵; the marker is visual only.",
             ],
         ),
         (
@@ -11686,25 +11720,33 @@ def _build_markdown_help(width=62):
                 "    Text with a note.[^id]",
                 "    [^id]: Footnote text",
                 "F5 or Tools > Insert Footnote creates a simple standard footnote.",
-                "Carriage folds single-paragraph definitions and displays",
-                "references sequentially as [1], [2], and so on.",
-                "Use Tools > Delete Footnote at Cursor to remove a folded",
-                "footnote and all of its inline references safely.",
+                "Single-paragraph definitions fold out of the prose view; references",
+                "display sequentially as [1], [2], and so on. Complex definitions",
+                "remain ordinary source.",
             ],
         ),
         (
             "Tables",
             [
-                "Use F4 or Tools > Insert Table to create a table, or edit a folded",
-                "table object with Tab or Tools > Edit Table at Cursor.",
-                "Use Tools > Delete Table at Cursor to remove one safely.",
-                "Optional titles use Pandoc table captions and appear in the",
-                "prose-view label as [[Table N: Title]].",
+                "F4 or Tools > Insert Table creates a basic pipe table. Tab opens a",
+                "folded table at the cursor. Optional titles use Pandoc captions and",
+                "appear as [[Table N: Title]] in the prose view.",
+                "The basic editor supports 2-6 columns. Wider imported tables are",
+                "preserved as Markdown but are not editable in that dialog.",
             ],
         ),
     ]
 
     rendered = ["Markdown syntax reference", rule]
+    rendered.extend(
+        textwrap.wrap(
+            intro,
+            width=width,
+            break_long_words=False,
+            break_on_hyphens=False,
+        )
+    )
+    rendered.append(rule)
     for index, (heading, body_lines) in enumerate(sections):
         rendered.append(heading)
         for line in body_lines:
