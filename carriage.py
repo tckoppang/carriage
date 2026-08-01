@@ -94,7 +94,7 @@ from html.parser import HTMLParser
 from dataclasses import dataclass, field
 
 APP_NAME = "Carriage"
-APP_VERSION = "1.157"
+APP_VERSION = "1.158"
 
 
 def _build_command_line_parser():
@@ -3314,6 +3314,42 @@ class SingleLineInput:
         return self.window
 
 
+def _rebalance_wrapped_lines(lines, width):
+    """Reduce very short final lines in dialog/help wrapping."""
+    if len(lines) < 2:
+        return lines
+    balanced = list(lines)
+    min_last = max(12, int(width * 0.35))
+    while len(balanced) >= 2:
+        last = balanced[-1]
+        prev = balanced[-2]
+        if len(last.strip()) >= min_last:
+            break
+        prev_words = prev.split()
+        if len(prev_words) < 2:
+            break
+        candidate_prev = " ".join(prev_words[:-1])
+        candidate_last = prev_words[-1] + (" " + last if last else "")
+        if len(candidate_prev) > width or len(candidate_last) > width:
+            break
+        balanced[-2] = candidate_prev
+        balanced[-1] = candidate_last
+    return balanced
+
+
+def _wrap_dialog_paragraph(text, width=64, initial_indent="", subsequent_indent=""):
+    """Wrap one dialog/help paragraph with light widow control."""
+    wrapper = textwrap.TextWrapper(
+        width=width,
+        initial_indent=initial_indent,
+        subsequent_indent=subsequent_indent,
+        break_long_words=False,
+        break_on_hyphens=False,
+    )
+    wrapped = wrapper.wrap(text)
+    return _rebalance_wrapped_lines(wrapped or [""], width)
+
+
 def _wrap_dialog_prose(text, width=64):
     """Word-wrap dialog prose while preserving intentional line breaks."""
     rendered = []
@@ -3321,13 +3357,7 @@ def _wrap_dialog_prose(text, width=64):
         if not line:
             rendered.append("")
             continue
-        wrapped = textwrap.wrap(
-            line,
-            width=width,
-            break_long_words=False,
-            break_on_hyphens=False,
-        )
-        rendered.extend(wrapped or [""])
+        rendered.extend(_wrap_dialog_paragraph(line, width=width))
     return "\n".join(rendered)
 
 
@@ -11441,7 +11471,7 @@ def _show_help_reference(title, text):
         title=title,
         body=help_body,
         buttons=[ok_button],
-        width=D(preferred=70),
+        width=D(preferred=76),
     )
     show_dialog(dialog, focus=help_body)
 
@@ -11581,12 +11611,7 @@ def _format_help_notes(width=62):
         ),
     ]
     return "\n\n".join(
-        textwrap.fill(
-            paragraph,
-            width=width,
-            break_long_words=False,
-            break_on_hyphens=False,
-        )
+        "\n".join(_wrap_dialog_paragraph(paragraph, width=width))
         for paragraph in paragraphs
     )
 
@@ -11738,29 +11763,23 @@ def _build_markdown_help(width=62):
     ]
 
     rendered = ["Markdown syntax reference", rule]
-    rendered.extend(
-        textwrap.wrap(
-            intro,
-            width=width,
-            break_long_words=False,
-            break_on_hyphens=False,
-        )
-    )
+    rendered.extend(_wrap_dialog_paragraph(intro, width=width))
     rendered.append(rule)
     for index, (heading, body_lines) in enumerate(sections):
         rendered.append(heading)
+        prose_parts = []
+        def flush_prose():
+            nonlocal prose_parts
+            if prose_parts:
+                rendered.extend(_wrap_dialog_paragraph(" ".join(prose_parts), width=width))
+                prose_parts = []
         for line in body_lines:
             if line.startswith("    "):
+                flush_prose()
                 rendered.append(line)
             else:
-                rendered.extend(
-                    textwrap.wrap(
-                        line,
-                        width=width,
-                        break_long_words=False,
-                        break_on_hyphens=False,
-                    ) or [""]
-                )
+                prose_parts.append(line.strip())
+        flush_prose()
         if index != len(sections) - 1:
             rendered.append(rule)
     return "\n".join(rendered)
