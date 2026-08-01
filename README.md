@@ -2,7 +2,7 @@
   <img src="assets/carriage-title.png" width="1200" alt="Carriage: A prose-first Markdown editor for the terminal">
 </p>
 
-> **Carriage is beta software.** It has received extensive automated testing, but it has not yet received the breadth of real-world use expected of a mature text editor. Keep important work backed up or under version control, and do not rely on Carriage as the only copy of a document.
+> **Carriage is beta software.** It has received extensive development testing, but it has not yet received the breadth of real-world use expected of a mature text editor. Keep important work backed up or under version control, and do not rely on Carriage as the only copy of a document.
 
 <p align="center">
   <img src="assets/carriage-screenshot.png" width="1200" alt="Carriage editing a Markdown document in a terminal">
@@ -11,6 +11,29 @@
 Carriage is built around writing documents rather than editing source code. It gives ordinary prose a focused, configurable writing area, keeps Markdown structure out of the way where practical, and leaves the file on disk as ordinary, portable Markdown.
 
 The goal is not to hide Markdown or replace it with a proprietary document format. Carriage is intended to make Markdown feel more like a writing environment while preserving the advantages of plain text.
+
+## Quick start
+
+Carriage requires Python 3.10 or newer. Clone the repository, create a virtual
+environment, install the audited dependency range, and run the application:
+
+```bash
+git clone https://github.com/tckoppang/carriage.git
+cd carriage
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+python carriage.py
+```
+
+Open a document by passing its path:
+
+```bash
+python carriage.py document.md
+```
+
+See [Installation](#installation) for command-line options, optional tools, and
+instructions for creating a permanent `carriage` command.
 
 ## Writing first
 
@@ -176,15 +199,9 @@ Optional external tools provide additional features:
 
 Carriage is a terminal application. It does not require GTK, Qt, or another graphical toolkit.
 
-## Installation from the development script
+## Installation
 
-Carriage is currently distributed during development as a versioned Python file such as `carriage_v1.158.py`.
-
-Clone or download the repository and open a terminal in its directory. Create a stable `carriage.py` symlink so aliases and commands do not need to change with each development version:
-
-```bash
-ln -s carriage_v1.158.py carriage.py
-```
+Clone or download the repository and open a terminal in its directory.
 
 Create and activate a virtual environment:
 
@@ -193,10 +210,10 @@ python3 -m venv .venv
 source .venv/bin/activate
 ```
 
-Install the audited dependency range:
+Install the audited dependency range from the included requirements file:
 
 ```bash
-python -m pip install 'prompt_toolkit>=3.0.52,<3.0.54'
+python -m pip install -r requirements.txt
 ```
 
 Run Carriage:
@@ -222,12 +239,6 @@ Use `--` before a filename beginning with a dash:
 
 ```bash
 python carriage.py -- -draft.md
-```
-
-When installing a later development version, update the stable symlink:
-
-```bash
-ln -sf carriage_vY.XXX.py carriage.py
 ```
 
 ### Fedora packages
@@ -291,9 +302,10 @@ Carriage uses its own internal clipboard. It does not automatically exchange tex
 
 ## Documentation
 
-- `CARRIAGE_HELP.md` mirrors the practical built-in help.
-- `MARKDOWN_REFERENCE.md` mirrors the built-in Markdown syntax reference.
-- `CONFIGURATION.md` documents every current configuration setting.
+- [Carriage Help](CARRIAGE_HELP.md) mirrors the practical built-in help.
+- [Markdown Reference](MARKDOWN_REFERENCE.md) mirrors the built-in Markdown syntax reference.
+- [Configuration Reference](CONFIGURATION.md) documents every current configuration setting.
+- [Keyboard Cheat Sheet](carriage_keyboard_cheat_sheet.pdf) is a printable one-page PDF.
 
 ## Design philosophy
 
@@ -305,4 +317,4 @@ Where Carriage understands the structure, it can provide a better writing interf
 
 ## License
 
-Carriage is licensed under the MIT License. See `LICENSE` for details.
+Carriage is licensed under the MIT License. See [LICENSE](LICENSE) for details.
