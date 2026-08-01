@@ -60,12 +60,14 @@ Usage:
 
 import argparse
 import asyncio
+import codecs
 import copy
 import errno
 from functools import lru_cache
 from bisect import bisect_right
 import hashlib
 import json
+import inspect
 import os
 import re
 import shlex
@@ -82,8 +84,71 @@ from html import unescape as _html_unescape
 from html.parser import HTMLParser
 from dataclasses import dataclass, field
 
+APP_NAME = "Carriage"
+APP_VERSION = "1.156"
+
+
+def _build_command_line_parser():
+    """Build Carriage's intentionally small command-line parser."""
+    parser = argparse.ArgumentParser(
+        prog="carriage",
+        description="A prose-first Markdown editor for the terminal.",
+        epilog=(
+            "With no FILE, Carriage opens an untitled document. "
+            "If FILE does not exist, it becomes the path used on first save. "
+            "Use -- before a filename beginning with '-'."
+        ),
+    )
+    parser.add_argument(
+        "file",
+        nargs="?",
+        metavar="FILE",
+        help="Markdown file to open, or path to use for a new document",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {APP_VERSION}",
+    )
+    return parser
+
+
+def _parse_command_line(argv=None):
+    return _build_command_line_parser().parse_args(argv)
+
+
+def _is_carriage_command_invocation():
+    """Return whether this import belongs to Carriage's executable command.
+
+    A packaging console script imports ``carriage:main`` before it can call
+    ``main``. Detect that import by the installed command name so metadata
+    options can exit before prompt_toolkit is imported, while ordinary library
+    or test imports retain normal module semantics.
+    """
+    if __name__ == "__main__":
+        return True
+    command = os.path.basename(sys.argv[0] or "").lower()
+    return command in {"carriage", "carriage.exe"}
+
+
+def _exit_for_early_cli_metadata():
+    """Handle package and script --help/--version before prompt_toolkit import."""
+    if not _is_carriage_command_invocation():
+        return
+    arguments = sys.argv[1:]
+    if any(argument in {"-h", "--help", "--version"} for argument in arguments):
+        _parse_command_line(arguments)
+
+
+# Console entry points import their target module before calling it. Handle
+# metadata commands now, using only the Python standard library, so ``carriage
+# --help`` and ``carriage --version`` remain usable even when prompt_toolkit is
+# missing or outside the supported range.
+_exit_for_early_cli_metadata()
+
+
 import prompt_toolkit
-from prompt_toolkit.application import Application
+from prompt_toolkit.application import Application, in_terminal
 from prompt_toolkit.cursor_shapes import CursorShape, SimpleCursorShapeConfig
 from prompt_toolkit.output.color_depth import ColorDepth
 from prompt_toolkit.application.current import get_app
@@ -103,6 +168,7 @@ from prompt_toolkit.layout.containers import (
     ConditionalContainer,
     Window,
     WindowAlign,
+    WindowRenderInfo,
     VSplit,
 )
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
@@ -128,8 +194,6 @@ from prompt_toolkit.widgets import (
     TextArea,
 )
 
-APP_NAME = "Carriage"
-APP_VERSION = "1.140"
 
 DEFAULT_WRAP_COLUMN = 80
 DEFAULT_SCROLLBAR_VISIBLE = True
@@ -169,6 +233,75 @@ def _check_prompt_toolkit_compatibility():
             "Carriage requires "
             f"{PROMPT_TOOLKIT_REQUIREMENT}; found prompt_toolkit {installed_text}."
         )
+
+
+def _window_render_info_contract_missing():
+    """Return private WindowRenderInfo constructor fields Carriage requires."""
+    try:
+        parameters = inspect.signature(WindowRenderInfo.__init__).parameters
+    except (TypeError, ValueError):
+        return ["WindowRenderInfo constructor signature"]
+    required = {
+        "visible_line_to_row_col",
+        "rowcol_to_yx",
+        "x_offset",
+        "y_offset",
+    }
+    return sorted(required - set(parameters))
+
+
+def _check_prompt_toolkit_preconstruction_contract():
+    """Validate the audited prompt_toolkit contract before building the UI.
+
+    Carriage promotes and customizes prompt_toolkit widgets at module load. A
+    version or private-contract failure therefore has to be detected before the
+    first TextArea is constructed, not later in ``main()`` after those private
+    surfaces have already been touched.
+    """
+    _check_prompt_toolkit_compatibility()
+
+    # Probe the same instance-only state Carriage relies on without creating a
+    # full TextArea, Layout, or Application. These constructors are terminal-
+    # independent and make distro-patched builds fail at a controlled boundary.
+    probe_buffer = Buffer()
+    probe_control = BufferControl(buffer=probe_buffer)
+    probe_window = Window(content=probe_control)
+    required = [
+        (probe_buffer, "_undo_stack", "Buffer undo stack"),
+        (probe_buffer, "_redo_stack", "Buffer redo stack"),
+        (probe_window, "_write_to_screen_at_index", "Window screen writer"),
+        (probe_window, "_scroll", "Window scrolling hook"),
+        (probe_window, "_get_margin_width", "Window margin geometry"),
+        (probe_window, "_mouse_handler", "Window mouse fallback"),
+        (probe_control, "_last_click_timestamp", "BufferControl click state"),
+        (
+            probe_control,
+            "_last_get_processed_line",
+            "BufferControl processed-line cache",
+        ),
+    ]
+    missing = [label for obj, name, label in required if not hasattr(obj, name)]
+    missing.extend(
+        f"WindowRenderInfo.{name}" for name in _window_render_info_contract_missing()
+    )
+    if missing:
+        details = ", ".join(missing)
+        raise RuntimeError(
+            "This prompt_toolkit build is missing private interfaces required "
+            f"by Carriage: {details}. Reinstall {PROMPT_TOOLKIT_REQUIREMENT}."
+        )
+
+
+# Reject incompatible/private-API builds before the first prompt_toolkit widget
+# is constructed. Script and installed-console launches receive one controlled
+# stderr line; ordinary imports retain a RuntimeError for their caller.
+try:
+    _check_prompt_toolkit_preconstruction_contract()
+except RuntimeError as _prompt_toolkit_startup_error:
+    if _is_carriage_command_invocation():
+        print(f"carriage: {_prompt_toolkit_startup_error}", file=sys.stderr)
+        raise SystemExit(2)
+    raise
 
 
 @lru_cache(maxsize=4096)
@@ -519,6 +652,8 @@ HARD_BREAK_DISPLAY_CHAR = "↵"
 WORKING_STATE_IDLE_SECONDS = 2.0
 WORKING_STATE_MAX_LATENCY_SECONDS = 10.0
 WORKING_STATE_POLL_SECONDS = 0.25
+LARGE_FILE_WARNING_BYTES = 8 * 1024 * 1024
+FILE_READ_CHUNK_BYTES = 1024 * 1024
 RECOVERY_FORMAT_VERSION = 4
 TABLE_SENTINEL = "\u2063"  # zero-width INVISIBLE SEPARATOR; never written to disk
 FOOTNOTE_SENTINEL = "\u2064"  # zero-width INVISIBLE PLUS; never written to disk
@@ -820,8 +955,17 @@ def _inline_footnote_literal_ranges(full_text):
 
         # The top stack entry is the same balanced opening label that the old
         # backward depth scan would find, but it is obtained in O(1).
-        bracket_stack.pop()
+        label_start = bracket_stack.pop()
         next_index = i + 1
+        completed_label_is_footnote = (
+            label_start + 2 < i
+            and full_text[label_start + 1] == "^"
+            and not (
+                label_start > 0
+                and full_text[label_start - 1] == "!"
+                and label_start - 1 not in escaped_positions
+            )
+        )
 
         if next_index < n and full_text[next_index] == "(":
             destination_end = _scan_inline_link_destination(
@@ -836,7 +980,8 @@ def _inline_footnote_literal_ranges(full_text):
         while reference_start < n and full_text[reference_start] in " \t":
             reference_start += 1
         if (
-            reference_start < n
+            not completed_label_is_footnote
+            and reference_start < n
             and full_text[reference_start] == "["
             and reference_start not in escaped_positions
         ):
@@ -945,6 +1090,11 @@ class TableEditorSession:
     grid_window: object | None = None
     dialog_float: object | None = None
     editing: bool = False
+    # Display-only table geometry/wrapping cache. The key includes the current
+    # working cell contents and terminal width, so both height measurement and
+    # fragment generation consume one computed layout without stale edits.
+    grid_layout_key: object | None = None
+    grid_layout_cache: object | None = None
     # Which edge of the selected row should be kept visible in the table
     # viewport. Moving downward anchors the row's bottom; moving upward anchors
     # its top. This matters for prose-heavy rows that span several screen lines.
@@ -991,9 +1141,6 @@ class EditorState:
         # written by Carriage. A save must still see this same version before
         # it is allowed to replace the file.
         self.disk_snapshot = None
-        # True while the configured interactive spell checker has the file open
-        # on disk. The checker works only on an explicitly saved source file.
-        self.external_process_running = False
         # Pandoc exports run in a worker thread so the editor remains responsive.
         # Only one Pandoc export may own the destination/export state at a time.
         self.pandoc_export_running = False
@@ -1186,20 +1333,6 @@ class CarriageBuffer(Buffer):
         return super().paste_clipboard_data(data, paste_mode=paste_mode, count=count)
 
 
-def _set_committed_table(table_number, table):
-    """Replace one committed table using copy-on-write for undo snapshots."""
-    updated = dict(state.tables)
-    updated[table_number] = table
-    state.tables = updated
-    _working_state_changed(immediate=True)
-
-
-def _set_committed_footnote(identifier, note):
-    """Replace one committed footnote using copy-on-write for undo snapshots."""
-    updated = dict(state.footnotes)
-    updated[identifier] = note
-    state.footnotes = updated
-    _working_state_changed(immediate=True)
 
 
 def _prose_layout_widths(columns):
@@ -1562,11 +1695,6 @@ class ScrollableWindow(Window):
         self._height_cache_heights = heights
         self._height_cache_prefix = prefix
         return heights, prefix
-
-    def _rendered_heights(self, ui_content=None, width=None):
-        """Return cached rendered-screen heights for all logical lines."""
-        heights, _prefix = self._rendered_height_geometry(ui_content, width)
-        return heights
 
     def _absolute_rendered_scroll(self, heights=None, prefix=None):
         """Return the current viewport top as an absolute rendered-row index."""
@@ -2997,13 +3125,7 @@ text_area.window.on_scrollbar_interact = _on_scrollbar_interact
 
 
 def _check_prompt_toolkit_private_contract():
-    """Verify the audited private prompt_toolkit surfaces Carriage relies on.
-
-    The narrow version window is the primary compatibility boundary. This
-    structural check catches distro patches or unusual builds that report an
-    accepted version while removing one of the implementation details Carriage
-    intentionally uses. It runs before Application construction.
-    """
+    """Recheck the promoted main-editor instances before Application creation."""
     required = [
         (text_area.buffer, "_undo_stack", "Buffer undo stack"),
         (text_area.buffer, "_redo_stack", "Buffer redo stack"),
@@ -3012,9 +3134,16 @@ def _check_prompt_toolkit_private_contract():
         (text_area.window, "_get_margin_width", "Window margin geometry"),
         (text_area.window, "_mouse_handler", "Window mouse fallback"),
         (text_area.control, "_last_click_timestamp", "BufferControl click state"),
-        (text_area.control, "_last_get_processed_line", "BufferControl processed-line cache"),
+        (
+            text_area.control,
+            "_last_get_processed_line",
+            "BufferControl processed-line cache",
+        ),
     ]
     missing = [label for obj, name, label in required if not hasattr(obj, name)]
+    missing.extend(
+        f"WindowRenderInfo.{name}" for name in _window_render_info_contract_missing()
+    )
     if missing:
         details = ", ".join(missing)
         raise RuntimeError(
@@ -3408,13 +3537,44 @@ def _disk_snapshot(path):
     return ("file", digest.hexdigest())
 
 
-def _read_utf8_file_with_snapshot(path):
+class _LargeFileConfirmationRequired(Exception):
+    """Raised before loading an unusually large regular file into memory."""
+
+    def __init__(self, size_bytes):
+        self.size_bytes = max(0, int(size_bytes))
+        super().__init__(f"Large file confirmation required: {self.size_bytes} bytes")
+
+
+def _format_file_size(size_bytes):
+    """Return a compact human-readable binary file size."""
+    size = max(0, int(size_bytes))
+    if size < 1024:
+        return f"{size} byte{'s' if size != 1 else ''}"
+    value = float(size)
+    for unit in ("KiB", "MiB", "GiB", "TiB"):
+        value /= 1024.0
+        if value < 1024.0 or unit == "TiB":
+            return f"{value:.1f} {unit}"
+    return f"{size} bytes"
+
+
+def _large_file_prompt_text(path, size_bytes):
+    """Return the warning shown before an unusually large file is loaded."""
+    return (
+        f'The file "{os.path.basename(path) or path}" is {_format_file_size(size_bytes)}. '
+        "Carriage is designed for prose documents, and a file this large can "
+        "use substantial memory and may respond slowly.\n\nOpen it anyway?"
+    )
+
+
+def _read_utf8_file_with_snapshot(path, *, allow_large=False):
     """Read one regular UTF-8 file and fingerprint exactly the bytes read.
 
     Open the path nonblocking where the platform supports it, then validate
-    the opened descriptor with fstat() before reading. This closes the unsafe
-    gap where a FIFO, device, directory, or a path swapped to one of those
-    could otherwise block or stream unbounded data during File > Open.
+    the opened descriptor with fstat() before reading. Files above Carriage's
+    generous prose-oriented warning threshold require explicit approval before
+    their contents are allocated. Reading itself is chunked and rechecks the
+    threshold so a file that grows after open cannot bypass the warning.
     """
     target_path = _canonical_path(path)
     flags = os.O_RDONLY
@@ -3426,19 +3586,35 @@ def _read_utf8_file_with_snapshot(path):
         file_stat = os.fstat(fd)
         if not stat.S_ISREG(file_stat.st_mode):
             raise OSError(f"Not a regular file: {target_path}")
+        if not allow_large and file_stat.st_size > LARGE_FILE_WARNING_BYTES:
+            raise _LargeFileConfirmationRequired(file_stat.st_size)
+
+        digest = hashlib.sha256()
+        decoder = codecs.getincrementaldecoder("utf-8")()
+        decoded_parts = []
+        total_bytes = 0
 
         with os.fdopen(fd, "rb") as f:
             fd = None  # fdopen owns and closes the descriptor now.
-            raw = f.read()
+            while True:
+                chunk = f.read(FILE_READ_CHUNK_BYTES)
+                if not chunk:
+                    break
+                total_bytes += len(chunk)
+                if not allow_large and total_bytes > LARGE_FILE_WARNING_BYTES:
+                    raise _LargeFileConfirmationRequired(total_bytes)
+                digest.update(chunk)
+                decoded_parts.append(decoder.decode(chunk))
+            decoded_parts.append(decoder.decode(b"", final=True))
     finally:
         if fd is not None:
             os.close(fd)
 
-    content = raw.decode("utf-8")
+    content = "".join(decoded_parts)
     # Match the universal-newline behavior Carriage used before v1.03 while
     # keeping the fingerprint tied to the exact source bytes.
     content = content.replace("\r\n", "\n").replace("\r", "\n")
-    return content, _snapshot_bytes(raw)
+    return content, ("file", digest.hexdigest())
 
 
 def _path_is_read_only(path):
@@ -3686,21 +3862,73 @@ def _table_recovery_record(table):
     }
 
 
+def _recovery_string_list(value, label, *, allow_none=False):
+    """Return a validated recovery list of strings.
+
+    Recovery data is untrusted crash-state input.  Keep every schema failure a
+    controlled ValueError so discovery/restoration can skip a corrupt journal
+    without allowing incidental TypeError/AttributeError exceptions to escape.
+    """
+    if value is None and allow_none:
+        return None
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ValueError(f"Recovery file contains invalid {label}.")
+    return list(value)
+
+
 def _table_from_recovery_record(raw_table):
     if not isinstance(raw_table, dict):
         raise ValueError("Recovery file contains invalid table data.")
+
+    headers = _recovery_string_list(raw_table.get("headers"), "table headers")
+    # MAX_TABLE_EDITOR_COLUMNS is a UI limit for creating/editing basic tables,
+    # not a document-format limit. Carriage intentionally folds and preserves
+    # wider imported Markdown tables, so their recovery records remain valid as
+    # long as every row and alignment entry has the same nonzero width.
+    if not headers:
+        raise ValueError("Recovery file contains a table without headers.")
+
+    raw_rows = raw_table.get("rows")
+    if not isinstance(raw_rows, list):
+        raise ValueError("Recovery file contains invalid table rows.")
+    rows = []
+    for raw_row in raw_rows:
+        row = _recovery_string_list(raw_row, "table row")
+        if len(row) != len(headers):
+            raise ValueError("Recovery file contains a table row with the wrong width.")
+        rows.append(row)
+
+    title = raw_table.get("title")
+    if not isinstance(title, str):
+        raise ValueError("Recovery file contains an invalid table title.")
+
+    alignments = _recovery_string_list(
+        raw_table.get("alignments"), "table alignments"
+    )
+    if len(alignments) != len(headers) or any(
+        alignment not in {"default", "left", "center", "right"}
+        for alignment in alignments
+    ):
+        raise ValueError("Recovery file contains invalid table alignments.")
+
+    original_lines = _recovery_string_list(
+        raw_table.get("original_lines"), "original table source", allow_none=True
+    )
+    caption_position = raw_table.get("caption_position")
+    if caption_position not in {None, "before", "after"}:
+        raise ValueError("Recovery file contains an invalid table caption position.")
+    dirty = raw_table.get("dirty")
+    if not isinstance(dirty, bool):
+        raise ValueError("Recovery file contains an invalid table dirty flag.")
+
     return TableData(
-        headers=list(raw_table.get("headers", [])),
-        rows=[list(row) for row in raw_table.get("rows", [])],
-        title=str(raw_table.get("title", "")),
-        alignments=list(raw_table.get("alignments", [])),
-        original_lines=(
-            None
-            if raw_table.get("original_lines") is None
-            else list(raw_table.get("original_lines"))
-        ),
-        caption_position=raw_table.get("caption_position"),
-        dirty=bool(raw_table.get("dirty", False)),
+        headers=headers,
+        rows=rows,
+        title=title,
+        alignments=alignments,
+        original_lines=original_lines,
+        caption_position=caption_position,
+        dirty=dirty,
     )
 
 
@@ -3726,18 +3954,30 @@ def _footnote_recovery_record(note):
 def _footnote_from_recovery_record(raw_note):
     if not isinstance(raw_note, dict):
         raise ValueError("Recovery file contains invalid footnote data.")
-    identifier = str(raw_note.get("identifier", "")).strip()
-    if not identifier:
-        raise ValueError("Recovery file contains a footnote without an identifier.")
+    identifier = raw_note.get("identifier")
+    if (
+        not isinstance(identifier, str)
+        or not identifier.strip()
+        or identifier != identifier.strip()
+        or "]" in identifier
+        or "\n" in identifier
+        or "\r" in identifier
+    ):
+        raise ValueError("Recovery file contains an invalid footnote identifier.")
+    text = raw_note.get("text")
+    if not isinstance(text, str):
+        raise ValueError("Recovery file contains invalid footnote text.")
+    original_lines = _recovery_string_list(
+        raw_note.get("original_lines"), "original footnote source", allow_none=True
+    )
+    dirty = raw_note.get("dirty")
+    if not isinstance(dirty, bool):
+        raise ValueError("Recovery file contains an invalid footnote dirty flag.")
     return FootnoteData(
         identifier=identifier,
-        text=str(raw_note.get("text", "")),
-        original_lines=(
-            None
-            if raw_note.get("original_lines") is None
-            else list(raw_note.get("original_lines"))
-        ),
-        dirty=bool(raw_note.get("dirty", False)),
+        text=text,
+        original_lines=original_lines,
+        dirty=dirty,
     )
 
 
@@ -4068,6 +4308,33 @@ def _record_recovery_success(revision):
     _refresh_recovery_error_state()
 
 
+def _record_recovery_failure(error, *, immediate_retry=False):
+    """Record a checkpoint failure and leave the current RAM state retryable."""
+    detail = str(error).strip() or error.__class__.__name__
+    state.recovery_write_error_message = detail
+    _refresh_recovery_error_state()
+
+    # A restored journal can fail before Buffer.reset has advanced the normal
+    # mutation revision (for example under a fault-injected framework failure).
+    # Keep the recovered RAM state strictly newer than the last accounted-for
+    # revision so the background loop cannot silently consider it protected.
+    if state.working_state_revision <= state.working_state_persisted_revision:
+        state.working_state_revision = state.working_state_persisted_revision + 1
+
+    now = time.monotonic()
+    if immediate_retry:
+        state.working_state_first_dirty_at = now - WORKING_STATE_MAX_LATENCY_SECONDS
+        state.working_state_last_change_at = now - WORKING_STATE_IDLE_SECONDS
+    else:
+        state.working_state_first_dirty_at = now
+        state.working_state_last_change_at = now
+
+    try:
+        get_app().invalidate()
+    except Exception:
+        pass
+
+
 def _write_recovery_snapshot():
     """Synchronously persist the current protected working state.
 
@@ -4136,28 +4403,47 @@ def _mark_recovery_retired(path):
         return False, str(e)
 
 
-def _cleanup_recovery_path(path):
-    """Remove one obsolete journal, or retire it if unlinking is impossible."""
+def _cleanup_recovery_path(path, *, already_retired=False):
+    """Durably make one obsolete journal harmless, then remove it if possible.
+
+    Retirement deliberately precedes unlink.  If a crash loses the directory
+    update and resurrects the old name, the file contents already carry a
+    file-fsynced retired marker and stale discovery will never offer it.  A
+    directory fsync is still attempted after successful unlink so ordinary
+    cleanup itself is durable as well.
+    """
     if not path:
         return True
+
+    if not already_retired:
+        retired, retire_error = _mark_recovery_retired(path)
+        if not retired:
+            state.recovery_cleanup_failures[path] = (
+                f"retirement failed before unlink: {retire_error}"
+            )
+            return False
+
     try:
         os.unlink(path)
-        state.recovery_cleanup_failures.pop(path, None)
-        return True
     except FileNotFoundError:
         state.recovery_cleanup_failures.pop(path, None)
         return True
-    except OSError as unlink_error:
-        retired, retire_error = _mark_recovery_retired(path)
-        if retired:
-            # The file may remain physically present, but stale discovery will
-            # recognize it as intentionally retired and never offer it.
-            state.recovery_cleanup_failures.pop(path, None)
-            return True
+    except OSError:
+        # A physically retained journal is nevertheless safe once its retired
+        # marker is durable.  Later boundary operations can try removal again,
+        # but destructive document transitions need not be blocked.
+        state.recovery_cleanup_failures.pop(path, None)
+        return True
 
-        detail = f"unlink failed: {unlink_error}; retirement failed: {retire_error}"
-        state.recovery_cleanup_failures[path] = detail
-        return False
+    try:
+        _fsync_directory(os.path.dirname(path) or ".")
+    except OSError:
+        # The unlink may be lost in a power failure, but retirement was already
+        # file-fsynced before it.  A resurrected name therefore remains harmless.
+        pass
+
+    state.recovery_cleanup_failures.pop(path, None)
+    return True
 
 
 def _retry_failed_recovery_cleanup():
@@ -4197,19 +4483,140 @@ def _clear_recovery_file():
     _refresh_recovery_error_state()
     return not state.recovery_cleanup_failures
 
+def _validate_recovery_object_correspondence(visible_text, tables, footnotes):
+    """Validate the one-to-one folded-label/object relationship in a journal."""
+    seen_tables = set()
+    seen_footnotes = set()
+    for line in visible_text.split("\n"):
+        table_match = TABLE_PLACEHOLDER_RE.match(line)
+        if table_match is not None:
+            number = int(table_match.group(1))
+            if number in seen_tables:
+                raise ValueError(
+                    f"Recovery file contains more than one placeholder for Table {number}."
+                )
+            if number not in tables:
+                raise ValueError(
+                    f"Recovery file contains a placeholder for missing Table {number}."
+                )
+            seen_tables.add(number)
+            continue
+
+        footnote_match = FOOTNOTE_PLACEHOLDER_RE.match(line)
+        if footnote_match is not None:
+            identifier = footnote_match.group(1)
+            if identifier in seen_footnotes:
+                raise ValueError(
+                    "Recovery file contains more than one placeholder for "
+                    f"footnote {identifier!r}."
+                )
+            if identifier not in footnotes:
+                raise ValueError(
+                    f"Recovery file contains a placeholder for missing footnote {identifier!r}."
+                )
+            seen_footnotes.add(identifier)
+
+    missing_tables = sorted(set(tables) - seen_tables)
+    if missing_tables:
+        raise ValueError(
+            "Recovery file contains table data without a folded placeholder."
+        )
+    missing_footnotes = sorted(set(footnotes) - seen_footnotes)
+    if missing_footnotes:
+        raise ValueError(
+            "Recovery file contains footnote data without a folded placeholder."
+        )
+
+
 def _read_recovery_payload(path):
-    """Read and validate the current Carriage recovery-journal format."""
+    """Read and strictly validate the current recovery-journal schema.
+
+    This function deliberately converts every malformed schema shape into
+    ValueError.  Callers can therefore preserve and skip corrupt journals for
+    manual inspection without startup or restoration being interrupted by an
+    incidental AttributeError, TypeError, or conversion exception.
+    """
     with open(path, "r", encoding="utf-8") as f:
         payload = json.load(f)
 
-    if payload.get("format") != RECOVERY_FORMAT_VERSION:
+    if not isinstance(payload, dict):
+        raise ValueError("Recovery file root must be a JSON object.")
+    format_version = payload.get("format")
+    if type(format_version) is not int or format_version != RECOVERY_FORMAT_VERSION:
         raise ValueError("Unsupported Carriage recovery format.")
-    if not isinstance(payload.get("visible_text"), str):
-        raise ValueError("Recovery file does not contain document text.")
-    if not isinstance(payload.get("tables"), dict):
+
+    pid = payload.get("pid")
+    if type(pid) is not int or pid <= 0:
+        raise ValueError("Recovery file contains an invalid process identifier.")
+    for key, label in (
+        ("boot_id", "boot identifier"),
+        ("process_start_id", "process-start identifier"),
+        ("source_path", "source path"),
+    ):
+        value = payload.get(key)
+        if value is not None and not isinstance(value, str):
+            raise ValueError(f"Recovery file contains an invalid {label}.")
+
+    for key, label in (
+        ("saved_text", "saved document text"),
+        ("visible_text", "visible document text"),
+    ):
+        if not isinstance(payload.get(key), str):
+            raise ValueError(f"Recovery file does not contain valid {label}.")
+
+    cursor_position = payload.get("cursor_position")
+    if type(cursor_position) is not int or cursor_position < 0:
+        raise ValueError("Recovery file contains an invalid cursor position.")
+
+    raw_snapshot = payload.get("disk_snapshot")
+    if raw_snapshot is not None:
+        if (
+            not isinstance(raw_snapshot, list)
+            or len(raw_snapshot) != 2
+            or raw_snapshot[0] not in {"file", "missing"}
+            or (
+                raw_snapshot[0] == "file"
+                and not isinstance(raw_snapshot[1], str)
+            )
+            or (raw_snapshot[0] == "missing" and raw_snapshot[1] is not None)
+        ):
+            raise ValueError("Recovery file contains an invalid disk snapshot.")
+
+    for key, label in (
+        ("had_table_draft", "table-draft flag"),
+        ("had_footnote_draft", "footnote-draft flag"),
+        ("retired", "retirement flag"),
+    ):
+        if not isinstance(payload.get(key), bool):
+            raise ValueError(f"Recovery file contains an invalid {label}.")
+
+    raw_tables = payload.get("tables")
+    if not isinstance(raw_tables, dict):
         raise ValueError("Recovery file contains invalid table data.")
-    if not isinstance(payload.get("footnotes"), dict):
+    tables = {}
+    for raw_number, raw_table in raw_tables.items():
+        if not isinstance(raw_number, str) or not raw_number.isdigit():
+            raise ValueError("Recovery file contains an invalid table number.")
+        number = int(raw_number)
+        if number <= 0 or str(number) != raw_number or number in tables:
+            raise ValueError("Recovery file contains an invalid table number.")
+        tables[number] = _table_from_recovery_record(raw_table)
+
+    raw_footnotes = payload.get("footnotes")
+    if not isinstance(raw_footnotes, dict):
         raise ValueError("Recovery file contains invalid footnote data.")
+    footnotes = {}
+    for raw_identifier, raw_note in raw_footnotes.items():
+        if not isinstance(raw_identifier, str):
+            raise ValueError("Recovery file contains an invalid footnote key.")
+        note = _footnote_from_recovery_record(raw_note)
+        if raw_identifier != note.identifier or raw_identifier in footnotes:
+            raise ValueError("Recovery file contains inconsistent footnote data.")
+        footnotes[raw_identifier] = note
+
+    _validate_recovery_object_correspondence(
+        payload["visible_text"], tables, footnotes
+    )
     return payload
 
 def _process_is_running(pid):
@@ -4284,14 +4691,11 @@ def _stale_recovery_files(source_path=None):
         try:
             payload = _read_recovery_payload(path)
             if payload.get("retired") is True:
-                # An intentional Save/New/Open/Quit cleanup may have been able
-                # to mark a journal retired even when directory permissions
-                # prevented unlinking it. Never offer such a file as crash
-                # recovery; opportunistically remove it when possible.
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
+                # An intentional Save/New/Open/Quit cleanup may have left a
+                # durably retired journal physically present. Never offer it;
+                # opportunistically remove it through the same directory-syncing
+                # cleanup path without requiring another in-place rewrite.
+                _cleanup_recovery_path(path, already_retired=True)
                 continue
             if _recovery_owner_is_live(payload):
                 continue
@@ -4314,6 +4718,14 @@ def _stale_recovery_files(source_path=None):
 
 
 def _restore_recovery_file(path):
+    """Restore one validated journal and immediately reclaim its protection.
+
+    The recovered document remains available if the claim write fails, but it
+    is explicitly marked unprotected and scheduled for an immediate retry. The
+    caller can then report the precise state instead of implying restoration
+    failed or silently leaving the old dead-process journal identity in place.
+    Return True when protection was claimed successfully, False otherwise.
+    """
     payload = _read_recovery_payload(path)
     if payload.get("retired") is True:
         raise ValueError("This recovery journal was intentionally retired.")
@@ -4327,12 +4739,8 @@ def _restore_recovery_file(path):
         note = _footnote_from_recovery_record(raw_note)
         restored_footnotes[str(raw_identifier)] = note
 
-    state.tables = restored_tables
-    state.footnotes = restored_footnotes
     recovered_visible_text = payload["visible_text"]
     cursor_position = payload.get("cursor_position", len(recovered_visible_text))
-    if not isinstance(cursor_position, int):
-        cursor_position = len(recovered_visible_text)
     cursor_position = max(0, min(len(recovered_visible_text), cursor_position))
 
     # A crash may capture an in-progress table-title draft in the object state
@@ -4347,24 +4755,27 @@ def _restore_recovery_file(path):
     cursor_row = min(old_doc.cursor_position_row, new_doc.line_count - 1)
     cursor_col = min(old_doc.cursor_position_col, len(new_doc.lines[cursor_row]))
     cursor_position = new_doc.translate_row_col_to_index(cursor_row, cursor_col)
-    text_area.buffer.reset(
-        Document(text=visible_text, cursor_position=cursor_position)
-    )
 
     source_path = payload.get("source_path")
-    state.path = source_path if isinstance(source_path, str) and source_path else None
     saved_text = payload.get("saved_text", "")
-    state.saved_text = saved_text if isinstance(saved_text, str) else ""
-
     raw_snapshot = payload.get("disk_snapshot")
-    if (
-        isinstance(raw_snapshot, list)
-        and len(raw_snapshot) == 2
-        and isinstance(raw_snapshot[0], str)
-    ):
-        state.disk_snapshot = tuple(raw_snapshot)
-    else:
-        state.disk_snapshot = None
+    disk_snapshot = None if raw_snapshot is None else tuple(raw_snapshot)
+
+    # Commit the fully parsed local state together. No recovery input is allowed
+    # to mutate the live editor before all schema/object validation has passed.
+    # The shared installer also normalizes a legacy or otherwise invalid saved
+    # cursor out of hidden structural Markdown while preserving valid logical
+    # positions elsewhere in the recovered document.
+    _install_editor_document(
+        visible_text,
+        cursor_position=cursor_position,
+        path=source_path,
+        saved_text=saved_text,
+        disk_snapshot=disk_snapshot,
+        tables=restored_tables,
+        footnotes=restored_footnotes,
+        reset_working_state=False,
+    )
 
     _claim_recovery_path(path)
     state.recovery_write_error_message = None
@@ -4372,7 +4783,12 @@ def _restore_recovery_file(path):
 
     # Claim the restored journal for this process immediately so a second
     # concurrently running Carriage instance will not offer it as stale.
-    _write_recovery_snapshot()
+    try:
+        _write_recovery_snapshot()
+    except Exception as e:
+        _record_recovery_failure(e, immediate_retry=True)
+        return False
+    return True
 
 
 def _offer_stale_recovery(source_path=None):
@@ -4414,19 +4830,32 @@ def _offer_stale_recovery(source_path=None):
     def restore_handler():
         close_dialog()
         try:
-            _restore_recovery_file(recovery_path)
+            protected = _restore_recovery_file(recovery_path)
         except (OSError, ValueError, json.JSONDecodeError) as e:
             show_message("Recovery error", str(e))
+            return
+        if not protected:
+            show_message(
+                "Recovery protection warning",
+                "The recovered document is open, but Carriage could not yet "
+                "reclaim its working-state journal for this process. The "
+                "document remains marked unprotected and Carriage will retry "
+                "automatically. Save the document to commit it manually.\n\n"
+                f"{state.recovery_error_message or 'Unknown recovery error.'}",
+            )
 
     def discard_handler():
         close_dialog()
-        try:
-            os.unlink(recovery_path)
-        except FileNotFoundError:
-            pass
-        except OSError as e:
-            show_message("Recovery error", str(e))
+        if not _cleanup_recovery_path(recovery_path):
+            show_message(
+                "Recovery error",
+                state.recovery_error_message
+                or state.recovery_cleanup_failures.get(
+                    recovery_path, "Could not safely discard the recovery journal."
+                ),
+            )
             return
+        _refresh_recovery_error_state()
         _offer_stale_recovery(source_path)
 
     restore_button = Button(text="Restore", handler=restore_handler)
@@ -4547,19 +4976,92 @@ def do_new():
     _reset_working_state_tracking()
 
 
+def _normalized_installed_cursor_position(visible_text, cursor_position=0):
+    """Return one stable visible insertion position for an installed document.
+
+    Loading can happen before a real prompt_toolkit application is running, so
+    terminal-width-dependent gutter detection is not reliable here.  The
+    document's structural analysis is the source of truth for the hidden ATX,
+    list, and blockquote prefix.  Compact footnote/folded-object interiors are
+    normalized through the same visible-boundary rules used by navigation.
+    """
+    cursor_position = max(0, min(len(visible_text), int(cursor_position)))
+    document = Document(visible_text, cursor_position=cursor_position)
+    row = document.cursor_position_row
+    row_layout = _display_row_layout(visible_text, row)
+    source_col = _normalize_visual_source_col(
+        document,
+        row,
+        document.cursor_position_col,
+        structural_body_col=row_layout.structural_prefix_width,
+    )
+    return document.translate_row_col_to_index(row, source_col)
+
+
+def _install_editor_document(
+    visible_text,
+    *,
+    cursor_position=0,
+    path,
+    saved_text,
+    disk_snapshot,
+    tables,
+    footnotes,
+    reset_working_state=True,
+):
+    """Install one complete visible document/object state consistently.
+
+    File-menu opening, command-line startup, and recovery restoration must all
+    preserve the same cursor invariants.  Set the object maps before resetting
+    the Buffer so any synchronous document callbacks observe a coherent folded
+    state, then install the normalized document and its disk baseline together.
+    """
+    normalized_cursor = _normalized_installed_cursor_position(
+        visible_text, cursor_position
+    )
+    state.tables = tables
+    state.footnotes = footnotes
+    text_area.buffer.reset(
+        Document(text=visible_text, cursor_position=normalized_cursor)
+    )
+    state.path = path
+    state.saved_text = saved_text
+    state.disk_snapshot = disk_snapshot
+    if reset_working_state:
+        _reset_working_state_tracking()
+
+
+def _install_open_document(path, content, disk_snapshot):
+    """Replace the editor document with one successfully read source file."""
+    visible = _collapse_objects_from_source(content)
+    _install_editor_document(
+        visible,
+        cursor_position=0,
+        path=path,
+        saved_text=content,
+        disk_snapshot=disk_snapshot,
+        tables=state.tables,
+        footnotes=state.footnotes,
+    )
+
+
 def do_open():
-    def cb(raw_path):
-        path = os.path.expanduser(raw_path.strip())
-        if not path:
-            return
-        if not os.path.exists(path):
-            show_message("Not found", f"No such file:\n{path}")
-            return
+    def load_path(path, *, allow_large=False):
         try:
-            content, disk_snapshot = _read_utf8_file_with_snapshot(path)
+            content, disk_snapshot = _read_utf8_file_with_snapshot(
+                path, allow_large=allow_large
+            )
+        except _LargeFileConfirmationRequired as e:
+            confirm(
+                "Large file",
+                _large_file_prompt_text(path, e.size_bytes),
+                lambda: load_path(path, allow_large=True),
+            )
+            return
         except (OSError, UnicodeError) as e:
             show_message("Error opening file", str(e))
             return
+
         if not _clear_recovery_file():
             cleanup_detail = state.recovery_error_message or "Unknown recovery cleanup error."
             _reprotect_after_blocked_cleanup()
@@ -4572,12 +5074,16 @@ def do_open():
                 f"{cleanup_detail}",
             )
             return
-        visible = _collapse_objects_from_source(content)
-        text_area.buffer.reset(Document(text=visible))
-        state.path = path
-        state.saved_text = content
-        state.disk_snapshot = disk_snapshot
-        _reset_working_state_tracking()
+        _install_open_document(path, content, disk_snapshot)
+
+    def cb(raw_path):
+        path = os.path.expanduser(raw_path.strip())
+        if not path:
+            return
+        if not os.path.exists(path):
+            show_message("Not found", f"No such file:\n{path}")
+            return
+        load_path(path)
 
     show_input_dialog("Open File", "Path:", state.path or "", cb)
 
@@ -5338,7 +5844,7 @@ def _is_thematic_break(line):
     return (
         len(compact) >= 3
         and len(set(compact)) == 1
-        and compact[0] in "-* _".replace(" ", "")
+        and compact[0] in "-*_"
     )
 
 
@@ -6046,26 +6552,6 @@ def _materialize_objects(visible_text):
 
     return "\n".join(rendered)
 
-def _folded_object_spans(text):
-    """Return folded-object source spans in the visible editor buffer.
-
-    Each tuple is (kind, key, row, start, end), with ``end`` exclusive. The
-    invisible sentinel is part of the span. Objects occupy a complete logical
-    line by contract.
-    """
-    spans = []
-    offset = 0
-    for row, line in enumerate(text.split("\n")):
-        table_match = TABLE_PLACEHOLDER_RE.match(line)
-        footnote_match = FOOTNOTE_PLACEHOLDER_RE.match(line)
-        if table_match:
-            spans.append(("table", int(table_match.group(1)), row, offset, offset + len(line)))
-        elif footnote_match:
-            spans.append(("footnote", footnote_match.group(1), row, offset, offset + len(line)))
-        offset += len(line) + 1
-    return tuple(spans)
-
-
 def _folded_object_line(line):
     return bool(TABLE_PLACEHOLDER_RE.match(line) or FOOTNOTE_PLACEHOLDER_RE.match(line))
 
@@ -6156,11 +6642,6 @@ def _table_number_at_cursor():
     return folded[1] if folded is not None and folded[0] == "table" else None
 
 
-def _footnote_placeholder_identifier_at_cursor():
-    folded = _folded_placeholder_at_cursor()
-    return folded[1] if folded is not None and folded[0] == "footnote" else None
-
-
 def _folded_placeholder_locked():
     """Return True while the caret is on a folded table/footnote object."""
     return _folded_placeholder_at_cursor() is not None
@@ -6183,15 +6664,103 @@ def _replace_buffer_document(buffer, document):
     buffer.set_document(document, bypass_readonly=True)
 
 
+_UNCHANGED_OBJECT_MAP = object()
+_UNCHANGED_SELECTION = object()
+_WORKING_STATE_TRACKING_FIELDS = (
+    "working_state_revision",
+    "working_state_persisted_revision",
+    "working_state_first_dirty_at",
+    "working_state_last_change_at",
+)
+
+
+def _commit_folded_object_transaction(
+    buffer,
+    document,
+    *,
+    tables=_UNCHANGED_OBJECT_MAP,
+    footnotes=_UNCHANGED_OBJECT_MAP,
+    selection=_UNCHANGED_SELECTION,
+):
+    """Commit folded-object mappings and their visible document atomically.
+
+    The object dictionaries and compact Markdown placeholders form one logical
+    document state.  Build the replacement values before calling this helper;
+    it captures undo/recovery bookkeeping, installs both halves, and restores
+    the exact prior state if prompt_toolkit raises during document replacement.
+    """
+    old_document = buffer.document
+    old_selection = buffer.selection_state
+    old_tables = state.tables
+    old_footnotes = state.footnotes
+    old_undo_stack = list(buffer._undo_stack)
+    old_redo_stack = list(buffer._redo_stack)
+    old_tracking = {
+        name: getattr(state, name) for name in _WORKING_STATE_TRACKING_FIELDS
+    }
+
+    object_changed = (
+        tables is not _UNCHANGED_OBJECT_MAP and tables is not old_tables
+    ) or (
+        footnotes is not _UNCHANGED_OBJECT_MAP and footnotes is not old_footnotes
+    )
+    document_changed = (
+        document.text != old_document.text
+        or document.cursor_position != old_document.cursor_position
+    )
+
+    rollback_error = None
+    try:
+        buffer.save_to_undo_stack()
+        if tables is not _UNCHANGED_OBJECT_MAP:
+            state.tables = tables
+        if footnotes is not _UNCHANGED_OBJECT_MAP:
+            state.footnotes = footnotes
+        if document_changed:
+            _replace_buffer_document(buffer, document)
+        if selection is not _UNCHANGED_SELECTION:
+            buffer.selection_state = selection
+        # Object-only edits do not fire the main buffer's text-change callback.
+        # Mark them only after both object and document state have committed.
+        if object_changed and document.text == old_document.text:
+            _working_state_changed(immediate=True)
+    except BaseException as error:
+        state.tables = old_tables
+        state.footnotes = old_footnotes
+        buffer.selection_state = old_selection
+        try:
+            current = buffer.document
+            if (
+                current.text != old_document.text
+                or current.cursor_position != old_document.cursor_position
+            ):
+                # Bypass the replace helper during rollback so a fault-injected
+                # helper failure cannot prevent restoration of the old document.
+                buffer.set_document(old_document, bypass_readonly=True)
+        except BaseException as restore_error:
+            rollback_error = restore_error
+        finally:
+            buffer._undo_stack = old_undo_stack
+            buffer._redo_stack = old_redo_stack
+            for name, value in old_tracking.items():
+                setattr(state, name, value)
+
+        if rollback_error is not None:
+            raise RuntimeError(
+                "Folded-object transaction failed and its document rollback "
+                "also failed."
+            ) from error
+        raise
+
+
 def _table_state_for_placeholders(document):
     """Validate table-object/placeholder correspondence before renumbering.
 
-    Return the placeholder numbers in source order.  Renumbering is one of the
-    few operations that rewrites both the object mapping and several folded
-    labels at once, so detect any pre-existing drift *before* mutating either
-    side of that relationship.
+    Renumbering is one of the few operations that rewrites both the object
+    mapping and several folded labels at once, so detect any pre-existing drift
+    *before* mutating either side of that relationship. Success has no payload;
+    invalid state raises ValueError before any mutation begins.
     """
-    placeholder_numbers = []
     seen = set()
     for line in document.lines:
         match = TABLE_PLACEHOLDER_RE.match(line)
@@ -6207,7 +6776,6 @@ def _table_state_for_placeholders(document):
                 f"Table {number} has a folded reference but no table data."
             )
         seen.add(number)
-        placeholder_numbers.append(number)
 
     missing = sorted(set(state.tables) - seen)
     if missing:
@@ -6215,41 +6783,22 @@ def _table_state_for_placeholders(document):
         raise ValueError(
             f"{label} has table data but no folded reference in the document."
         )
-    return placeholder_numbers
 
 
-def _shift_table_numbers_for_insert(insert_number):
-    """Make room for a new document-relative table number atomically.
+def _shifted_table_state_for_insert(insert_number, document):
+    """Return renumbered table objects/document without mutating editor state."""
+    _table_state_for_placeholders(document)
 
-    Return False without changing document/object state if the folded labels
-    and the committed table mapping have already drifted out of sync.
-    """
-    if not state.tables:
-        return True
-
-    doc = text_area.buffer.document
-    try:
-        _table_state_for_placeholders(doc)
-    except ValueError as error:
-        show_message(
-            "Document object error",
-            f"Carriage cannot insert a table because its folded table state is "
-            f"inconsistent.\n\n{error}",
-        )
-        return False
-
-    # Build both sides of the renumbering before committing either one.  This
-    # prevents a malformed placeholder from leaving state.tables half-shifted.
-    new_tables = {}
+    shifted_tables = {}
     for number, table in state.tables.items():
         target = number + 1 if number >= insert_number else number
-        new_tables[target] = table
+        shifted_tables[target] = table
 
-    row = doc.cursor_position_row
-    col = doc.cursor_position_col
+    row = document.cursor_position_row
+    col = document.cursor_position_col
     changed = False
     new_lines = []
-    for line in doc.lines:
+    for line in document.lines:
         match = TABLE_PLACEHOLDER_RE.match(line)
         if match and int(match.group(1)) >= insert_number:
             old_number = int(match.group(1))
@@ -6259,62 +6808,84 @@ def _shift_table_numbers_for_insert(insert_number):
             changed = True
         new_lines.append(line)
 
-    old_tables = state.tables
-    state.tables = new_tables
-    if changed:
-        new_text = "\n".join(new_lines)
-        tmp = Document(text=new_text)
-        new_row = min(row, tmp.line_count - 1)
-        new_cursor = tmp.translate_row_col_to_index(
-            new_row, min(col, len(tmp.lines[new_row]))
-        )
-        try:
-            _replace_buffer_document(
-                text_area.buffer,
-                Document(new_text, cursor_position=new_cursor),
-            )
-        except Exception:
-            # set_document() should be reliable here, but never leave one half
-            # of a structural table renumbering committed if it does fail.
-            state.tables = old_tables
-            raise
-    return True
+    if not changed:
+        return shifted_tables, document
+
+    new_text = "\n".join(new_lines)
+    tmp = Document(text=new_text)
+    new_row = min(row, tmp.line_count - 1)
+    new_cursor = tmp.translate_row_col_to_index(
+        new_row, min(col, len(tmp.lines[new_row]))
+    )
+    return shifted_tables, Document(new_text, cursor_position=new_cursor)
 
 
-def _insert_table_placeholder(table_number):
-    """Insert a folded table as its own prose block at the cursor."""
-    buf = text_area.buffer
-    doc = buf.document
-    before = doc.current_line_before_cursor
-    after = doc.current_line_after_cursor
+
+def _document_with_inserted_table_placeholder(table_number, table, document):
+    """Return ``document`` with one folded table block inserted at its cursor."""
+    before = document.current_line_before_cursor
+    after = document.current_line_after_cursor
 
     prefix = ""
     suffix = ""
     if before.strip():
         prefix = "\n\n"
-    elif doc.cursor_position_row > 0 and doc.lines[doc.cursor_position_row - 1].strip():
+    elif (
+        document.cursor_position_row > 0
+        and document.lines[document.cursor_position_row - 1].strip()
+    ):
         prefix = "\n"
 
     if after.strip():
         suffix = "\n\n"
-    elif doc.cursor_position_row + 1 < doc.line_count and doc.lines[doc.cursor_position_row + 1].strip():
+    elif (
+        document.cursor_position_row + 1 < document.line_count
+        and document.lines[document.cursor_position_row + 1].strip()
+    ):
         suffix = "\n"
 
-    table = state.tables.get(table_number)
-    title = table.title if table is not None else ""
-    buf.insert_text(prefix + _table_placeholder(table_number, title) + suffix)
+    insertion = prefix + _table_placeholder(table_number, table.title) + suffix
+    position = document.cursor_position
+    return Document(
+        document.text[:position] + insertion + document.text[position:],
+        cursor_position=position + len(insertion),
+    )
 
 
-def _refresh_table_placeholder(table_number):
-    """Refresh one folded reference after its title changes."""
-    table = state.tables.get(table_number)
-    if table is None:
-        return
 
-    doc = text_area.buffer.document
-    row = doc.cursor_position_row
-    col = doc.cursor_position_col
-    lines = list(doc.lines)
+def _commit_new_table_at_cursor(insert_number, table):
+    """Insert and renumber a table through one document/object transaction."""
+    document = text_area.buffer.document
+    try:
+        shifted_tables, shifted_document = _shifted_table_state_for_insert(
+            insert_number, document
+        )
+    except ValueError as error:
+        show_message(
+            "Document object error",
+            f"Carriage cannot insert a table because its folded table state is "
+            f"inconsistent.\n\n{error}",
+        )
+        return False
+
+    updated_tables = dict(shifted_tables)
+    updated_tables[insert_number] = table
+    final_document = _document_with_inserted_table_placeholder(
+        insert_number, table, shifted_document
+    )
+    _commit_folded_object_transaction(
+        text_area.buffer,
+        final_document,
+        tables=updated_tables,
+    )
+    return True
+
+
+def _document_with_refreshed_table_placeholder(table_number, table, document):
+    """Return document with one folded table label refreshed, without mutation."""
+    row = document.cursor_position_row
+    col = document.cursor_position_col
+    lines = list(document.lines)
     changed = False
     for index, line in enumerate(lines):
         match = TABLE_PLACEHOLDER_RE.match(line)
@@ -6326,18 +6897,15 @@ def _refresh_table_placeholder(table_number):
             break
 
     if not changed:
-        return
+        return document
 
     new_text = "\n".join(lines)
     tmp = Document(text=new_text)
     new_row = min(row, tmp.line_count - 1)
     new_col = min(col, len(tmp.lines[new_row]))
-    _replace_buffer_document(
-        text_area.buffer,
-        Document(
-            text=new_text,
-            cursor_position=tmp.translate_row_col_to_index(new_row, new_col),
-        ),
+    return Document(
+        text=new_text,
+        cursor_position=tmp.translate_row_col_to_index(new_row, new_col),
     )
 
 
@@ -6380,14 +6948,12 @@ def _delete_table_object(table_number):
     if target_row is None:
         return False
 
-    buf.save_to_undo_stack()
     updated = {}
     for number in sorted(state.tables):
         if number == table_number:
             continue
         new_number = number - 1 if number > table_number else number
         updated[new_number] = state.tables[number]
-    state.tables = updated
 
     lines, cursor_row = _remove_folded_object_line(doc.lines, target_row)
     for row, line in enumerate(lines):
@@ -6396,7 +6962,7 @@ def _delete_table_object(table_number):
             old_number = int(match.group(1))
             if old_number > table_number:
                 new_number = old_number - 1
-                table = state.tables.get(new_number)
+                table = updated.get(new_number)
                 if table is not None:
                     lines[row] = _table_placeholder(new_number, table.title)
 
@@ -6404,9 +6970,10 @@ def _delete_table_object(table_number):
     tmp = Document(new_text)
     cursor_row = min(cursor_row, tmp.line_count - 1)
     cursor_col = min(doc.cursor_position_col, len(tmp.lines[cursor_row]))
-    _replace_buffer_document(
+    _commit_folded_object_transaction(
         buf,
         Document(new_text, tmp.translate_row_col_to_index(cursor_row, cursor_col)),
+        tables=updated,
     )
     return True
 
@@ -7250,20 +7817,6 @@ def _analyze_document_layout(full_text, width=None):
 
 
 @lru_cache(maxsize=8)
-def _structural_display_map(full_text):
-    """Return gutter metadata projected from the shared block layout."""
-    result = {}
-    for block in _analyze_document_layout(full_text, WRAP_COLUMN):
-        for offset, row_info in enumerate(_layout_rows_for_block(block)):
-            if row_info.structural_prefix_width:
-                result[block.start + offset] = (
-                    row_info.structural_prefix_width,
-                    row_info.role,
-                )
-    return result
-
-
-@lru_cache(maxsize=8)
 def _layout_row_map(full_text):
     """Return per-source-row metadata from the shared block layout.
 
@@ -7333,8 +7886,8 @@ def _display_row_layout(full_text, row):
 
 def _active_structural_prefix_width(document, row, role=None, columns=None):
     """Return a prefix width only when it is actually hidden in the gutter."""
-    info = _structural_display_map(document.text).get(row)
-    if info is None or (role is not None and info[1] != role):
+    info = _display_row_layout(document.text, row)
+    if not info.structural_prefix_width or (role is not None and info.role != role):
         return None
     if columns is None:
         try:
@@ -7342,7 +7895,11 @@ def _active_structural_prefix_width(document, row, role=None, columns=None):
         except Exception:
             columns = WRAP_COLUMN + STRUCTURE_GUTTER_WIDTH + 2
     _left, gutter, _right = _prose_layout_widths(columns)
-    return info[0] if 0 < info[0] <= gutter else None
+    return (
+        info.structural_prefix_width
+        if 0 < info.structural_prefix_width <= gutter
+        else None
+    )
 
 
 def _hidden_structural_body_col(document, row):
@@ -8733,15 +9290,12 @@ def do_convert_for_carriage():
 
     if new_cursor is None:
         new_cursor = len(new_text)
-    buf.save_to_undo_stack()
-    state.tables = new_tables
-    state.footnotes = new_footnotes
-    buf.set_document(
+    _commit_folded_object_transaction(
+        buf,
         Document(text=new_text, cursor_position=new_cursor),
-        bypass_readonly=True,
+        tables=new_tables,
+        footnotes=new_footnotes,
     )
-    if objects_changed:
-        _working_state_changed(immediate=True)
 
 
 def do_undo():
@@ -8804,6 +9358,25 @@ def do_paste():
         buf.cut_selection()
     buf.paste_clipboard_data(get_app().clipboard.get_data())
     _leave_extend_selection_mode()
+
+
+def _dialog_buffer_cut(buf):
+    """Cut an active selection from a simple dialog editor to the clipboard."""
+    if buf.selection_state is not None:
+        get_app().clipboard.set_data(buf.cut_selection())
+
+
+def _dialog_buffer_copy(buf):
+    """Copy an active selection from a simple dialog editor to the clipboard."""
+    if buf.selection_state is not None:
+        get_app().clipboard.set_data(buf.copy_selection())
+
+
+def _dialog_buffer_paste(buf):
+    """Paste into a simple dialog editor, replacing any active selection."""
+    if buf.selection_state is not None:
+        buf.cut_selection()
+    buf.paste_clipboard_data(get_app().clipboard.get_data())
 
 
 
@@ -9267,85 +9840,92 @@ def _wrap_table_grid_cell(text, width):
     ) or [""]
 
 
-def _table_grid_geometry(session):
-    """Return shared column geometry and border strings for the table editor."""
+@dataclass(frozen=True)
+class _TableGridLayout:
+    """One terminal-width-specific display layout for the basic table editor."""
+
+    columns: int
+    cell_width: int
+    top: str
+    middle: str
+    bottom: str
+    wrapped_rows: tuple
+    row_heights: tuple
+    natural_body_height: int
+
+
+def _table_grid_layout(session):
+    """Return cached geometry and wrapped cells for the current working table."""
     columns = session.working.column_count
     try:
         terminal_width = get_app().output.get_size().columns
     except Exception:
         terminal_width = 100
+
+    rows = _table_rows(session)
+    content_key = tuple(tuple(str(cell) for cell in row) for row in rows)
+    key = (terminal_width, columns, content_key)
+    if session.grid_layout_key == key and session.grid_layout_cache is not None:
+        return session.grid_layout_cache
+
     cell_width = _table_grid_cell_width(columns, terminal_width)
     span = "─" * (cell_width + 2)
-    return {
-        "columns": columns,
-        "cell_width": cell_width,
-        "top": "┌" + "┬".join(span for _ in range(columns)) + "┐",
-        "middle": "├" + "┼".join(span for _ in range(columns)) + "┤",
-        "bottom": "└" + "┴".join(span for _ in range(columns)) + "┘",
-    }
+    wrapped_rows = tuple(
+        tuple(tuple(_wrap_table_grid_cell(cell, cell_width)) for cell in row)
+        for row in rows
+    )
+    row_heights = tuple(
+        max((len(parts) for parts in row), default=1) for row in wrapped_rows
+    )
+    natural_height = max(1, len(rows) - 1) + sum(row_heights)
+    layout = _TableGridLayout(
+        columns=columns,
+        cell_width=cell_width,
+        top="┌" + "┬".join(span for _ in range(columns)) + "┐",
+        middle="├" + "┼".join(span for _ in range(columns)) + "┤",
+        bottom="└" + "┴".join(span for _ in range(columns)) + "┘",
+        wrapped_rows=wrapped_rows,
+        row_heights=row_heights,
+        natural_body_height=natural_height,
+    )
+    session.grid_layout_key = key
+    session.grid_layout_cache = layout
+    return layout
 
 
 def _table_grid_outer_border_fragments(session, edge):
     """Render one fixed outer border outside the scrolling table viewport."""
-    geometry = _table_grid_geometry(session)
-    return [("class:table.border", geometry[edge])]
+    layout = _table_grid_layout(session)
+    return [("class:table.border", getattr(layout, edge))]
 
 
 def _table_grid_body_height(session):
-    """Return the natural rendered height of the scrollable table body.
-
-    Rows can wrap to multiple terminal lines, and each adjacent pair of rows
-    has one internal separator.  Cap the viewport at 18 rows for large tables,
-    but never allocate blank body rows below a short table.
-    """
-    rows = _table_rows(session)
-    geometry = _table_grid_geometry(session)
-    cell_width = geometry["cell_width"]
-
-    natural_height = max(1, len(rows) - 1)  # internal separators
-    for row in rows:
-        row_height = 1
-        for cell in row:
-            wrapped = _wrap_table_grid_cell(cell, cell_width)
-            row_height = max(row_height, len(wrapped))
-        natural_height += row_height
-
-    viewport_height = min(natural_height, 18)
+    """Return the natural rendered height of the scrollable table body."""
+    layout = _table_grid_layout(session)
+    viewport_height = min(layout.natural_body_height, 18)
     # Give HSplit permission to shrink on unusually short terminals, while the
     # preferred/max pair prevents spare blank rows on ordinary layouts.
     return D(min=1, preferred=viewport_height, max=viewport_height)
 
 
 def _table_grid_fragments(session):
-    """Render only the scrollable table body and internal row separators.
-
-    The top and bottom borders are separate fixed Windows in the dialog.  This
-    Window contains only rows and internal separators, so arrow-key navigation
-    can scroll the selected cell without ever scrolling the table frame away.
-    A zero-width [SetCursorPosition] marker at the selected cell gives
-    prompt_toolkit a logical cursor to keep visible; the cursor itself remains
-    hidden.
-    """
-    rows = _table_rows(session)
-    geometry = _table_grid_geometry(session)
-    columns = geometry["columns"]
-    cell_width = geometry["cell_width"]
-    border = geometry["middle"]
+    """Render the scrollable table body from the shared computed grid layout."""
+    layout = _table_grid_layout(session)
+    rows = layout.wrapped_rows
+    columns = layout.columns
+    cell_width = layout.cell_width
+    border = layout.middle
 
     fragments = []
-    for row_number, row in enumerate(rows):
-        wrapped_cells = []
-        for cell in row:
-            wrapped = _wrap_table_grid_cell(cell, cell_width)
-            wrapped_cells.append(wrapped)
-
-        row_height = max(len(parts) for parts in wrapped_cells)
+    for row_number, wrapped_cells in enumerate(rows):
+        row_height = layout.row_heights[row_number]
         selected_row = row_number == session.selected_row
         # Anchor downward navigation (and always the final row) at the row's
-        # last rendered line so the bottom of a tall row can actually enter the
-        # viewport. Upward navigation anchors at the first rendered line.
+        # last rendered line so the bottom of a tall row can enter the viewport.
         cursor_visual_line = 0
-        if selected_row and (session.scroll_anchor == "bottom" or row_number == len(rows) - 1):
+        if selected_row and (
+            session.scroll_anchor == "bottom" or row_number == len(rows) - 1
+        ):
             cursor_visual_line = row_height - 1
 
         for visual_line in range(row_height):
@@ -9355,8 +9935,7 @@ def _table_grid_fragments(session):
                     wrapped_cells[col][visual_line]
                     if visual_line < len(wrapped_cells[col])
                     else ""
-                )
-                cell_text = cell_text.ljust(cell_width)
+                ).ljust(cell_width)
                 selected = selected_row and col == session.selected_col
                 if selected and visual_line == cursor_visual_line:
                     fragments.append(("[SetCursorPosition]", ""))
@@ -9374,7 +9953,6 @@ def _table_grid_fragments(session):
             fragments.append(("class:table.border", border + "\n"))
 
     return fragments
-
 
 def _save_table_editor():
     session = current_table_editor
@@ -9395,12 +9973,22 @@ def _save_table_editor():
         or _table_content_key(session.working) != _table_content_key(committed)
     )
     if changed:
-        # One table save is one logical document edit. Capture the complete
-        # pre-edit state before changing either the object or its placeholder.
-        text_area.buffer.save_to_undo_stack()
+        # One table save is one logical document edit. Build the object map and
+        # refreshed folded label first, then commit both through one rollback-
+        # protected transaction.
         session.working.dirty = True
-        _set_committed_table(session.table_number, session.working)
-        _refresh_table_placeholder(session.table_number)
+        updated_tables = dict(state.tables)
+        updated_tables[session.table_number] = session.working
+        new_document = _document_with_refreshed_table_placeholder(
+            session.table_number,
+            session.working,
+            text_area.buffer.document,
+        )
+        _commit_folded_object_transaction(
+            text_area.buffer,
+            new_document,
+            tables=updated_tables,
+        )
 
     close_dialog()
     get_app().invalidate()
@@ -9521,7 +10109,7 @@ def open_table_editor(table_number):
     # flexible windows on either side absorb the remaining dialog space.
     grid_stack = Box(
         body=HSplit([grid_top_border, grid_window, grid_bottom_border]),
-        width=lambda: get_cwidth(_table_grid_geometry(session)["top"]),
+        width=lambda: get_cwidth(_table_grid_layout(session).top),
         padding=0,
     )
     centered_grid = VSplit(
@@ -9567,22 +10155,15 @@ def open_table_editor(table_number):
 
     @table_cell_kb.add("c-x", eager=True)
     def _cut_from_cell(event):
-        buf = event.current_buffer
-        if buf.selection_state is not None:
-            get_app().clipboard.set_data(buf.cut_selection())
+        _dialog_buffer_cut(event.current_buffer)
 
     @table_cell_kb.add("c-c")
     def _copy_from_cell(event):
-        buf = event.current_buffer
-        if buf.selection_state is not None:
-            get_app().clipboard.set_data(buf.copy_selection())
+        _dialog_buffer_copy(event.current_buffer)
 
     @table_cell_kb.add("c-v")
     def _paste_into_cell(event):
-        buf = event.current_buffer
-        if buf.selection_state is not None:
-            buf.cut_selection()
-        buf.paste_clipboard_data(get_app().clipboard.get_data())
+        _dialog_buffer_paste(event.current_buffer)
 
     cell_editor.control.key_bindings = table_cell_kb
 
@@ -9601,22 +10182,15 @@ def open_table_editor(table_number):
 
     @table_title_kb.add("c-x", eager=True)
     def _cut_from_title(event):
-        buf = event.current_buffer
-        if buf.selection_state is not None:
-            get_app().clipboard.set_data(buf.cut_selection())
+        _dialog_buffer_cut(event.current_buffer)
 
     @table_title_kb.add("c-c")
     def _copy_from_title(event):
-        buf = event.current_buffer
-        if buf.selection_state is not None:
-            get_app().clipboard.set_data(buf.copy_selection())
+        _dialog_buffer_copy(event.current_buffer)
 
     @table_title_kb.add("c-v")
     def _paste_into_title(event):
-        buf = event.current_buffer
-        if buf.selection_state is not None:
-            buf.cut_selection()
-        buf.paste_clipboard_data(get_app().clipboard.get_data())
+        _dialog_buffer_paste(event.current_buffer)
 
     title_editor.control.key_bindings = table_title_kb
 
@@ -9703,15 +10277,11 @@ def do_insert_table():
         title = " ".join(title_field.text.splitlines()).strip()
         close_dialog()
 
-        # Insertion can renumber existing tables and rewrite several folded
-        # placeholders. Treat that whole transformation as one undoable edit.
-        text_area.buffer.save_to_undo_stack()
-        if not _shift_table_numbers_for_insert(insert_number):
+        # Renumbering, the new object, and its folded placeholder form one
+        # logical document edit. Build all three before committing any of them.
+        table = _new_table_data(columns, rows, title=title)
+        if not _commit_new_table_at_cursor(insert_number, table):
             return
-        _set_committed_table(
-            insert_number, _new_table_data(columns, rows, title=title)
-        )
-        _insert_table_placeholder(insert_number)
         open_table_editor(insert_number)
 
     dialog = Dialog(
@@ -9739,39 +10309,64 @@ def do_insert_table():
 # Simple footnote editor
 # ---------------------------------------------------------------------------
 
+def _footnote_source_span_at_cursor(document=None, direction=0):
+    """Return the inline-footnote source span touching the cursor.
+
+    Adjacent compact references share a source boundary: in ``[^a][^b]`` the
+    end of the first reference is also the start of the second.  Directional
+    operations must resolve that position according to the user's intent:
+    rightward movement/Delete/Tab prefer the reference beginning there, while
+    leftward movement/Backspace prefer the reference ending there.  A zero
+    direction retains the ordinary containing-span behavior and, at a shared
+    edge, prefers the following reference so object commands never enter its
+    hidden source.
+    """
+    doc = document or text_area.buffer.document
+    col = doc.cursor_position_col
+    spans = _footnote_references_on_row(doc.text, doc.cursor_position_row)
+
+    # A strict interior belongs unambiguously to one compact object.
+    for start, end, identifier in spans:
+        if start < col < end:
+            return start, end, identifier
+
+    starts = [span for span in spans if span[0] == col]
+    ends = [span for span in spans if span[1] == col]
+    if direction < 0:
+        if ends:
+            return ends[-1]
+        if starts:
+            return starts[0]
+    else:
+        # Rightward and neutral object commands prefer the object that starts
+        # at a shared boundary.  At a non-shared closing edge, retain the
+        # preceding object so Tab/menu editing still works at its visible end.
+        if starts:
+            return starts[0]
+        if ends:
+            return ends[-1]
+    return None
+
+
 def _footnote_identifier_at_cursor():
     """Return the folded/simple footnote under the cursor, if any."""
     doc = text_area.buffer.document
-    line = doc.current_line
-    col = doc.cursor_position_col
-
-    placeholder = FOOTNOTE_PLACEHOLDER_RE.match(line)
+    placeholder = FOOTNOTE_PLACEHOLDER_RE.match(doc.current_line)
     if placeholder:
         return placeholder.group(1)
 
-    for start, end, identifier in _footnote_references_on_row(doc.text, doc.cursor_position_row):
-        if start <= col <= end:
-            return identifier
-    return None
+    span = _footnote_source_span_at_cursor(doc, direction=1)
+    return span[2] if span is not None else None
 
 
-def _footnote_source_span_at_cursor(document=None):
-    """Return the source span of an inline footnote reference at the cursor."""
-    doc = document or text_area.buffer.document
-    line = doc.current_line
-    col = doc.cursor_position_col
-    for start, end, identifier in _footnote_references_on_row(doc.text, doc.cursor_position_row):
-        if start <= col <= end:
-            return start, end, identifier
-    return None
-
-
-def _next_footnote_identifier():
+def _next_footnote_identifier(source_text=None):
     """Return a stable generated identifier that does not renumber older notes."""
     highest = 0
     pattern = re.compile(r"^fn-(\d+)$")
     identifiers = set(state.footnotes)
-    for _start, _end, identifier, _row, _start_col, _end_col in _footnote_reference_spans(text_area.text):
+    if source_text is None:
+        source_text = text_area.text
+    for _start, _end, identifier, _row, _start_col, _end_col in _footnote_reference_spans(source_text):
         identifiers.add(identifier)
     for identifier in identifiers:
         match = pattern.match(identifier)
@@ -9783,10 +10378,11 @@ def _next_footnote_identifier():
     return f"fn-{candidate}"
 
 
-def _append_footnote_placeholder(identifier, cursor_position):
-    """Append a folded definition while preserving the prose cursor."""
-    buf = text_area.buffer
-    text = buf.text
+def _document_with_appended_footnote_placeholder(
+    identifier, document, cursor_position
+):
+    """Return a document with one folded definition appended to its source."""
+    text = document.text
     placeholder = _footnote_placeholder(identifier)
     if not text:
         new_text = placeholder
@@ -9796,9 +10392,8 @@ def _append_footnote_placeholder(identifier, cursor_position):
         new_text = text + "\n" + placeholder
     else:
         new_text = text + "\n\n" + placeholder
-    _replace_buffer_document(
-        buf, Document(text=new_text, cursor_position=cursor_position)
-    )
+    return Document(text=new_text, cursor_position=cursor_position)
+
 
 
 def _save_footnote_editor():
@@ -9817,11 +10412,17 @@ def _save_footnote_editor():
     )
     if changed:
         # Footnote text is document content even though its folded placeholder
-        # does not change. Capture the old object state so Ctrl+Z can undo an
-        # object-only edit in the correct chronological position.
-        text_area.buffer.save_to_undo_stack()
+        # does not change. Commit the object-only edit through the same rollback
+        # boundary as mixed document/object operations so recovery bookkeeping
+        # cannot leave a partially installed note.
         session.working.dirty = True
-        _set_committed_footnote(session.identifier, session.working)
+        updated_footnotes = dict(state.footnotes)
+        updated_footnotes[session.identifier] = session.working
+        _commit_folded_object_transaction(
+            text_area.buffer,
+            text_area.buffer.document,
+            footnotes=updated_footnotes,
+        )
 
     close_dialog()
     get_app().invalidate()
@@ -9861,22 +10462,15 @@ def open_footnote_editor(identifier):
 
     @note_kb.add("c-x", eager=True)
     def _cut_from_note(event):
-        buf = event.current_buffer
-        if buf.selection_state is not None:
-            get_app().clipboard.set_data(buf.cut_selection())
+        _dialog_buffer_cut(event.current_buffer)
 
     @note_kb.add("c-c")
     def _copy_from_note(event):
-        buf = event.current_buffer
-        if buf.selection_state is not None:
-            get_app().clipboard.set_data(buf.copy_selection())
+        _dialog_buffer_copy(event.current_buffer)
 
     @note_kb.add("c-v")
     def _paste_into_note(event):
-        buf = event.current_buffer
-        if buf.selection_state is not None:
-            buf.cut_selection()
-        buf.paste_clipboard_data(get_app().clipboard.get_data())
+        _dialog_buffer_paste(event.current_buffer)
 
     @note_kb.add("escape")
     def _cancel_note(event):
@@ -9912,6 +10506,44 @@ def do_edit_footnote_at_cursor():
     open_footnote_editor(identifier)
 
 
+def _commit_new_footnote_at_cursor():
+    """Insert a reference, definition object, and placeholder transactionally."""
+    buf = text_area.buffer
+    base_document = buf.document
+    if base_document.selection is not None:
+        base_document, _clipboard_data = base_document.cut_selection()
+
+    identifier = _next_footnote_identifier(base_document.text)
+    reference = f"[^{identifier}]"
+    position = base_document.cursor_position
+    reference_document = Document(
+        base_document.text[:position]
+        + reference
+        + base_document.text[position:],
+        cursor_position=position + len(reference),
+    )
+    final_document = _document_with_appended_footnote_placeholder(
+        identifier,
+        reference_document,
+        reference_document.cursor_position,
+    )
+
+    updated_footnotes = dict(state.footnotes)
+    updated_footnotes[identifier] = FootnoteData(
+        identifier=identifier,
+        text="",
+        original_lines=None,
+        dirty=True,
+    )
+    _commit_folded_object_transaction(
+        buf,
+        final_document,
+        footnotes=updated_footnotes,
+        selection=None,
+    )
+    return identifier
+
+
 def do_insert_footnote():
     """Insert a stable reference and append its simple definition object."""
     if _folded_placeholder_locked():
@@ -9925,32 +10557,7 @@ def do_insert_footnote():
         _folded_edit_warning()
         return
 
-    # The complete insertion, including replacement of any selected prose, is
-    # one logical edit. Save before touching either text or object state.
-    buf.save_to_undo_stack()
-    if buf.selection_state is not None:
-        buf.cut_selection()
-
-    identifier = _next_footnote_identifier()
-    reference = f"[^{identifier}]"
-    pos = buf.cursor_position
-    text = buf.text
-    new_text = text[:pos] + reference + text[pos:]
-    new_cursor = pos + len(reference)
-    _replace_buffer_document(
-        buf, Document(text=new_text, cursor_position=new_cursor)
-    )
-
-    _set_committed_footnote(
-        identifier,
-        FootnoteData(
-            identifier=identifier,
-            text="",
-            original_lines=None,
-            dirty=True,
-        ),
-    )
-    _append_footnote_placeholder(identifier, new_cursor)
+    identifier = _commit_new_footnote_at_cursor()
     open_footnote_editor(identifier)
 
 
@@ -9988,10 +10595,8 @@ def _delete_footnote_object(identifier):
     if target_row is None:
         return False
 
-    buf.save_to_undo_stack()
     updated = dict(state.footnotes)
     del updated[identifier]
-    state.footnotes = updated
 
     lines, cursor_row = _remove_folded_object_line(doc.lines, target_row)
     result = "\n".join(lines)
@@ -10005,7 +10610,11 @@ def _delete_footnote_object(identifier):
         )
     else:
         final_cursor = max(0, min(len(result), new_cursor))
-    _replace_buffer_document(buf, Document(result, final_cursor))
+    _commit_folded_object_transaction(
+        buf,
+        Document(result, final_cursor),
+        footnotes=updated,
+    )
     return True
 
 
@@ -10026,106 +10635,105 @@ def do_delete_footnote_at_cursor():
     )
 
 
+async def _working_state_iteration():
+    """Run one recovery maintenance/checkpoint iteration."""
+    # Cleanup failures are normally rare and often transient (for example,
+    # permissions changed while Carriage was running). Retry at a low rate
+    # without making the normal 250 ms checkpoint poll perform filesystem work
+    # on every iteration.
+    now = time.monotonic()
+    if (
+        state.recovery_cleanup_failures
+        and now >= state.recovery_cleanup_retry_at
+    ):
+        state.recovery_cleanup_retry_at = now + 5.0
+        _retry_failed_recovery_cleanup()
+
+    # A failed checkpoint/cleanup is visible in the status bar immediately.
+    # The modal warning waits until no other dialog is open so it never stacks
+    # on top of an unrelated user decision.
+    if (
+        state.recovery_error
+        and not state.recovery_error_reported
+        and current_float is None
+    ):
+        state.recovery_error_reported = True
+        detail = state.recovery_error_message or "Unknown recovery error."
+        if state.recovery_error_kind == "cleanup":
+            show_message(
+                "Recovery cleanup error",
+                "Carriage could not remove or safely retire an obsolete "
+                "working-state journal. Your Markdown file is unaffected, "
+                "but Carriage will block destructive document transitions "
+                f"until the journal can be made harmless.\n\n{detail}",
+            )
+        else:
+            show_message(
+                "Recovery unavailable",
+                "Carriage could not update the protected working-state journal. "
+                "Your Markdown file has not been changed; use Save to commit work "
+                f"manually.\n\n{detail}",
+            )
+
+    # Every main-buffer/object-draft mutation advances the revision. If the
+    # current revision has already been reconciled with disk/journal, there is
+    # nothing to materialize or compare.
+    if state.working_state_revision <= state.working_state_persisted_revision:
+        return
+
+    if not _has_recoverable_changes():
+        _clear_recovery_file()
+        _reset_working_state_tracking()
+        return
+
+    now = time.monotonic()
+    if state.working_state_first_dirty_at is None:
+        state.working_state_first_dirty_at = now
+    if state.working_state_last_change_at is None:
+        state.working_state_last_change_at = now
+
+    idle_due = (
+        now - state.working_state_last_change_at >= WORKING_STATE_IDLE_SECONDS
+    )
+    max_due = (
+        now - state.working_state_first_dirty_at
+        >= WORKING_STATE_MAX_LATENCY_SECONDS
+    )
+    if not (idle_due or max_due):
+        return
+
+    # Payload capture is intentionally inside the outer loop's exception
+    # boundary as serialization/state errors can occur before the worker call.
+    recovery_path, epoch, payload, revision = _recovery_snapshot_data()
+    try:
+        committed = await asyncio.to_thread(
+            _write_recovery_payload_atomic,
+            recovery_path,
+            epoch,
+            payload,
+            revision,
+        )
+    except (OSError, UnicodeError, TypeError, ValueError) as e:
+        _record_recovery_failure(e)
+        return
+
+    if committed:
+        _record_recovery_success(revision)
+        get_app().invalidate()
+
+
 async def _working_state_loop():
-    """Persist unsaved working state after idle pauses and during long bursts."""
+    """Persist unsaved working state without allowing one failure to kill it."""
     while True:
         await asyncio.sleep(WORKING_STATE_POLL_SECONDS)
-
-        # Cleanup failures are normally rare and often transient (for example,
-        # permissions changed while Carriage was running). Retry at a low rate
-        # without making the normal 250 ms checkpoint poll perform filesystem
-        # work on every iteration.
-        now = time.monotonic()
-        if (
-            state.recovery_cleanup_failures
-            and now >= state.recovery_cleanup_retry_at
-        ):
-            state.recovery_cleanup_retry_at = now + 5.0
-            _retry_failed_recovery_cleanup()
-
-        # A failed checkpoint/cleanup is visible in the status bar immediately.
-        # The modal warning waits until no other dialog is open so it never
-        # stacks on top of an unrelated user decision.
-        if (
-            state.recovery_error
-            and not state.recovery_error_reported
-            and current_float is None
-        ):
-            state.recovery_error_reported = True
-            detail = state.recovery_error_message or "Unknown recovery error."
-            if state.recovery_error_kind == "cleanup":
-                show_message(
-                    "Recovery cleanup error",
-                    "Carriage could not remove or safely retire an obsolete "
-                    "working-state journal. Your Markdown file is unaffected, "
-                    "but Carriage will block destructive document transitions "
-                    f"until the journal can be made harmless.\n\n{detail}",
-                )
-            else:
-                show_message(
-                    "Recovery unavailable",
-                    "Carriage could not update the protected working-state journal. "
-                    "Your Markdown file has not been changed; use Save to commit work "
-                    f"manually.\n\n{detail}",
-                )
-
-        # Every main-buffer/object-draft mutation advances the revision. If the
-        # current revision has already been reconciled with disk/journal, there
-        # is nothing to materialize or compare. This removes the old four-times-
-        # per-second whole-document scan while preserving undo-to-saved-state:
-        # Undo itself advances the revision, so that transition still reaches
-        # _has_recoverable_changes() below and clears the now-obsolete journal.
-        if state.working_state_revision <= state.working_state_persisted_revision:
-            continue
-
-        if not _has_recoverable_changes():
-            _clear_recovery_file()
-            _reset_working_state_tracking()
-            continue
-
-        # Persist only states that changed after the last successful journal
-        # commit. Main prose edits, object commits, and active table/footnote
-        # drafts all signal revisions through the shared mutation hook.
-        now = time.monotonic()
-        if state.working_state_first_dirty_at is None:
-            state.working_state_first_dirty_at = now
-        if state.working_state_last_change_at is None:
-            state.working_state_last_change_at = now
-
-        idle_due = (
-            now - state.working_state_last_change_at >= WORKING_STATE_IDLE_SECONDS
-        )
-        max_due = (
-            now - state.working_state_first_dirty_at
-            >= WORKING_STATE_MAX_LATENCY_SECONDS
-        )
-        if not (idle_due or max_due):
-            continue
-
-        recovery_path, epoch, payload, revision = _recovery_snapshot_data()
         try:
-            committed = await asyncio.to_thread(
-                _write_recovery_payload_atomic,
-                recovery_path,
-                epoch,
-                payload,
-                revision,
+            await _working_state_iteration()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            _record_recovery_failure(
+                RuntimeError(f"Unexpected recovery checkpoint error: {e}")
             )
-        except (OSError, UnicodeError, TypeError, ValueError) as e:
-            state.recovery_write_error_message = str(e)
-            _refresh_recovery_error_state()
-            # Avoid a tight retry loop after an I/O failure. New edits will
-            # update last_change_at naturally; otherwise retry after the normal
-            # idle interval.
-            retry_at = time.monotonic()
-            state.working_state_first_dirty_at = retry_at
-            state.working_state_last_change_at = retry_at
-            get_app().invalidate()
-            continue
-
-        if committed:
-            _record_recovery_success(revision)
-            get_app().invalidate()
 
 
 
@@ -10692,8 +11300,77 @@ def do_run_spellcheck():
         _launch_spellcheck()
 
 
+async def _run_external_command_in_terminal(argv):
+    """Run an argv command with terminal ownership and return its exit status."""
+    async with in_terminal():
+        process = await asyncio.create_subprocess_exec(*argv)
+        try:
+            return await process.wait()
+        except asyncio.CancelledError:
+            if process.returncode is None:
+                try:
+                    process.terminate()
+                except ProcessLookupError:
+                    pass
+                try:
+                    await process.wait()
+                except Exception:
+                    pass
+            raise
+
+
+def _spellcheck_failure_text(return_code):
+    if return_code < 0:
+        return f"The spell checker was terminated by signal {-return_code}."
+    return f"The spell checker exited with status {return_code}."
+
+
+def _reload_spellchecked_file(path, *, allow_large=False):
+    """Reload a checker-edited file, confirming unexpected large growth."""
+    try:
+        content, disk_snapshot = _read_utf8_file_with_snapshot(
+            path, allow_large=allow_large
+        )
+    except _LargeFileConfirmationRequired as e:
+        confirm(
+            "Large file",
+            "The spell checker increased the file beyond Carriage's large-file "
+            "warning threshold.\n\n" + _large_file_prompt_text(path, e.size_bytes),
+            lambda: _reload_spellchecked_file(path, allow_large=True),
+        )
+        return False
+    except (OSError, UnicodeError) as e:
+        show_message("Error reloading file", str(e))
+        return False
+
+    if state.path is None or not _same_document_path(path, state.path):
+        show_message(
+            "Spell checker result not loaded",
+            "The active document changed before the spell checker finished. "
+            "The checked file was left on disk and the current editor document "
+            "was not replaced.",
+        )
+        return False
+
+    visible = _collapse_objects_from_source(content)
+    text_area.buffer.reset(Document(text=visible))
+    state.saved_text = content
+    state.disk_snapshot = disk_snapshot
+    cleanup_ok = _clear_recovery_file()
+    _reset_working_state_tracking()
+    if not cleanup_ok:
+        show_message(
+            "Recovery cleanup error",
+            "The spell-checked file was reloaded successfully, but Carriage "
+            "could not safely retire its obsolete recovery journal.\n\n"
+            f"{state.recovery_error_message or 'Unknown recovery cleanup error.'}",
+        )
+    return True
+
+
 def _launch_spellcheck():
-    argv = _spellcheck_argv(state.path)
+    checked_path = state.path
+    argv = _spellcheck_argv(checked_path)
     executable = _resolve_executable(argv[0])
     if executable is None:
         show_message(
@@ -10704,40 +11381,32 @@ def _launch_spellcheck():
         return
     argv[0] = executable
 
+    try:
+        precheck_size = os.stat(checked_path).st_size
+    except OSError as e:
+        show_message("Spell checker error", str(e))
+        return
+    previously_large = precheck_size > LARGE_FILE_WARNING_BYTES
+
     async def run_and_reload():
-        # prompt_toolkit hands run_system_command a shell command string. Quote
-        # every array element after substitution so the TOML array retains
-        # argument boundaries even when the document path contains spaces.
-        cmd = " ".join(shlex.quote(arg) for arg in argv)
-        state.external_process_running = True
         try:
-            await application.run_system_command(cmd, wait_for_enter=False)
+            return_code = await _run_external_command_in_terminal(argv)
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             show_message("Spell checker error", str(e))
             return
-        finally:
-            state.external_process_running = False
 
-        # The configured checker edits the file in place. Reload that file and
-        # make the exact edited bytes the new conflict-detection baseline.
-        try:
-            content, disk_snapshot = _read_utf8_file_with_snapshot(state.path)
-        except (OSError, UnicodeError) as e:
-            show_message("Error reloading file", str(e))
+        if return_code != 0:
+            show_message("Spell checker error", _spellcheck_failure_text(return_code))
             return
-        visible = _collapse_objects_from_source(content)
-        text_area.buffer.reset(Document(text=visible))
-        state.saved_text = content
-        state.disk_snapshot = disk_snapshot
-        cleanup_ok = _clear_recovery_file()
-        _reset_working_state_tracking()
-        if not cleanup_ok:
-            show_message(
-                "Recovery cleanup error",
-                "The spell-checked file was reloaded successfully, but Carriage "
-                "could not safely retire its obsolete recovery journal.\n\n"
-                f"{state.recovery_error_message or 'Unknown recovery cleanup error.'}",
-            )
+
+        # A file that was already over the threshold has necessarily been
+        # approved (or deliberately created/saved) in this editor session. A
+        # checker that unexpectedly grows a formerly small file must ask again.
+        _reload_spellchecked_file(
+            checked_path, allow_large=previously_large
+        )
 
     get_app().create_background_task(run_and_reload())
 
@@ -11152,15 +11821,6 @@ def _document_metadata(visible_text=None):
     )
     _document_metadata_cache = cache
     return cache
-
-
-def _current_section_title(doc):
-    """Return the nearest recognized ATX heading at or before the cursor."""
-    metadata = _document_metadata(doc.text)
-    index = bisect_right(metadata.heading_rows, doc.cursor_position_row) - 1
-    if index < 0:
-        return None
-    return metadata.heading_titles[index]
 
 
 def _document_progress(doc):
@@ -11894,7 +12554,7 @@ def _after_inline_footnote_reference():
     buf = text_area.buffer
     if buf.selection_state is not None:
         return False
-    span = _footnote_source_span_at_cursor(buf.document)
+    span = _footnote_source_span_at_cursor(buf.document, direction=-1)
     return span is not None and buf.document.cursor_position_col == span[1]
 
 
@@ -11902,12 +12562,12 @@ def _before_inline_footnote_reference():
     buf = text_area.buffer
     if buf.selection_state is not None:
         return False
-    span = _footnote_source_span_at_cursor(buf.document)
+    span = _footnote_source_span_at_cursor(buf.document, direction=1)
     return span is not None and buf.document.cursor_position_col == span[0]
 
 
-def _delete_inline_footnote_reference(buf):
-    span = _footnote_source_span_at_cursor(buf.document)
+def _delete_inline_footnote_reference(buf, direction):
+    span = _footnote_source_span_at_cursor(buf.document, direction=direction)
     if span is None:
         return
     start_col, end_col, _identifier = span
@@ -11925,12 +12585,12 @@ def _delete_inline_footnote_reference(buf):
 def _(event):
     # Remove the compact [n] reference as one source object. The definition is
     # intentionally retained; orphaned note text is safer than silent data loss.
-    _delete_inline_footnote_reference(event.current_buffer)
+    _delete_inline_footnote_reference(event.current_buffer, direction=-1)
 
 
 @kb.add("delete", filter=editor_focused & Condition(_before_inline_footnote_reference))
 def _(event):
-    _delete_inline_footnote_reference(event.current_buffer)
+    _delete_inline_footnote_reference(event.current_buffer, direction=1)
 
 
 def _at_list_item_body_start():
@@ -12258,13 +12918,23 @@ def _visual_source_candidates(row, info):
     return _store_bounded_visual_cache(cache, key, frozen_by_wrap)
 
 
-def _normalize_visual_source_col(document, row, source_col):
-    """Snap a source column to an explicit visible cursor boundary."""
+def _normalize_visual_source_col(
+    document, row, source_col, *, structural_body_col=None
+):
+    """Snap a source column to an explicit visible cursor boundary.
+
+    ``structural_body_col`` lets startup/recovery normalization use the stable
+    document layout before a real terminal width exists.  Interactive callers
+    keep the ordinary width-aware gutter behavior by leaving it unset.
+    """
     if not (0 <= row < document.line_count):
         return source_col
     source_line = document.lines[row]
     source_col = max(0, min(len(source_line), int(source_col)))
-    source_col = max(source_col, _hidden_structural_body_col(document, row))
+    if structural_body_col is None:
+        structural_body_col = _hidden_structural_body_col(document, row)
+    structural_body_col = max(0, min(len(source_line), int(structural_body_col)))
+    source_col = max(source_col, structural_body_col)
 
     if (
         source_col > 0
@@ -12697,7 +13367,7 @@ def _move_editor_cursor_across_lines(delta):
         # skips the sentinel first and then crosses the newline in this same
         # keypress, taking the caret directly to the next visible line.
 
-    footnote_span = _footnote_source_span_at_cursor(doc)
+    footnote_span = _footnote_source_span_at_cursor(doc, direction=delta)
     if footnote_span is not None:
         start_col, end_col, _identifier = footnote_span
         if delta > 0 and col < end_col:
@@ -12795,8 +13465,6 @@ def _(event):
         event.current_buffer.exit_selection()
         _move_editor_cursor_across_lines(-1)
 
-
-extend_selection_mode = Condition(lambda: state.extend_selection_mode)
 
 
 @kb.add("c-left", filter=editor_focused)
@@ -13007,22 +13675,49 @@ def _format_config_startup_warning(diagnostics):
 
 def _start_background_tasks(
     startup_error=None,
+    startup_large_file=None,
     recovery_source_path=None,
     offer_any_recovery=False,
     config_diagnostics=None,
 ):
     application.create_background_task(_working_state_loop())
 
+    def offer_recovery_after_startup(path=None):
+        if path is not None:
+            _offer_stale_recovery(path)
+        elif offer_any_recovery:
+            _offer_stale_recovery()
+
+    def load_large_startup_file(path):
+        try:
+            content, disk_snapshot = _read_utf8_file_with_snapshot(
+                path, allow_large=True
+            )
+        except (OSError, UnicodeError) as e:
+            show_message("Error opening file", f"{path}\n\n{e}")
+            return
+        _install_open_document(path, content, disk_snapshot)
+        offer_recovery_after_startup(path)
+
     def continue_startup():
         # Preserve the pre-v1.139 startup precedence: a requested file-open
-        # error is shown instead of offering recovery for that launch.
+        # error is shown instead of offering recovery for that launch. A large
+        # command-line file is the one exception: defer its allocation until
+        # the TUI exists so the user can explicitly approve the load.
         if startup_error is not None:
             title, message = startup_error
             show_message(title, message)
+        elif startup_large_file is not None:
+            path, size_bytes = startup_large_file
+            confirm(
+                "Large file",
+                _large_file_prompt_text(path, size_bytes),
+                lambda: load_large_startup_file(path),
+            )
         elif recovery_source_path is not None:
-            _offer_stale_recovery(recovery_source_path)
-        elif offer_any_recovery:
-            _offer_stale_recovery()
+            offer_recovery_after_startup(recovery_source_path)
+        else:
+            offer_recovery_after_startup()
 
     diagnostics = list(config_diagnostics or ())
     if diagnostics:
@@ -13035,30 +13730,6 @@ def _start_background_tasks(
         continue_startup()
 
 
-def _parse_command_line(argv=None):
-    """Parse Carriage's intentionally small command-line interface."""
-    parser = argparse.ArgumentParser(
-        prog="carriage",
-        description="A prose-first Markdown editor for the terminal.",
-        epilog=(
-            "With no FILE, Carriage opens an untitled document. "
-            "If FILE does not exist, it becomes the path used on first save. "
-            "Use -- before a filename beginning with '-'."
-        ),
-    )
-    parser.add_argument(
-        "file",
-        nargs="?",
-        metavar="FILE",
-        help="Markdown file to open, or path to use for a new document",
-    )
-    parser.add_argument(
-        "--version",
-        action="version",
-        version=f"%(prog)s {APP_VERSION}",
-    )
-    return parser.parse_args(argv)
-
 
 def main(argv=None):
     global application
@@ -13069,13 +13740,13 @@ def main(argv=None):
     args = _parse_command_line(argv)
 
     try:
-        _check_prompt_toolkit_compatibility()
         _check_prompt_toolkit_private_contract()
     except RuntimeError as e:
         print(f"carriage: {e}", file=sys.stderr)
         return 2
 
     startup_error = None
+    startup_large_file = None
     config_diagnostics = list(_CONFIG_DIAGNOSTICS)
     config_creation_warning = _ensure_config_file()
     if config_creation_warning is not None:
@@ -13086,15 +13757,16 @@ def main(argv=None):
         if os.path.exists(path):
             try:
                 content, disk_snapshot = _read_utf8_file_with_snapshot(path)
+            except _LargeFileConfirmationRequired as e:
+                # Defer unusually large command-line files until the TUI exists
+                # so Carriage can ask before allocating the full document.
+                startup_large_file = (path, e.size_bytes)
             except (OSError, UnicodeError) as e:
                 # Start the editor rather than crashing before the UI exists;
                 # display the error as soon as the application is running.
                 startup_error = ("Error opening file", f"{path}\n\n{e}")
             else:
-                text_area.text = _collapse_objects_from_source(content)
-                state.path = path
-                state.saved_text = content
-                state.disk_snapshot = disk_snapshot
+                _install_open_document(path, content, disk_snapshot)
         else:
             state.path = path  # new file at this path on first save
             state.disk_snapshot = _MISSING_DISK_SNAPSHOT
@@ -13104,7 +13776,12 @@ def main(argv=None):
     application.run(
         pre_run=lambda: _start_background_tasks(
             startup_error,
-            recovery_source_path=(state.path if args.file is not None else None),
+            startup_large_file=startup_large_file,
+            recovery_source_path=(
+                state.path
+                if args.file is not None and startup_large_file is None
+                else None
+            ),
             offer_any_recovery=(args.file is None),
             config_diagnostics=config_diagnostics,
         )
