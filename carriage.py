@@ -33,9 +33,10 @@ materialized as standard Markdown. Unsupported tables and complex footnotes
 remain ordinary source.
 
 Carriage includes selection-based italic and bold toggles, interactive Find / Replace,
-prose-aware word counting, lightweight visual highlighting, mouse support, document
-and section navigation, configurable terminal spell checking, and Pandoc export to PDF,
-DOCX, ODT, HTML, and custom formats.
+prose-aware word counting, lightweight visual highlighting, mouse support, desktop
+clipboard integration with an automatic internal fallback, document and section
+navigation, configurable terminal spell checking, and Pandoc export to PDF, DOCX,
+ODT, HTML, and custom formats.
 
 The Markdown file changes only through explicit Save or Save As. Unsaved work
 is protected separately in a private recovery journal. Saves use durable atomic
@@ -59,6 +60,7 @@ Requires:
 Optional:
   pandoc, for document export (or configure another Pandoc executable)
   aspell and an appropriate dictionary package, the default spell checker
+  Linux desktop clipboard helper: wl-clipboard on Wayland, or xclip/xsel on X11
 
 Usage:
   carriage [FILE]
@@ -94,7 +96,7 @@ from html.parser import HTMLParser
 from dataclasses import dataclass, field
 
 APP_NAME = "Carriage"
-APP_VERSION = "1.159"
+APP_VERSION = "1.160"
 
 
 def _build_command_line_parser():
@@ -162,7 +164,8 @@ from prompt_toolkit.cursor_shapes import CursorShape, SimpleCursorShapeConfig
 from prompt_toolkit.output.color_depth import ColorDepth
 from prompt_toolkit.application.current import get_app
 from prompt_toolkit.buffer import Buffer
-from prompt_toolkit.clipboard.base import ClipboardData
+from prompt_toolkit.clipboard.base import Clipboard, ClipboardData
+from prompt_toolkit.clipboard.in_memory import InMemoryClipboard
 from prompt_toolkit.document import Document
 from prompt_toolkit.data_structures import Point
 from prompt_toolkit.filters import Condition, has_completions, has_focus
@@ -311,6 +314,374 @@ except RuntimeError as _prompt_toolkit_startup_error:
         print(f"carriage: {_prompt_toolkit_startup_error}", file=sys.stderr)
         raise SystemExit(2)
     raise
+
+
+class _CommandClipboardBackend:
+    """Plain-text clipboard backend implemented by platform helper commands."""
+
+    def __init__(self, name, copy_command, paste_command):
+        self.name = name
+        self.copy_command = tuple(copy_command)
+        self.paste_command = tuple(paste_command)
+
+    def set_text(self, text):
+        result = subprocess.run(
+            self.copy_command,
+            input=text,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=2,
+            check=False,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or "").strip()
+            raise OSError(detail or f"{self.name} clipboard write failed")
+
+    def get_text(self):
+        result = subprocess.run(
+            self.paste_command,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=2,
+            check=False,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or "").strip()
+            raise OSError(detail or f"{self.name} clipboard read failed")
+        return result.stdout
+
+
+class _WindowsClipboardBackend:
+    """Native Win32 Unicode clipboard support without third-party packages."""
+
+    CF_UNICODETEXT = 13
+    GMEM_MOVEABLE = 0x0002
+
+    def __init__(self):
+        import ctypes
+        from ctypes import wintypes
+
+        self.name = "Windows"
+        self._ctypes = ctypes
+        self._wintypes = wintypes
+        self.user32 = ctypes.WinDLL("user32", use_last_error=True)
+        self.kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        self.user32.OpenClipboard.argtypes = [wintypes.HWND]
+        self.user32.OpenClipboard.restype = wintypes.BOOL
+        self.user32.CloseClipboard.argtypes = []
+        self.user32.CloseClipboard.restype = wintypes.BOOL
+        self.user32.EmptyClipboard.argtypes = []
+        self.user32.EmptyClipboard.restype = wintypes.BOOL
+        self.user32.IsClipboardFormatAvailable.argtypes = [wintypes.UINT]
+        self.user32.IsClipboardFormatAvailable.restype = wintypes.BOOL
+        self.user32.GetClipboardData.argtypes = [wintypes.UINT]
+        self.user32.GetClipboardData.restype = wintypes.HANDLE
+        self.user32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+        self.user32.SetClipboardData.restype = wintypes.HANDLE
+
+        self.kernel32.GetConsoleWindow.argtypes = []
+        self.kernel32.GetConsoleWindow.restype = wintypes.HWND
+        self.kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+        self.kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
+        self.kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+        self.kernel32.GlobalLock.restype = ctypes.c_void_p
+        self.kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+        self.kernel32.GlobalUnlock.restype = wintypes.BOOL
+        self.kernel32.GlobalFree.argtypes = [wintypes.HGLOBAL]
+        self.kernel32.GlobalFree.restype = wintypes.HGLOBAL
+
+    def _raise_last_error(self, action):
+        error = self._ctypes.get_last_error()
+        if error:
+            raise OSError(error, f"Windows clipboard {action} failed")
+        raise OSError(f"Windows clipboard {action} failed")
+
+    def _clipboard_owner_window(self):
+        """Return Carriage's console HWND for safe clipboard ownership.
+
+        Win32 requires a real owner window when EmptyClipboard() is followed by
+        SetClipboardData(). Opening with a NULL HWND can leave the clipboard
+        ownerless after EmptyClipboard(), causing SetClipboardData() to fail.
+        A terminal Carriage process should have a console window handle,
+        including under Windows pseudoconsole hosts. If Windows cannot provide
+        one, fail safely and let Carriage use its internal clipboard instead of
+        clearing the desktop clipboard without being able to replace it.
+        """
+        owner = self.kernel32.GetConsoleWindow()
+        if not owner:
+            raise OSError(
+                "Windows did not provide a console window handle for clipboard ownership"
+            )
+        return owner
+
+    def _open(self):
+        # Another desktop process may briefly own the clipboard. A few short
+        # retries keep ordinary copy/paste reliable without noticeably blocking
+        # Carriage's UI thread. Always open with Carriage's console HWND so a
+        # subsequent EmptyClipboard()/SetClipboardData() sequence has a valid
+        # clipboard owner.
+        owner = self._clipboard_owner_window()
+        for _attempt in range(8):
+            if self.user32.OpenClipboard(owner):
+                return
+            time.sleep(0.01)
+        self._raise_last_error("open")
+
+    @staticmethod
+    def _windows_text(text):
+        normalized = str(text).replace("\r\n", "\n").replace("\r", "\n")
+        return normalized.replace("\n", "\r\n")
+
+    def set_text(self, text):
+        payload = (self._windows_text(text) + "\0").encode("utf-16-le")
+        handle = self.kernel32.GlobalAlloc(self.GMEM_MOVEABLE, len(payload))
+        if not handle:
+            self._raise_last_error("allocation")
+
+        transferred = False
+        try:
+            pointer = self.kernel32.GlobalLock(handle)
+            if not pointer:
+                self._raise_last_error("memory lock")
+            try:
+                self._ctypes.memmove(pointer, payload, len(payload))
+            finally:
+                self.kernel32.GlobalUnlock(handle)
+
+            self._open()
+            try:
+                if not self.user32.EmptyClipboard():
+                    self._raise_last_error("clear")
+                if not self.user32.SetClipboardData(self.CF_UNICODETEXT, handle):
+                    self._raise_last_error("write")
+                # SetClipboardData owns the HGLOBAL after a successful call.
+                transferred = True
+            finally:
+                self.user32.CloseClipboard()
+        finally:
+            if not transferred:
+                self.kernel32.GlobalFree(handle)
+
+    def get_text(self):
+        if not self.user32.IsClipboardFormatAvailable(self.CF_UNICODETEXT):
+            return None
+
+        self._open()
+        try:
+            handle = self.user32.GetClipboardData(self.CF_UNICODETEXT)
+            if not handle:
+                self._raise_last_error("read")
+            pointer = self.kernel32.GlobalLock(handle)
+            if not pointer:
+                self._raise_last_error("memory lock")
+            try:
+                return self._ctypes.wstring_at(pointer)
+            finally:
+                self.kernel32.GlobalUnlock(handle)
+        finally:
+            self.user32.CloseClipboard()
+
+
+def _detect_system_clipboard_backend():
+    """Return the best available plain-text desktop clipboard backend."""
+    if os.name == "nt":
+        try:
+            return _WindowsClipboardBackend()
+        except (OSError, AttributeError):
+            return None
+
+    if sys.platform == "darwin":
+        pbcopy = shutil.which("pbcopy")
+        pbpaste = shutil.which("pbpaste")
+        if pbcopy and pbpaste:
+            return _CommandClipboardBackend(
+                "macOS", (pbcopy,), (pbpaste,)
+            )
+        return None
+
+    # Wayland first, then the conventional X11 clipboard helpers. These tools
+    # remain optional: a headless/minimal Linux install simply uses Carriage's
+    # in-memory fallback.
+    wl_copy = shutil.which("wl-copy")
+    wl_paste = shutil.which("wl-paste")
+    if wl_copy and wl_paste and os.environ.get("WAYLAND_DISPLAY"):
+        return _CommandClipboardBackend(
+            "Wayland",
+            (wl_copy, "--type", "text/plain;charset=utf-8"),
+            (wl_paste, "--no-newline", "--type", "text"),
+        )
+
+    xclip = shutil.which("xclip")
+    if xclip and os.environ.get("DISPLAY"):
+        return _CommandClipboardBackend(
+            "X11",
+            (xclip, "-selection", "clipboard", "-in"),
+            (xclip, "-selection", "clipboard", "-out"),
+        )
+
+    xsel = shutil.which("xsel")
+    if xsel and os.environ.get("DISPLAY"):
+        return _CommandClipboardBackend(
+            "X11",
+            (xsel, "--clipboard", "--input"),
+            (xsel, "--clipboard", "--output"),
+        )
+
+    return None
+
+
+def _normalize_clipboard_text(text):
+    """Normalize external clipboard line endings to Carriage's LF convention."""
+    return str(text).replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _normalized_clipboard_data(data):
+    """Return plain clipboard data with LF-normalized text."""
+    if not isinstance(data, ClipboardData):
+        return ClipboardData()
+    return ClipboardData(_normalize_clipboard_text(data.text), data.type)
+
+
+class CarriageClipboard(Clipboard):
+    """Desktop clipboard with a transparent in-memory fallback.
+
+    Carriage always records copied text in an internal prompt_toolkit clipboard
+    first. When a desktop backend is available, the same plain text is mirrored
+    there. If no desktop backend exists, the internal clipboard is the fallback.
+    If a Carriage Copy/Cut cannot mirror successfully, that internal copy remains
+    authoritative until a later mirror succeeds. Once the desktop clipboard is
+    synchronized, a failed/non-text desktop read is treated as empty rather than
+    resurrecting older internal clipboard contents.
+    """
+
+    def __init__(self, backend=None):
+        self._memory = InMemoryClipboard()
+        self._backend = backend if backend is not None else _detect_system_clipboard_backend()
+        self._fallback_notice_shown = False
+        # A failed desktop write means the desktop clipboard may still contain
+        # older text. Until a later Copy/Cut mirrors successfully, Carriage's
+        # internal clipboard is authoritative for Paste so stale desktop text
+        # can never replace the copy the writer just made. When possible, keep
+        # a snapshot of that post-failure desktop state so a later external Copy
+        # can be recognized and allowed to become authoritative again.
+        self._desktop_out_of_sync = False
+        self._failed_write_desktop_snapshot_known = False
+        self._failed_write_desktop_snapshot = None
+
+    @property
+    def backend_name(self):
+        return getattr(self._backend, "name", None)
+
+    def _notice_fallback(self):
+        if self._fallback_notice_shown:
+            return
+        self._fallback_notice_shown = True
+        notice = globals().get("show_transient_status")
+        if callable(notice):
+            try:
+                notice(
+                    "System clipboard unavailable; using Carriage clipboard.",
+                    duration=4.0,
+                )
+            except Exception:
+                pass
+
+    def set_data(self, data):
+        normalized = _normalized_clipboard_data(data)
+        self._memory.set_data(normalized)
+        if self._backend is None:
+            self._notice_fallback()
+            return
+        try:
+            self._backend.set_text(normalized.text)
+        except (OSError, subprocess.SubprocessError, UnicodeError):
+            self._desktop_out_of_sync = True
+            self._failed_write_desktop_snapshot_known = False
+            self._failed_write_desktop_snapshot = None
+            # A failed write may leave the desktop clipboard unchanged, may
+            # partially clear it, or may fail before touching it. Capture its
+            # resulting text state when that can be done safely. Paste can then
+            # distinguish that stale state from a later external Copy.
+            try:
+                stale_text = self._backend.get_text()
+            except (OSError, subprocess.SubprocessError, UnicodeError):
+                pass
+            else:
+                self._failed_write_desktop_snapshot_known = True
+                self._failed_write_desktop_snapshot = (
+                    None if stale_text is None else _normalize_clipboard_text(stale_text)
+                )
+            self._notice_fallback()
+        else:
+            self._desktop_out_of_sync = False
+            self._failed_write_desktop_snapshot_known = False
+            self._failed_write_desktop_snapshot = None
+            # A successful mirror proves the system clipboard has recovered.
+            # Allow a later, separate failure to surface its fallback notice.
+            self._fallback_notice_shown = False
+
+    def get_data(self):
+        if self._backend is None:
+            self._notice_fallback()
+            return _normalized_clipboard_data(self._memory.get_data())
+
+        if self._desktop_out_of_sync:
+            if self._failed_write_desktop_snapshot_known:
+                try:
+                    current_text = self._backend.get_text()
+                except (OSError, subprocess.SubprocessError, UnicodeError):
+                    return _normalized_clipboard_data(self._memory.get_data())
+                current_snapshot = (
+                    None
+                    if current_text is None
+                    else _normalize_clipboard_text(current_text)
+                )
+                if current_snapshot != self._failed_write_desktop_snapshot:
+                    # Another application changed the desktop clipboard after
+                    # Carriage's failed write. That newer external Copy now wins.
+                    self._desktop_out_of_sync = False
+                    self._failed_write_desktop_snapshot_known = False
+                    self._failed_write_desktop_snapshot = None
+                    if current_text is None:
+                        return ClipboardData()
+                    data = ClipboardData(
+                        current_snapshot, SelectionType.CHARACTERS
+                    )
+                    self._memory.set_data(data)
+                    return data
+            return _normalized_clipboard_data(self._memory.get_data())
+
+        try:
+            text = self._backend.get_text()
+        except (OSError, subprocess.SubprocessError, UnicodeError):
+            # A live desktop clipboard is authoritative once Carriage has
+            # synchronized with it. If that clipboard cannot currently provide
+            # readable text, do not resurrect an older internal value; Paste
+            # must be a no-op. The internal fallback remains authoritative only
+            # when no backend exists or a prior Carriage mirror write failed.
+            return ClipboardData()
+
+        # A successfully readable system clipboard that does not currently hold
+        # Unicode/plain text is intentionally treated as empty rather than
+        # resurrecting an older internal clipboard value.
+        if text is None:
+            return ClipboardData()
+
+        data = ClipboardData(
+            _normalize_clipboard_text(text), SelectionType.CHARACTERS
+        )
+        self._memory.set_data(data)
+        return data
+
+    def rotate(self):
+        self._memory.rotate()
 
 
 @lru_cache(maxsize=4096)
@@ -3314,18 +3685,56 @@ def close_dialog():
     app.invalidate()
 
 
+class SingleLineBuffer(Buffer):
+    """Buffer that enforces Carriage's one-line input invariant.
+
+    ``multiline=False`` prevents Enter from inserting a newline, but terminal
+    bracketed paste still reaches ``Buffer.insert_text()`` directly. Normalize
+    every inserted CR/LF boundary here so Ctrl+V and terminal-native paste have
+    identical behavior. Programmatic document replacement remains unaffected.
+    """
+
+    @staticmethod
+    def _single_line_text(data):
+        return str(data).replace("\r\n", "\n").replace("\r", "\n").replace("\n", " ")
+
+    def insert_text(self, data, overwrite=False, move_cursor=True, fire_event=True):
+        return super().insert_text(
+            self._single_line_text(data),
+            overwrite=overwrite,
+            move_cursor=move_cursor,
+            fire_event=fire_event,
+        )
+
+
 class SingleLineInput:
     """Minimal one-line dialog input without TextArea scrolling chrome."""
 
     def __init__(self, text="", *, style="class:input-field", width=None):
-        self.buffer = Buffer(
-            document=Document(text, cursor_position=len(text)),
+        initial_text = SingleLineBuffer._single_line_text(text)
+        self.buffer = SingleLineBuffer(
+            document=Document(initial_text, cursor_position=len(initial_text)),
             multiline=False,
         )
+        clipboard_kb = KeyBindings()
+
+        @clipboard_kb.add("c-x", eager=True)
+        def _cut(event):
+            _dialog_buffer_cut(event.current_buffer)
+
+        @clipboard_kb.add("c-c")
+        def _copy(event):
+            _dialog_buffer_copy(event.current_buffer)
+
+        @clipboard_kb.add("c-v")
+        def _paste(event):
+            _dialog_buffer_paste(event.current_buffer)
+
         self.control = BufferControl(
             buffer=self.buffer,
             focusable=True,
             focus_on_click=True,
+            key_bindings=clipboard_kb,
         )
         self.window = Window(
             content=self.control,
@@ -9887,6 +10296,7 @@ def do_cut():
     if _folded_placeholder_locked() or _selection_intersects_folded_object(buf):
         _folded_edit_warning()
         return
+    buf.save_to_undo_stack()
     data = buf.cut_selection()
     get_app().clipboard.set_data(data)
     _leave_extend_selection_mode()
@@ -9912,11 +10322,24 @@ def do_paste():
     if _folded_placeholder_locked() or _selection_intersects_folded_object(buf):
         _folded_edit_warning()
         return
+
+    # Resolve clipboard contents before touching an active selection. A desktop
+    # clipboard can legitimately contain no usable plain text (or the current
+    # backend can return an empty value). In that case Paste is a true no-op:
+    # keep both the document and its current selection exactly as they are.
+    data = _normalized_clipboard_data(get_app().clipboard.get_data())
+    if not data.text:
+        return
+
     # Standard editor Paste replaces an active selection rather than inserting
-    # beside it. Keep that behavior for both keyboard and menu invocation.
+    # beside it. Keep that behavior for both keyboard and menu invocation. Save
+    # explicitly here because menu invocation does not receive prompt_toolkit's
+    # automatic pre-keybinding undo snapshot. CarriageBuffer deduplicates the
+    # identical snapshot when Ctrl+V has already caused one.
+    buf.save_to_undo_stack()
     if buf.selection_state is not None:
         buf.cut_selection()
-    buf.paste_clipboard_data(get_app().clipboard.get_data())
+    buf.paste_clipboard_data(data)
     _leave_extend_selection_mode()
 
 
@@ -9933,10 +10356,26 @@ def _dialog_buffer_copy(buf):
 
 
 def _dialog_buffer_paste(buf):
-    """Paste into a simple dialog editor, replacing any active selection."""
+    """Paste one line into a simple dialog editor, replacing any selection.
+
+    prompt_toolkit's ``multiline=False`` prevents Enter from creating a new
+    line, but bracketed/system paste can still deliver embedded CR/LF. Every
+    editor that uses this helper is intentionally single-line, so convert those
+    pasted line boundaries to spaces before inserting them. Resolve and sanitize
+    the clipboard text before cutting an active selection so an empty/non-text
+    clipboard leaves the field and its selection unchanged. The main prose
+    editor uses ``do_paste()`` instead and therefore keeps multiline paste.
+    """
+    data = _normalized_clipboard_data(get_app().clipboard.get_data())
+    single_line = ClipboardData(
+        data.text.replace("\n", " "),
+        SelectionType.CHARACTERS,
+    )
+    if not single_line.text:
+        return
     if buf.selection_state is not None:
         buf.cut_selection()
-    buf.paste_clipboard_data(get_app().clipboard.get_data())
+    buf.paste_clipboard_data(single_line)
 
 
 
@@ -10692,6 +11131,9 @@ def open_table_editor(table_number):
         height=D(preferred=3),
         style="class:table.cell-editor",
     )
+    # TextArea constructs a normal Buffer internally. Promote this deliberately
+    # single-line editor so terminal bracketed paste cannot bypass sanitization.
+    cell_editor.buffer.__class__ = SingleLineBuffer
     title_editor.buffer.on_text_changed += _working_state_changed
     cell_editor.buffer.on_text_changed += _working_state_changed
 
@@ -11010,6 +11452,9 @@ def open_footnote_editor(identifier):
         height=D(preferred=8, max=14),
         style="class:footnote.editor",
     )
+    # Keep terminal-native bracketed paste consistent with Ctrl+V in this
+    # deliberately single-line simple-footnote editor.
+    editor.buffer.__class__ = SingleLineBuffer
     editor.buffer.on_text_changed += _working_state_changed
     session.editor = editor
 
@@ -12003,9 +12448,9 @@ KEYBINDING_ROWS = [
     ("Ctrl+Z", "Undo"),
     ("Ctrl+R", "Redo"),
     ("Ctrl+F", "Find / replace"),
-    ("Ctrl+X", "Cut to Carriage clipboard"),
-    ("Ctrl+C", "Copy to Carriage clipboard"),
-    ("Ctrl+V", "Paste from Carriage clipboard"),
+    ("Ctrl+X", "Cut to clipboard"),
+    ("Ctrl+C", "Copy to clipboard"),
+    ("Ctrl+V", "Paste from clipboard"),
     ("Ctrl+Q", "Quit"),
     ("F1", "Carriage Help"),
     ("F2", "Toggle italic on selected text"),
@@ -12070,8 +12515,13 @@ def _format_help_notes(width=62):
             "that remain ordinary Markdown are searched normally."
         ),
         (
-            "Clipboard: Ctrl+X, Ctrl+C, and Ctrl+V use Carriage's internal clipboard. "
-            "They do not automatically exchange text with the desktop clipboard."
+            "Clipboard: Ctrl+X, Ctrl+C, and Ctrl+V use the desktop system clipboard "
+            "for plain text when the platform provides an available backend. Windows uses "
+            "native clipboard support and macOS uses pbcopy/pbpaste. On Linux, install "
+            "wl-clipboard for Wayland or xclip/xsel for X11. These helpers are optional: "
+            "if no system clipboard backend is available, Carriage automatically falls "
+            "back to its internal clipboard and keeps Cut/Copy/Paste working within "
+            "Carriage. Pasted CRLF or CR line endings are normalized to LF."
         ),
         (
             "Emphasis: Select text and press F2 for italic or F3 for bold. The attributes "
@@ -14396,6 +14846,7 @@ def _create_application():
         layout=layout,
         key_bindings=kb,
         style=style,
+        clipboard=CarriageClipboard(),
         mouse_support=MOUSE_ENABLED,
         full_screen=True,
         # Without this, prompt_toolkit's default color depth is 256-color, not

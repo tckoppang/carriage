@@ -97,6 +97,14 @@ Adjacent references remain separate atomic objects. Complex or multiline footnot
 
 Undo and redo operate across the document, not only the visible prose. Prose changes, table edits, footnote edits, object insertion and deletion, conversion, and the associated object state participate in one chronological undo history.
 
+## Find and replace
+
+Press `Ctrl+F` or choose **Edit > Find / Replace** to open the one-line search interface in the status-bar position. Search is literal, begins at the cursor, wraps around the document, and uses a single-line selection as the initial search term when available.
+
+Enter or Down moves to the next match; Up moves to the previous match. Tab switches to replacement. In Replace mode, Enter replaces the current occurrence and advances, while `Alt+A` replaces all matches as one undoable document change. `Alt+C` toggles case-sensitive matching and `Alt+W` toggles whole-word matching. Esc returns to the document. Regular-expression search is intentionally not included.
+
+Find / Replace searches ordinary visible document text. Folded table and footnote placeholder lines and their hidden contents are excluded from search. Complex or multiline footnotes that remain ordinary Markdown are searched normally.
+
 ## Saving and recovery
 
 The Markdown file changes only through explicit **Save** or **Save As**. Carriage does not silently autosave the source file.
@@ -196,6 +204,9 @@ Optional external tools provide additional features:
 - **Aspell** and a dictionary package for spell checking
 - **Pandoc** for PDF, DOCX, ODT, HTML, and custom export
 - a PDF engine supported by Pandoc for PDF export
+- on Linux, **wl-clipboard** for desktop clipboard exchange under Wayland, or **xclip**/**xsel** under X11
+
+Linux clipboard helpers are optional. Without one, Carriage automatically uses its internal clipboard, so Cut/Copy/Paste still work within Carriage. Windows uses native clipboard support, and macOS uses the standard `pbcopy`/`pbpaste` tools.
 
 Carriage is a terminal application. It does not require GTK, Qt, or another graphical toolkit.
 
@@ -243,11 +254,13 @@ python carriage.py -- -draft.md
 
 ### Fedora packages
 
-Fedora users can install optional external tools with DNF:
+Fedora users on the usual Wayland desktop can install the optional external tools with DNF:
 
 ```bash
-sudo dnf install aspell aspell-en pandoc-cli pandoc-pdf
+sudo dnf install aspell aspell-en pandoc-cli pandoc-pdf wl-clipboard
 ```
+
+`wl-clipboard` provides `wl-copy` and `wl-paste`. On an X11 session, install `xclip` or `xsel` instead for system clipboard exchange. Clipboard helpers remain optional because Carriage falls back to its internal clipboard when none is available.
 
 Fedora also provides `python3-prompt-toolkit`, but its installed version must fall within Carriage's audited range. Check it with:
 
@@ -288,7 +301,8 @@ Press `F10` or `Ctrl+Space` to activate the menu bar. `F1` opens Carriage Help.
 | `Ctrl+O` | Open file |
 | `Ctrl+S` or `F9` | Save |
 | `Ctrl+Z` / `Ctrl+R` | Undo / redo |
-| `Ctrl+X` / `Ctrl+C` / `Ctrl+V` | Internal cut / copy / paste |
+| `Ctrl+F` | Find / replace |
+| `Ctrl+X` / `Ctrl+C` / `Ctrl+V` | Cut / copy / paste using the desktop clipboard when available |
 | `F2` / `F3` | Toggle italic / bold on selected text |
 | `F4` / `F5` | Insert table / footnote |
 | `F6` | Toggle Extend Selection mode |
@@ -298,7 +312,7 @@ Press `F10` or `Ctrl+Space` to activate the menu bar. `F1` opens Carriage Help.
 | `Alt+Up` / `Alt+Down` | Previous / next ATX section |
 | `Tab` | Edit a folded table or footnote at the cursor |
 
-Carriage uses its own internal clipboard. It does not automatically exchange text with the desktop clipboard.
+Carriage exchanges plain text with the desktop system clipboard when an available platform backend is present. Windows uses native clipboard support; macOS uses `pbcopy`/`pbpaste`; Linux uses `wl-copy`/`wl-paste` from **wl-clipboard** under Wayland, or `xclip`/`xsel` under X11. Linux clipboard helpers are optional. If no system clipboard backend is available, Cut/Copy/Paste automatically fall back to Carriage's internal clipboard. Pasted CRLF or CR line endings are normalized to LF.
 
 ## Documentation
 

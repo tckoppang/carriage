@@ -9,9 +9,10 @@
 | `Ctrl+S` or `F9` | Save |
 | `Ctrl+Z` | Undo |
 | `Ctrl+R` | Redo |
-| `Ctrl+X` | Cut to the Carriage clipboard |
-| `Ctrl+C` | Copy to the Carriage clipboard |
-| `Ctrl+V` | Paste from the Carriage clipboard |
+| `Ctrl+F` | Find / replace |
+| `Ctrl+X` | Cut to the clipboard |
+| `Ctrl+C` | Copy to the clipboard |
+| `Ctrl+V` | Paste from the clipboard |
 | `Ctrl+Q` | Quit |
 | `F1` | Carriage Help |
 | `F2` | Toggle italic on selected text |
@@ -27,7 +28,7 @@
 | `Alt+Up` / `Alt+Down` | Previous / next ATX section |
 | `1` through `6` | Jump among File, Edit, Go, Export, Tools, and Help while the menu bar is active |
 | `Tab` | Indent normally; edit a folded table or footnote at the cursor |
-| `Esc` | Close a menu or dialog |
+| `Esc` | Close a menu, dialog, or Find / Replace |
 
 ## Selection
 
@@ -43,9 +44,26 @@ Press `F6` again to leave the mode while preserving the selection. Shift-based s
 
 Double-click selects a word. Triple-click selects the current paragraph or list item. Structural Markdown shown in the hanging gutter is not a cursor destination.
 
+## Find and replace
+
+`Ctrl+F` opens Find / Replace on the status-line row. Search is literal, begins at the current cursor position, and wraps around the document. If a single-line selection is active, it becomes the initial search term.
+
+While the Find field is active:
+
+- Enter or Down moves to the next match.
+- Up moves to the previous match.
+- Tab switches to Replace.
+- `Alt+C` toggles case-sensitive matching.
+- `Alt+W` toggles whole-word matching.
+- Esc closes Find / Replace and returns to the document.
+
+While the Replace field is active, Enter replaces the current match and advances, Down skips to the next match, Up moves to the previous match, and `Alt+A` replaces all matches. Replace All is recorded as one undoable document change. Tab or Shift+Tab returns to Find.
+
+Carriage does not use regular expressions for Find / Replace. Find / Replace searches ordinary visible document text. Folded table and footnote placeholder lines and their hidden contents are excluded from search. Complex or multiline footnotes that remain ordinary Markdown are searched normally.
+
 ## Clipboard
 
-`Ctrl+X`, `Ctrl+C`, and `Ctrl+V` use Carriage's internal clipboard. They do not automatically exchange text with the desktop clipboard.
+`Ctrl+X`, `Ctrl+C`, and `Ctrl+V` exchange plain text with the desktop system clipboard when an available platform backend is present. Windows uses native clipboard support; macOS uses `pbcopy`/`pbpaste`; Linux uses `wl-copy`/`wl-paste` from **wl-clipboard** under Wayland, or `xclip`/`xsel` under X11. Linux clipboard helpers are optional. If no system clipboard backend is available, Carriage automatically falls back to its internal clipboard, so Cut/Copy/Paste continue to work within Carriage. Pasted CRLF or CR line endings are normalized to LF.
 
 ## Emphasis
 
