@@ -32,9 +32,9 @@ associated table or footnote editor. On Save and export, both object types are
 materialized as standard Markdown. Unsupported tables and complex footnotes
 remain ordinary source.
 
-Carriage includes selection-based italic and bold toggles, prose-aware word
-counting, lightweight visual highlighting, mouse support, document and section
-navigation, configurable terminal spell checking, and Pandoc export to PDF,
+Carriage includes selection-based italic and bold toggles, interactive Find / Replace,
+prose-aware word counting, lightweight visual highlighting, mouse support, document
+and section navigation, configurable terminal spell checking, and Pandoc export to PDF,
 DOCX, ODT, HTML, and custom formats.
 
 The Markdown file changes only through explicit Save or Save As. Unsaved work
@@ -94,7 +94,7 @@ from html.parser import HTMLParser
 from dataclasses import dataclass, field
 
 APP_NAME = "Carriage"
-APP_VERSION = "1.158"
+APP_VERSION = "1.159"
 
 
 def _build_command_line_parser():
@@ -1128,6 +1128,27 @@ class FootnoteEditorSession:
     dialog_float: object | None = None
 
 
+@dataclass
+class FindReplaceSession:
+    """Ephemeral status-line Find/Replace state; never written to the document."""
+
+    active: bool = False
+    mode: str = "find"
+    query: str = ""
+    replacement: str = ""
+    search_anchor: int = 0
+    origin_cursor: int = 0
+    origin_selection: object | None = None
+    current_match: tuple[int, int] | None = None
+    match_index: int = -1
+    match_count: int = 0
+    wrapped: bool = False
+    case_sensitive: bool = False
+    whole_word: bool = False
+    changed: bool = False
+    suppress_input_events: bool = False
+
+
 # ---------------------------------------------------------------------------
 # Editor state
 # ---------------------------------------------------------------------------
@@ -1188,7 +1209,7 @@ class EditorState:
 
 
 state = EditorState()
-
+find_replace = FindReplaceSession()
 
 def _working_state_changed(_buffer=None, *, immediate=False):
     """Mark unsaved working state for near-continuous durable protection."""
@@ -3029,6 +3050,8 @@ class FullWidthSafeBufferControl(BufferControl):
             # a click on structural Markdown to the visible prose boundary.
             _clamp_buffer_cursor_out_of_gutter(buffer)
             self._carriage_mouse_down_index = buffer.cursor_position
+            if find_replace.active:
+                _find_replace_refocus_input()
             return result
 
         if (
@@ -3039,8 +3062,9 @@ class FullWidthSafeBufferControl(BufferControl):
             self._reset_carriage_click_sequence()
             result = super().mouse_handler(mouse_event)
             _clamp_buffer_cursor_out_of_gutter(buffer)
+            if find_replace.active:
+                _find_replace_refocus_input()
             return result
-
         if mouse_event.event_type == MouseEventType.MOUSE_UP:
             # Disable prompt_toolkit's private timestamp-only double-click
             # heuristic. Carriage owns the complete multi-click policy so a
@@ -3048,7 +3072,11 @@ class FullWidthSafeBufferControl(BufferControl):
             self._last_click_timestamp = None
             result = super().mouse_handler(mouse_event)
             _clamp_buffer_cursor_out_of_gutter(buffer)
-
+            if find_replace.active:
+                anchor = buffer.cursor_position
+                self._reset_carriage_click_sequence()
+                _find_replace_reanchor_after_document_mouse(anchor)
+                return result
             if getattr(self, "_carriage_mouse_dragged", False):
                 self._reset_carriage_click_sequence()
                 return result
@@ -3226,6 +3254,9 @@ current_footnote_editor = None
 def show_dialog(dialog, focus=None):
     """Show a modal dialog, preserving any dialog already underneath it."""
     global current_float
+    # Find/Replace and a modal dialog must never own focus simultaneously.
+    if find_replace.active:
+        _close_find_replace()
     dialog_float = Float(content=dialog)
     focus_target = focus if focus is not None else dialog
     floats.append(dialog_float)
@@ -6689,7 +6720,9 @@ def _folded_placeholder_locked():
 # prompt_toolkit's standard insertion/deletion bindings honor Buffer.read_only.
 # Folded tables and footnote definitions are atomic labels: navigation and
 # object commands remain available, while direct character edits are blocked.
-text_area.buffer.read_only = Condition(_folded_placeholder_locked)
+text_area.buffer.read_only = Condition(
+    lambda: _folded_placeholder_locked() or find_replace.active
+)
 
 
 def _replace_buffer_document(buffer, document):
@@ -9345,6 +9378,494 @@ def do_redo():
     text_area.buffer.redo()
 
 
+# ---------------------------------------------------------------------------
+# Find / Replace
+# ---------------------------------------------------------------------------
+
+def _find_replace_word_char(char):
+    """Return whether char participates in Carriage's whole-word boundary."""
+    return bool(char) and (char.isalnum() or char == "_")
+
+
+def _find_replace_matches(text, query, *, case_sensitive=False, whole_word=False):
+    """Return literal, editable match spans in source order.
+
+    Search is deliberately literal rather than regular-expression based. Folded
+    table/footnote placeholders are presentation objects, so their source labels
+    are excluded from search and replacement just as direct editing excludes them.
+    """
+    if not query:
+        return ()
+
+    pattern = re.escape(query)
+    if whole_word:
+        if _find_replace_word_char(query[0]):
+            pattern = r"(?<!\w)" + pattern
+        if _find_replace_word_char(query[-1]):
+            pattern = pattern + r"(?!\w)"
+    flags = 0 if case_sensitive else re.IGNORECASE
+    return tuple(
+        (match.start(), match.end())
+        for match in re.finditer(pattern, text, flags)
+        if not _folded_edit_range_intersects(text, match.start(), match.end())
+    )
+
+
+def _set_find_replace_input(control, text, *, cursor_position=None):
+    if cursor_position is None:
+        cursor_position = len(text)
+    cursor_position = max(0, min(len(text), cursor_position))
+    control.buffer.set_document(
+        Document(text=text, cursor_position=cursor_position), bypass_readonly=True
+    )
+
+
+def _find_replace_single_line_text(text):
+    """Normalize pasted CR/LF sequences so status-line inputs stay one line."""
+    return text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", " ")
+
+
+def _find_replace_sanitize_input(control):
+    """Return a one-line value, repairing pasted newlines without event recursion."""
+    raw = control.text
+    clean = _find_replace_single_line_text(raw)
+    if clean == raw:
+        return clean
+
+    raw_cursor = control.buffer.cursor_position
+    clean_cursor = len(_find_replace_single_line_text(raw[:raw_cursor]))
+    session = find_replace
+    was_suppressed = session.suppress_input_events
+    session.suppress_input_events = True
+    try:
+        _set_find_replace_input(control, clean, cursor_position=clean_cursor)
+    finally:
+        session.suppress_input_events = was_suppressed
+    return clean
+
+
+def _find_replace_refocus_input():
+    """Return keyboard focus to the active Find/Replace field."""
+    if not find_replace.active:
+        return
+    target = replace_input if find_replace.mode == "replace" else find_input
+    get_app().layout.focus(target)
+    get_app().invalidate()
+
+
+def _find_replace_reanchor_after_document_mouse(anchor):
+    """Use a prose click as a new search origin without surrendering input focus."""
+    session = find_replace
+    if not session.active:
+        return
+    buf = text_area.buffer
+    anchor = max(0, min(len(buf.text), anchor))
+    session.search_anchor = anchor
+    session.current_match = None
+    session.match_index = -1
+    session.wrapped = False
+
+    spans = _find_replace_matches(
+        buf.text,
+        session.query,
+        case_sensitive=session.case_sensitive,
+        whole_word=session.whole_word,
+    )
+    session.match_count = len(spans)
+    if not spans:
+        _find_replace_clear_match(cursor_position=anchor)
+    else:
+        hit = next(
+            (i for i, (start, end) in enumerate(spans) if start <= anchor < end),
+            None,
+        )
+        if hit is not None:
+            _find_replace_select_match(spans, hit, wrapped=False)
+        else:
+            _find_replace_refresh_from_anchor(anchor=anchor)
+    _find_replace_refocus_input()
+
+
+def _find_replace_clear_match(*, cursor_position=None):
+    buf = text_area.buffer
+    buf.exit_selection()
+    if cursor_position is not None:
+        buf.cursor_position = max(0, min(len(buf.text), cursor_position))
+    find_replace.current_match = None
+    find_replace.match_index = -1
+
+
+def _find_replace_select_match(spans, index, *, wrapped=False):
+    buf = text_area.buffer
+    start, end = spans[index]
+    buf.exit_selection()
+    buf.cursor_position = start
+    buf.start_selection(selection_type=SelectionType.CHARACTERS)
+    buf.cursor_position = end
+    find_replace.current_match = (start, end)
+    find_replace.match_index = index
+    find_replace.match_count = len(spans)
+    find_replace.wrapped = bool(wrapped)
+    text_area.window.end_manual_scroll()
+    get_app().invalidate()
+
+
+def _find_replace_refresh_from_anchor(anchor=None, direction=1):
+    """Select the first match from anchor, wrapping once when necessary."""
+    session = find_replace
+    buf = text_area.buffer
+    spans = _find_replace_matches(
+        buf.text,
+        session.query,
+        case_sensitive=session.case_sensitive,
+        whole_word=session.whole_word,
+    )
+    session.match_count = len(spans)
+    session.wrapped = False
+    position = session.search_anchor if anchor is None else anchor
+    position = max(0, min(len(buf.text), position))
+    if not spans:
+        _find_replace_clear_match(cursor_position=position)
+        get_app().invalidate()
+        return False
+
+    wrapped = False
+    if direction >= 0:
+        index = next((i for i, (start, _end) in enumerate(spans) if start >= position), None)
+        if index is None:
+            index = 0
+            wrapped = True
+    else:
+        eligible = [i for i, (_start, end) in enumerate(spans) if end <= position]
+        if eligible:
+            index = eligible[-1]
+        else:
+            index = len(spans) - 1
+            wrapped = True
+    _find_replace_select_match(spans, index, wrapped=wrapped)
+    return True
+
+
+def _find_replace_step(direction):
+    """Move to the next/previous current-query match with wraparound."""
+    session = find_replace
+    buf = text_area.buffer
+    spans = _find_replace_matches(
+        buf.text,
+        session.query,
+        case_sensitive=session.case_sensitive,
+        whole_word=session.whole_word,
+    )
+    session.match_count = len(spans)
+    if not spans:
+        _find_replace_clear_match(cursor_position=session.search_anchor)
+        session.wrapped = False
+        get_app().invalidate()
+        return False
+
+    current = session.current_match
+    if current in spans:
+        index = spans.index(current)
+        new_index = index + (1 if direction >= 0 else -1)
+        wrapped = not (0 <= new_index < len(spans))
+        new_index %= len(spans)
+    else:
+        position = buf.cursor_position
+        if direction >= 0:
+            new_index = next(
+                (i for i, (start, _end) in enumerate(spans) if start >= position),
+                0,
+            )
+            wrapped = all(start < position for start, _end in spans)
+        else:
+            eligible = [i for i, (_start, end) in enumerate(spans) if end <= position]
+            if eligible:
+                new_index = eligible[-1]
+                wrapped = False
+            else:
+                new_index = len(spans) - 1
+                wrapped = True
+
+    _find_replace_select_match(spans, new_index, wrapped=wrapped)
+    return True
+
+
+def _find_replace_query_changed(_buffer=None):
+    session = find_replace
+    if not session.active or session.suppress_input_events:
+        return
+    session.query = _find_replace_sanitize_input(find_input)
+    session.current_match = None
+    session.match_index = -1
+    _find_replace_refresh_from_anchor()
+
+
+def _find_replace_replacement_changed(_buffer=None):
+    if find_replace.active and not find_replace.suppress_input_events:
+        find_replace.replacement = _find_replace_sanitize_input(replace_input)
+        get_app().invalidate()
+
+
+def _find_replace_toggle_case():
+    session = find_replace
+    anchor = session.current_match[0] if session.current_match is not None else session.search_anchor
+    session.case_sensitive = not session.case_sensitive
+    session.current_match = None
+    _find_replace_refresh_from_anchor(anchor=anchor)
+
+
+def _find_replace_toggle_whole_word():
+    session = find_replace
+    anchor = session.current_match[0] if session.current_match is not None else session.search_anchor
+    session.whole_word = not session.whole_word
+    session.current_match = None
+    _find_replace_refresh_from_anchor(anchor=anchor)
+
+
+def _find_replace_show_replace():
+    if not find_replace.active:
+        return
+    find_replace.mode = "replace"
+    get_app().layout.focus(replace_input)
+    get_app().invalidate()
+
+
+def _find_replace_show_find():
+    if not find_replace.active:
+        return
+    find_replace.mode = "find"
+    get_app().layout.focus(find_input)
+    get_app().invalidate()
+
+
+def _find_replace_current_span():
+    session = find_replace
+    spans = _find_replace_matches(
+        text_area.buffer.text,
+        session.query,
+        case_sensitive=session.case_sensitive,
+        whole_word=session.whole_word,
+    )
+    if session.current_match in spans:
+        return session.current_match
+    if not spans:
+        session.match_count = 0
+        return None
+    _find_replace_refresh_from_anchor(anchor=text_area.buffer.cursor_position)
+    return session.current_match
+
+
+def _find_replace_replace_current():
+    """Replace the selected occurrence as one normal undoable editor change."""
+    session = find_replace
+    buf = text_area.buffer
+    session.replacement = replace_input.text
+    span = _find_replace_current_span()
+    if span is None:
+        get_app().invalidate()
+        return
+
+    start, end = span
+    old_text = buf.text
+    new_text = old_text[:start] + session.replacement + old_text[end:]
+    next_anchor = start + len(session.replacement)
+    session.current_match = None
+    session.match_index = -1
+    session.search_anchor = next_anchor
+
+    if new_text != old_text:
+        _commit_folded_object_transaction(
+            buf,
+            Document(text=new_text, cursor_position=next_anchor),
+            selection=None,
+        )
+        session.changed = True
+    else:
+        buf.exit_selection()
+        buf.cursor_position = next_anchor
+
+    _find_replace_refresh_from_anchor(anchor=next_anchor)
+    get_app().layout.focus(replace_input)
+
+
+def _find_replace_replace_all():
+    """Replace every editable match in one document transaction / Undo step."""
+    session = find_replace
+    buf = text_area.buffer
+    session.replacement = replace_input.text
+    spans = _find_replace_matches(
+        buf.text,
+        session.query,
+        case_sensitive=session.case_sensitive,
+        whole_word=session.whole_word,
+    )
+    if not spans:
+        session.match_count = 0
+        get_app().invalidate()
+        return
+
+    pieces = []
+    last = 0
+    for start, end in spans:
+        pieces.append(buf.text[last:start])
+        pieces.append(session.replacement)
+        last = end
+    pieces.append(buf.text[last:])
+    new_text = "".join(pieces)
+    changed_count = sum(
+        1
+        for start, end in spans
+        if buf.text[start:end] != session.replacement
+    )
+    first_end = spans[0][0] + len(session.replacement)
+
+    if new_text == buf.text:
+        # Matching text was found, but applying the requested replacement would
+        # not alter the document. Do not create an undo transaction or claim
+        # that replacements were made. Leave the writer at the current match.
+        _close_find_replace(message="No changes made.")
+        return
+
+    _commit_folded_object_transaction(
+        buf,
+        Document(text=new_text, cursor_position=first_end),
+        selection=None,
+    )
+    session.changed = True
+
+    _close_find_replace(
+        cursor_position=first_end,
+        message=(
+            f"Replaced {changed_count} "
+            f"occurrence{'s' if changed_count != 1 else ''}."
+        ),
+    )
+
+
+def _close_find_replace(*, cursor_position=None, message=None):
+    """Leave the one-line Find/Replace UI and return focus to prose."""
+    session = find_replace
+    if not session.active:
+        return
+    buf = text_area.buffer
+    current = session.current_match
+    session.active = False
+    buf.exit_selection()
+
+    if cursor_position is not None:
+        buf.cursor_position = max(0, min(len(buf.text), cursor_position))
+    elif current is not None:
+        # The selection cursor sits at the end of the match; keep the writer at
+        # the location they chose when Find closes.
+        buf.cursor_position = min(len(buf.text), current[1])
+    elif not session.changed:
+        buf.cursor_position = max(0, min(len(buf.text), session.origin_cursor))
+        if session.origin_selection is not None:
+            buf.selection_state = copy.copy(session.origin_selection)
+
+    session.mode = "find"
+    session.current_match = None
+    session.match_index = -1
+    session.match_count = 0
+    session.wrapped = False
+    session.suppress_input_events = False
+    get_app().layout.focus(text_area)
+    if message:
+        show_transient_status(message)
+    get_app().invalidate()
+
+
+def do_find_replace():
+    """Open Carriage's status-line literal Find/Replace interface."""
+    if current_float is not None:
+        return
+    session = find_replace
+    buf = text_area.buffer
+
+    if session.active:
+        _find_replace_show_find()
+        return
+
+    session.origin_cursor = buf.cursor_position
+    session.origin_selection = copy.copy(buf.selection_state)
+    session.search_anchor = buf.cursor_position
+    state.extend_selection_mode = False
+    prefill = ""
+    if buf.selection_state is not None:
+        start, end = buf.document.selection_range()
+        candidate = buf.text[start:end]
+        # The status-line input is intentionally single-line. Never expose the
+        # hidden source representation of a folded object as a search term.
+        if (
+            candidate
+            and "\n" not in candidate
+            and not _folded_edit_range_intersects(buf.text, start, end)
+        ):
+            prefill = candidate
+            session.search_anchor = start
+
+    buf.exit_selection()
+    session.active = True
+    session.mode = "find"
+    session.query = prefill
+    session.replacement = ""
+    session.current_match = None
+    session.match_index = -1
+    session.match_count = 0
+    session.wrapped = False
+    session.changed = False
+    session.suppress_input_events = True
+    try:
+        _set_find_replace_input(find_input, prefill)
+        _set_find_replace_input(replace_input, "")
+    finally:
+        session.suppress_input_events = False
+
+    if prefill:
+        _find_replace_refresh_from_anchor()
+    else:
+        _find_replace_clear_match(cursor_position=session.search_anchor)
+
+    _clear_transient_status_message()
+    get_app().layout.focus(find_input)
+    get_app().invalidate()
+
+
+def _find_replace_progress_text():
+    session = find_replace
+    if not session.query:
+        return "type to search"
+    if session.match_count <= 0 or session.match_index < 0:
+        return "no matches"
+    label = f"{session.match_index + 1}/{session.match_count}"
+    return label + (" wrap" if session.wrapped else "")
+
+
+def _find_replace_hint_text():
+    """Keep the command legend useful without starving the editable field."""
+    try:
+        columns = get_app().output.get_size().columns
+    except Exception:
+        columns = 80
+    progress = _find_replace_progress_text()
+    session = find_replace
+
+    if session.mode == "replace":
+        if columns >= 105:
+            return f" {progress}  Enter replace  ↓ skip  ↑ previous  Alt+A all  Tab find  Esc done "
+        if columns >= 75:
+            return f" {progress}  Enter repl  ↓ skip  ↑ prev  Alt+A all  Tab find  Esc "
+        return f" {progress}  Enter repl  ↓/↑  Alt+A all  Esc "
+
+    case = "on" if session.case_sensitive else "off"
+    word = "on" if session.whole_word else "off"
+    if columns >= 110:
+        return f" {progress}  Enter/↓ next  ↑ previous  Tab replace  Alt+C case:{case}  Alt+W word:{word}  Esc done "
+    if columns >= 78:
+        return f" {progress}  Enter/↓ next  ↑ prev  Tab repl  C:{case} W:{word}  Esc "
+    return f" {progress}  Enter/↓  ↑  Tab repl  Esc "
+
+
 def _folded_edit_warning():
     show_message(
         "Folded object",
@@ -11481,6 +12002,7 @@ KEYBINDING_ROWS = [
     ("Ctrl+S / F9", "Save"),
     ("Ctrl+Z", "Undo"),
     ("Ctrl+R", "Redo"),
+    ("Ctrl+F", "Find / replace"),
     ("Ctrl+X", "Cut to Carriage clipboard"),
     ("Ctrl+C", "Copy to Carriage clipboard"),
     ("Ctrl+V", "Paste from Carriage clipboard"),
@@ -11535,6 +12057,17 @@ def _format_help_notes(width=62):
             "them through. Double-click selects a word and triple-click selects the "
             "current paragraph or list item. Structural Markdown shown in the hanging "
             "gutter is not a cursor destination."
+        ),
+        (
+            "Find / Replace: Ctrl+F opens the status-line search. Search is literal and "
+            "begins at the cursor; a single-line selection pre-fills the query. Enter "
+            "or Down moves to the next match, Up moves to the previous match, and Tab "
+            "switches between Find and Replace. Alt+C toggles case sensitivity, Alt+W "
+            "toggles whole-word matching, and Alt+A in Replace mode replaces all matches "
+            "as one Undo step. Esc returns to the document. Search covers ordinary visible "
+            "document text; folded table and footnote placeholder lines "
+            "and their hidden contents are excluded from search. Complex or multiline footnotes "
+            "that remain ordinary Markdown are searched normally."
         ),
         (
             "Clipboard: Ctrl+X, Ctrl+C, and Ctrl+V use Carriage's internal clipboard. "
@@ -12217,13 +12750,76 @@ status_divider = ConditionalContainer(
     Window(height=1, char="─", style="class:divider"),
     filter=Condition(lambda: state.statusbar_visible),
 )
-status_bar = ConditionalContainer(
+
+
+# Find/Replace deliberately occupies the status-line row instead of opening a
+# dialog. If the ordinary status bar is hidden, this one row is temporarily
+# allocated while Find/Replace is active so the current match can never scroll
+# underneath an overlay.
+find_input = SingleLineInput(style="class:status")
+replace_input = SingleLineInput(style="class:status")
+find_input.window.width = D(min=12, preferred=30)
+replace_input.window.width = D(min=12, preferred=30)
+find_input.buffer.on_text_changed += _find_replace_query_changed
+replace_input.buffer.on_text_changed += _find_replace_replacement_changed
+
+normal_status_row = ConditionalContainer(
     Window(
         content=FormattedTextControl(get_statusbar_text),
         height=1,
         style="class:status",
     ),
-    filter=Condition(lambda: state.statusbar_visible),
+    filter=Condition(lambda: not find_replace.active),
+)
+find_row = ConditionalContainer(
+    VSplit(
+        [
+            Window(
+                content=FormattedTextControl(lambda: [("class:status", " Find: ")]),
+                height=1,
+                width=D.exact(7),
+                style="class:status",
+            ),
+            find_input,
+            Window(
+                content=FormattedTextControl(
+                    lambda: [("class:status", _find_replace_hint_text())]
+                ),
+                height=1,
+                width=D(min=20, preferred=52, max=68),
+                dont_extend_width=True,
+                style="class:status",
+            ),
+        ]
+    ),
+    filter=Condition(lambda: find_replace.active and find_replace.mode == "find"),
+)
+replace_row = ConditionalContainer(
+    VSplit(
+        [
+            Window(
+                content=FormattedTextControl(lambda: [("class:status", " Replace: ")]),
+                height=1,
+                width=D.exact(10),
+                style="class:status",
+            ),
+            replace_input,
+            Window(
+                content=FormattedTextControl(
+                    lambda: [("class:status", _find_replace_hint_text())]
+                ),
+                height=1,
+                width=D(min=20, preferred=52, max=68),
+                dont_extend_width=True,
+                style="class:status",
+            ),
+        ]
+    ),
+    filter=Condition(lambda: find_replace.active and find_replace.mode == "replace"),
+)
+status_bar = ConditionalContainer(
+    HSplit([normal_status_row, find_row, replace_row]),
+    filter=Condition(lambda: state.statusbar_visible or find_replace.active),
 )
 
 # When the normal status bar is disabled, transient notices still occupy the
@@ -12238,6 +12834,7 @@ transient_status_overlay = ConditionalContainer(
     filter=Condition(
         lambda: (
             not state.statusbar_visible
+            and not find_replace.active
             and _current_transient_status_message() is not None
         )
     ),
@@ -12287,6 +12884,8 @@ class EdgeAlignedMenuContainer(MenuContainer):
                 ):
                     app = get_app()
                     if not hover:
+                        if find_replace.active:
+                            _close_find_replace()
                         if app.layout.has_focus(self.window):
                             if self.selected_menu == [index]:
                                 app.layout.focus_last()
@@ -12359,6 +12958,8 @@ menu_container = EdgeAlignedMenuContainer(
                 MenuItem(_menu_label("Cut", "Ctrl+X", 18), handler=do_cut),
                 MenuItem(_menu_label("Copy", "Ctrl+C", 18), handler=do_copy),
                 MenuItem(_menu_label("Paste", "Ctrl+V", 18), handler=do_paste),
+                MenuItem("-", disabled=True),
+                MenuItem(_menu_label("Find / Replace...", "Ctrl+F", 18), handler=do_find_replace),
                 MenuItem("-", disabled=True),
                 MenuItem(_menu_label("Italic", "F2", 18), handler=do_toggle_italic),
                 MenuItem(_menu_label("Bold", "F3", 18), handler=do_toggle_bold),
@@ -12438,7 +13039,13 @@ root_container = FloatContainer(
 
 layout = Layout(root_container, focused_element=text_area)
 
-editor_focused = Condition(lambda: get_app().layout.has_focus(text_area))
+editor_focused = Condition(
+    lambda: get_app().layout.has_focus(text_area) and not find_replace.active
+)
+find_focused = Condition(lambda: get_app().layout.has_focus(find_input))
+replace_focused = Condition(lambda: get_app().layout.has_focus(replace_input))
+find_replace_focused = find_focused | replace_focused
+find_replace_active = Condition(lambda: find_replace.active)
 
 kb = KeyBindings()
 
@@ -12451,6 +13058,16 @@ def _(event):
 @kb.add("c-o", filter=editor_focused)
 def _(event):
     with_unsaved_changes_check(do_open)()
+
+
+@kb.add("c-f", filter=editor_focused)
+def _(event):
+    do_find_replace()
+
+
+@kb.add("c-f", filter=find_replace_active)
+def _(event):
+    _find_replace_show_find()
 
 
 @kb.add("f2", filter=editor_focused)
@@ -12573,7 +13190,74 @@ def _(event):
     do_renumber_list()
 
 
-no_dialog_open = Condition(lambda: current_float is None)
+# Find/Replace key handling stays intentionally small and terminal-portable.
+# prompt_toolkit 3.0.52/3.0.53 cannot represent Shift+Enter as a distinct key,
+# and many terminals transmit it identically to Enter. Use Up for Previous and
+# Enter/Down for Next instead of depending on an unportable escape sequence.
+@kb.add("enter", filter=find_focused)
+@kb.add("down", filter=find_focused)
+@kb.add("c-n", filter=find_focused)
+def _(event):
+    _find_replace_step(1)
+
+
+@kb.add("up", filter=find_focused)
+@kb.add("c-p", filter=find_focused)
+def _(event):
+    _find_replace_step(-1)
+
+
+@kb.add("tab", filter=find_focused)
+def _(event):
+    _find_replace_show_replace()
+
+
+@kb.add("enter", filter=replace_focused)
+def _(event):
+    _find_replace_replace_current()
+
+
+@kb.add("down", filter=replace_focused)
+@kb.add("c-n", filter=replace_focused)
+def _(event):
+    _find_replace_step(1)
+
+
+@kb.add("up", filter=replace_focused)
+@kb.add("c-p", filter=replace_focused)
+def _(event):
+    _find_replace_step(-1)
+
+
+@kb.add("tab", filter=replace_focused)
+@kb.add("s-tab", filter=replace_focused)
+def _(event):
+    _find_replace_show_find()
+
+
+@kb.add("escape", "c", filter=find_replace_focused)
+def _(event):
+    _find_replace_toggle_case()
+
+
+@kb.add("escape", "w", filter=find_replace_focused)
+def _(event):
+    _find_replace_toggle_whole_word()
+
+
+@kb.add("escape", "a", filter=replace_focused)
+def _(event):
+    _find_replace_replace_all()
+
+
+@kb.add("escape", filter=find_replace_active)
+def _(event):
+    _close_find_replace()
+
+
+no_dialog_open = Condition(
+    lambda: current_float is None and not find_replace.active
+)
 menu_focused = Condition(lambda: get_app().layout.has_focus(menu_container.window))
 dialog_open = Condition(lambda: current_float is not None)
 table_editor_active = Condition(
