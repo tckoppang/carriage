@@ -2,34 +2,32 @@
 
 ## Keyboard reference
 
-| Command | Action |
-|---|---|
-| `Ctrl+N` | New file |
-| `Ctrl+O` | Open file |
-| `Ctrl+S` or `F9` | Save |
-| `Ctrl+Z` | Undo |
-| `Ctrl+R` | Redo |
-| `Ctrl+F` | Find / replace |
-| `Ctrl+X` | Cut to the clipboard |
-| `Ctrl+C` | Copy to the clipboard |
-| `Ctrl+V` | Paste from the clipboard |
-| `Ctrl+Q` | Quit |
-| `F1` | Carriage Help |
-| `F2` | Toggle italic on selected text |
-| `F3` | Toggle bold on selected text |
-| `F4` | Insert table |
-| `F5` | Insert footnote |
-| `F6` | Toggle Extend Selection mode |
-| `F7` | Spell check |
-| `F8` | Renumber the numbered list at the cursor |
-| `F10` or `Ctrl+Space` | Open the menu bar |
-| `Home` / `End` | Start / end of the displayed row |
-| `Ctrl+Home` / `Ctrl+End` | Top / end of the document |
-| `Alt+G` | Go directly to an ATX section |
-| `Alt+Up` / `Alt+Down` | Previous / next ATX section |
-| `1` through `6` | Jump among File, Edit, Go, Export, Tools, and Help while the menu bar is active |
-| `Tab` | Indent normally; edit a folded table or footnote at the cursor |
-| `Esc` | Close a menu, dialog, or Find / Replace |
+- `Ctrl+N` - New file.
+- `Ctrl+O` - Open file.
+- `Ctrl+S` or `F9` - Save.
+- `Ctrl+Z` - Undo.
+- `Ctrl+R` - Redo.
+- `Ctrl+F` - Find / replace.
+- `Ctrl+X` - Cut to the clipboard.
+- `Ctrl+C` - Copy to the clipboard.
+- `Ctrl+V` - Paste from the clipboard.
+- `Ctrl+Q` - Quit.
+- `F1` - Carriage Help.
+- `F2` - Toggle italic on selected text.
+- `F3` - Toggle bold on selected text.
+- `F4` - Insert table.
+- `F5` - Insert footnote.
+- `F6` - Toggle Extend Selection mode.
+- `F7` - Spell check.
+- `F8` - Renumber the numbered list at the cursor.
+- `F10` or `Ctrl+Space` - Open the menu bar.
+- `Home` / `End` - Start / end of the displayed row.
+- `Ctrl+Home` / `Ctrl+End` - Top / end of the document.
+- `Alt+G` - Go directly to an ATX section.
+- `Alt+Up` / `Alt+Down` - Previous / next ATX section.
+- `1` through `6` - Jump among File, Edit, Go, Export, Tools, and Help while the menu bar is active.
+- `Tab` - Indent normally; edit a folded table or footnote at the cursor.
+- `Esc` - Close a menu, dialog, or Find / Replace.
 
 ## Selection
 

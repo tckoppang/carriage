@@ -1,12 +1,12 @@
-<p align="center">
-  <img src="assets/carriage-title.png" width="1200" alt="Carriage: A prose-first Markdown editor for the terminal">
-</p>
+# Carriage
+
+*A prose-first Markdown editor for the terminal.*
+
+![Carriage title graphic](assets/carriage-title.png)
 
 > **Carriage is beta software.** It has received extensive development testing, but it has not yet received the breadth of real-world use expected of a mature text editor. Keep important work backed up or under version control, and do not rely on Carriage as the only copy of a document.
 
-<p align="center">
-  <img src="assets/carriage-screenshot.png" width="1200" alt="Carriage editing a Markdown document in a terminal">
-</p>
+![Carriage editing a Markdown document in a terminal](assets/carriage-screenshot.png)
 
 Carriage is built around writing documents rather than editing source code. It gives ordinary prose a focused, configurable writing area, keeps Markdown structure out of the way where practical, and leaves the file on disk as ordinary, portable Markdown.
 
@@ -14,8 +14,7 @@ The goal is not to hide Markdown or replace it with a proprietary document forma
 
 ## Quick start
 
-Carriage requires Python 3.10 or newer. Clone the repository, create a virtual
-environment, install the audited dependency range, and run the application:
+Carriage requires Python 3.10 or newer. Clone the repository, create a virtual environment, install the audited dependency range, and run the application:
 
 ```bash
 git clone https://github.com/tckoppang/carriage.git
@@ -32,8 +31,7 @@ Open a document by passing its path:
 python carriage.py document.md
 ```
 
-See [Installation](#installation) for command-line options, optional tools, and
-instructions for creating a permanent `carriage` command.
+See [Installation](#installation) for command-line options, optional tools, and instructions for creating a permanent `carriage` command.
 
 ## Writing first
 
@@ -295,23 +293,21 @@ carriage document.md
 
 Press `F10` or `Ctrl+Space` to activate the menu bar. `F1` opens Carriage Help.
 
-| Command | Action |
-|---|---|
-| `Ctrl+N` | New file |
-| `Ctrl+O` | Open file |
-| `Ctrl+S` or `F9` | Save |
-| `Ctrl+Z` / `Ctrl+R` | Undo / redo |
-| `Ctrl+F` | Find / replace |
-| `Ctrl+X` / `Ctrl+C` / `Ctrl+V` | Cut / copy / paste using the desktop clipboard when available |
-| `F2` / `F3` | Toggle italic / bold on selected text |
-| `F4` / `F5` | Insert table / footnote |
-| `F6` | Toggle Extend Selection mode |
-| `F7` | Spell check |
-| `F8` | Renumber the numbered list at the cursor |
-| `Ctrl+Home` / `Ctrl+End` | Top / end of document |
-| `Alt+G` | Go directly to an ATX section |
-| `Alt+Up` / `Alt+Down` | Previous / next ATX section |
-| `Tab` | Edit a folded table or footnote at the cursor |
+- `Ctrl+N` - New file.
+- `Ctrl+O` - Open file.
+- `Ctrl+S` or `F9` - Save.
+- `Ctrl+Z` / `Ctrl+R` - Undo / redo.
+- `Ctrl+F` - Find / replace.
+- `Ctrl+X` / `Ctrl+C` / `Ctrl+V` - Cut / copy / paste using the desktop clipboard when available.
+- `F2` / `F3` - Toggle italic / bold on selected text.
+- `F4` / `F5` - Insert table / footnote.
+- `F6` - Toggle Extend Selection mode.
+- `F7` - Spell check.
+- `F8` - Renumber the numbered list at the cursor.
+- `Ctrl+Home` / `Ctrl+End` - Top / end of document.
+- `Alt+G` - Go directly to an ATX section.
+- `Alt+Up` / `Alt+Down` - Previous / next ATX section.
+- `Tab` - Edit a folded table or footnote at the cursor.
 
 Carriage exchanges plain text with the desktop system clipboard when an available platform backend is present. Windows uses native clipboard support; macOS uses `pbcopy`/`pbpaste`; Linux uses `wl-copy`/`wl-paste` from **wl-clipboard** under Wayland, or `xclip`/`xsel` under X11. Linux clipboard helpers are optional. If no system clipboard backend is available, Cut/Copy/Paste automatically fall back to Carriage's internal clipboard. Pasted CRLF or CR line endings are normalized to LF.
 

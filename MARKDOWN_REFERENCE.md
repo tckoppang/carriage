@@ -83,7 +83,7 @@ Text with a note.[^id]
 [^id]: Footnote text
 ```
 
-`F5` or **Tools > Insert Footnote** creates a simple standard footnote. Supported single-paragraph definitions fold out of the prose view, and references display sequentially as `[1]`, `[2]`, and so on. Complex definitions remain ordinary source.
+`F5` or **Tools > Insert Footnote** creates a standard prose footnote. Supported single- and multi-paragraph prose definitions fold out of the prose view, and references display sequentially as `[1]`, `[2]`, and so on. Blank lines in the footnote editor separate paragraphs. Definitions containing structural blocks such as lists, blockquotes, code, raw HTML, reference definitions, thematic breaks, or tables remain ordinary source.
 
 ## Tables
 
@@ -95,4 +95,4 @@ Optional titles use Pandoc table captions and appear in the prose view as:
 [[Table N: Title]]
 ```
 
-The basic editor supports 2 to 6 columns. Wider imported tables are preserved as Markdown but cannot be opened in that dialog.
+The basic editor creates tables with 2 to 6 columns and 1 to 60 data rows. Existing and imported tables with up to six columns can be edited regardless of row count. Wider imported tables are preserved as Markdown but cannot be opened in that dialog. A table that conceptually has no header can use a blank header row.

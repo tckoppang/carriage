@@ -95,7 +95,7 @@ from html.parser import HTMLParser
 from dataclasses import dataclass, field
 
 APP_NAME = "Carriage"
-APP_VERSION = "1.177"
+APP_VERSION = "1.178"
 
 
 def _build_command_line_parser():
@@ -13120,7 +13120,7 @@ def _format_help_notes(width=62):
             "toggles whole-word matching, and Alt+A in Replace mode replaces all matches "
             "as one Undo step. Esc returns to the document. Search covers ordinary visible "
             "document text; folded table and footnote placeholder lines "
-            "and their hidden contents are excluded from search. Complex or multiline footnotes "
+            "and their hidden contents are excluded from search. Structurally complex footnotes "
             "that remain ordinary Markdown are searched normally."
         ),
         (
@@ -13348,8 +13348,10 @@ def _build_markdown_help(width=62):
                 "F4 or Tools > Insert Table creates a basic pipe table. Tab opens a",
                 "folded table at the cursor. Optional titles use Pandoc captions and",
                 "appear as [[Table N: Title]] in the prose view.",
-                "The basic editor supports 2-6 columns. Wider imported tables are",
-                "preserved as Markdown but are not editable in that dialog.",
+                f"The basic editor creates 2-6 columns and 1-{MAX_TABLE_INSERT_ROWS} data rows.",
+                "Existing and imported tables with up to six columns remain editable",
+                "regardless of row count. Wider imported tables are preserved as Markdown",
+                "but are not editable in that dialog.",
             ],
         ),
     ]
