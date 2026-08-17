@@ -95,7 +95,7 @@ from html.parser import HTMLParser
 from dataclasses import dataclass, field
 
 APP_NAME = "Carriage"
-APP_VERSION = "1.173"
+APP_VERSION = "1.177"
 
 
 def _build_command_line_parser():
@@ -1998,6 +1998,11 @@ class ScrollableWindow(Window):
 
     on_scrollbar_interact = None
     manual_scroll_active = False
+    # Up/Down owns a separate cursor-visible viewport mode. prompt_toolkit's
+    # stock wrapped-line scroller works in logical source lines and can therefore
+    # jump an entire paragraph when a visual-row cursor move crosses the viewport
+    # edge. Carriage keeps the keyboard viewport in rendered-row coordinates.
+    keyboard_scroll_active = False
 
     def invalidate_rendered_height_cache(self):
         """Invalidate document geometry while retaining reusable line heights.
@@ -2135,6 +2140,9 @@ class ScrollableWindow(Window):
         self, rendered_row, heights=None, prefix=None, window_height=None
     ):
         """Set a cursor-independent viewport top from a rendered-row index."""
+        # Mouse-wheel/scrollbar viewport ownership supersedes keyboard vertical
+        # navigation. Manual mode hides the caret until editing resumes.
+        self.keyboard_scroll_active = False
         # Any explicit viewport scroll cancels a section-navigation top anchor.
         # Otherwise ending a manual scroll while the caret remained on the
         # heading could unexpectedly snap the heading back to the top.
@@ -2179,9 +2187,32 @@ class ScrollableWindow(Window):
         """Return viewport ownership to prompt_toolkit without moving the cursor."""
         self.manual_scroll_active = False
 
+    def _set_keyboard_rendered_scroll(
+        self, rendered_row, heights, prefix, window_height
+    ):
+        """Keep a keyboard-driven viewport at one rendered-row position.
+
+        Unlike manual wheel/scrollbar browsing, the insertion cursor remains
+        visible. The explicit top survives repaints until a nonvertical cursor
+        move or an edit returns scrolling to prompt_toolkit.
+        """
+        if not heights or prefix is None or len(prefix) != len(heights) + 1:
+            self.keyboard_scroll_active = False
+            return
+
+        total_height = prefix[-1]
+        max_top = max(0, total_height - max(1, int(window_height)))
+        target = max(0, min(max_top, int(rendered_row)))
+        target_row = max(
+            0, min(len(heights) - 1, bisect_right(prefix, target) - 1)
+        )
+        self.vertical_scroll = target_row
+        self.vertical_scroll_2 = target - prefix[target_row]
+        self.keyboard_scroll_active = True
+
     def _scroll(self, ui_content, width, height):
-        """Honor manual scrolling and section-heading viewport alignment."""
-        if not self.manual_scroll_active:
+        """Honor rendered-row viewport modes and section-heading alignment."""
+        if not self.manual_scroll_active and not self.keyboard_scroll_active:
             anchor = getattr(self, "_section_top_anchor_row", None)
             if (
                 anchor is not None
@@ -2201,6 +2232,9 @@ class ScrollableWindow(Window):
                 return
             return super()._scroll(ui_content, width, height)
 
+        # Manual browsing and keyboard vertical navigation both preserve an
+        # explicit rendered-row viewport top. Only manual browsing hides the
+        # cursor; keyboard mode keeps the caret visible.
         self.horizontal_scroll = 0
         heights, prefix = self._rendered_height_geometry(
             ui_content=ui_content, width=width
@@ -2274,6 +2308,36 @@ class ScrollableWindow(Window):
                 content_y_max,
             )
 
+            def click_viewport_snapshot():
+                """Capture the exact rendered top used by this mouse map."""
+                heights, prefix = self._rendered_height_geometry(
+                    ui_content=info.ui_content, width=info.window_width
+                )
+                if not heights or prefix is None:
+                    return None
+                return (
+                    self._absolute_rendered_scroll(heights, prefix),
+                    heights,
+                    prefix,
+                    max(1, info.window_height),
+                )
+
+            def restore_click_viewport(snapshot):
+                """Keep a positioning click from shifting the visible text."""
+                if snapshot is None:
+                    self.end_manual_scroll()
+                    return
+                rendered_top, heights, prefix, window_height = snapshot
+                # Moving the buffer cursor fires _resume_editor_view(), which
+                # intentionally ends wheel/manual scrolling. Reinstall the same
+                # rendered top afterward in cursor-visible mode. A subsequent
+                # nonvertical cursor move or edit releases this ownership in the
+                # normal way.
+                self.end_manual_scroll()
+                self._set_keyboard_rendered_scroll(
+                    rendered_top, heights, prefix, window_height
+                )
+
             def content_handler(mouse_event):
                 y = _clamp_content_mouse_y(
                     mouse_event.position.y,
@@ -2287,11 +2351,50 @@ class ScrollableWindow(Window):
                 # dead mouse zone. The y coordinate above is clamped to the
                 # final rendered content row before horizontal source lookup.
 
-                # A real click resumes editing at the clicked location. End
-                # manual scrolling before forwarding it to BufferControl; the
-                # current render map still describes exactly what was clicked.
+                # A positioning click must use the render map that was actually
+                # clicked and keep that same viewport afterward. Ending manual
+                # wheel scrolling *before* the cursor move lets prompt_toolkit
+                # re-clamp/recenter the window around the new caret, which makes
+                # the text jump a few rendered rows. Snapshot the current top and
+                # restore it after BufferControl has placed the caret instead.
+                #
+                # When Mouse Down begins while wheel/manual scrolling owns the
+                # viewport, retain that same snapshot for the complete drag
+                # gesture. Cursor changes during Mouse Move fire the ordinary
+                # cursor callback, which otherwise releases Carriage's explicit
+                # rendered-row top and lets prompt_toolkit snap the view while a
+                # selection is being extended. A normal drag that did not begin
+                # from a manually scrolled viewport keeps prompt_toolkit's usual
+                # behavior, including edge autoscroll.
                 if mouse_event.event_type == MouseEventType.MOUSE_DOWN:
-                    self.end_manual_scroll()
+                    click_snapshot = click_viewport_snapshot()
+                    self._carriage_drag_viewport_snapshot = (
+                        click_snapshot if self.manual_scroll_active else None
+                    )
+                elif (
+                    mouse_event.event_type == MouseEventType.MOUSE_MOVE
+                    and mouse_event.button != MouseButton.NONE
+                ):
+                    click_snapshot = getattr(
+                        self, "_carriage_drag_viewport_snapshot", None
+                    )
+                elif mouse_event.event_type == MouseEventType.MOUSE_UP:
+                    click_snapshot = getattr(
+                        self, "_carriage_drag_viewport_snapshot", None
+                    )
+                else:
+                    click_snapshot = None
+
+                def finish_mouse_event(result):
+                    if click_snapshot is not None:
+                        restore_click_viewport(click_snapshot)
+                    elif mouse_event.event_type == MouseEventType.MOUSE_DOWN:
+                        # v1.176 behavior: even an ordinary positioning click
+                        # keeps the viewport used by the click itself stable.
+                        restore_click_viewport(click_viewport_snapshot())
+                    if mouse_event.event_type == MouseEventType.MOUSE_UP:
+                        self._carriage_drag_viewport_snapshot = None
+                    return result
 
                 # Search left from blank cells to the nearest rendered source
                 # position, matching prompt_toolkit's normal click behavior.
@@ -2308,11 +2411,12 @@ class ScrollableWindow(Window):
                             )
                         )
                         if result == NotImplemented:
-                            return self._mouse_handler(mouse_event)
-                        return result
+                            result = self._mouse_handler(mouse_event)
+                        return finish_mouse_event(result)
                     x -= 1
 
-                return self._mouse_handler(mouse_event)
+                result = self._mouse_handler(mouse_event)
+                return finish_mouse_event(result)
 
             mouse_handlers.set_mouse_handler_for_range(
                 x_min=content_x_min,
@@ -2383,13 +2487,14 @@ class ScrollableWindow(Window):
                     if target is None:
                         return None
 
-                    self.end_manual_scroll()
+                    click_snapshot = click_viewport_snapshot()
                     app = get_app()
                     if app.layout.current_control is not self.content:
                         app.layout.current_control = self.content
                     buffer = self.content.buffer
                     buffer.exit_selection()
                     buffer.cursor_position = max(0, min(len(buffer.text), target))
+                    restore_click_viewport(click_snapshot)
                     reset_clicks = getattr(
                         self.content, "_reset_carriage_click_sequence", None
                     )
@@ -3461,15 +3566,36 @@ class FullWidthSafeBufferControl(BufferControl):
             # heuristic. Carriage owns the complete multi-click policy so a
             # rapid click elsewhere cannot accidentally count as a double-click.
             self._last_click_timestamp = None
-            result = super().mouse_handler(mouse_event)
+
+            dragged = getattr(self, "_carriage_mouse_dragged", False)
+            if dragged:
+                # Real drag selection still belongs to BufferControl. Mouse-move
+                # events establish/update the selection, and Mouse Up finalizes
+                # the release position.
+                result = super().mouse_handler(mouse_event)
+                _clamp_buffer_cursor_out_of_gutter(buffer)
+                if find_replace.active:
+                    anchor = buffer.cursor_position
+                    self._reset_carriage_click_sequence()
+                    _find_replace_reanchor_after_document_mouse(anchor)
+                    return result
+                self._reset_carriage_click_sequence()
+                return result
+
+            # A plain click is complete on Mouse Down: that event focused the
+            # editor, cleared any old selection, and positioned the insertion
+            # point using the render map that was actually clicked. Do not pass
+            # the matching Mouse Up through BufferControl. Ending Carriage's
+            # wheel-scroll mode on Mouse Down can repaint the viewport before
+            # Mouse Up arrives; prompt_toolkit would then map the same screen
+            # coordinate through the new viewport and interpret the difference
+            # as a drag selection. Carriage handles multi-click selection below.
+            result = None
             _clamp_buffer_cursor_out_of_gutter(buffer)
             if find_replace.active:
                 anchor = buffer.cursor_position
                 self._reset_carriage_click_sequence()
                 _find_replace_reanchor_after_document_mouse(anchor)
-                return result
-            if getattr(self, "_carriage_mouse_dragged", False):
-                self._reset_carriage_click_sequence()
                 return result
 
             click_index = getattr(
@@ -3541,6 +3667,7 @@ text_area.window._height_line_cache = {}
 # display transformations and soft wrapping.
 text_area.window._vertical_preferred_x = None
 text_area.window._visual_vertical_move_in_progress = False
+text_area.window.keyboard_scroll_active = False
 # Visual cursor geometry is expensive on very long logical paragraphs. Cache
 # only rows actually visited by navigation; text edits clear these caches.
 text_area.window._visual_positions_cache = {}
@@ -3608,18 +3735,19 @@ def _resume_editor_view(_buffer=None):
     # Ordinary cursor movement releases any Alt+Up/Alt+Down viewport anchor.
     # Section navigation installs a fresh anchor after moving the cursor.
     text_area.window._section_top_anchor_row = None
-    # Repeated Up/Down presses preserve a rendered-screen column, just like a
-    # conventional editor preserves a preferred column across short lines. Any
-    # other cursor movement (Left/Right, mouse click, Home/End, etc.) starts a
-    # new vertical-navigation column on the next Up/Down press.
+    # Repeated Up/Down presses preserve both the rendered-screen column and
+    # Carriage's rendered-row viewport ownership. Any other cursor movement
+    # returns viewport scrolling to prompt_toolkit.
     if not text_area.window._visual_vertical_move_in_progress:
         text_area.window._vertical_preferred_x = None
+        text_area.window.keyboard_scroll_active = False
 
 
 def _editor_text_changed(_buffer=None):
     """Reset viewport ownership, invalidate layout, and protect changed work."""
     state.extend_selection_mode = False
     text_area.window.end_manual_scroll()
+    text_area.window.keyboard_scroll_active = False
     text_area.window._section_top_anchor_row = None
     text_area.window._vertical_preferred_x = None
     text_area.window.invalidate_rendered_height_cache()
@@ -14927,7 +15055,22 @@ def _move_editor_cursor_visual_rows(delta):
     if target == buf.cursor_position:
         return False
 
+    # Keep the caret at its current screen row until it reaches a viewport edge;
+    # after that, move the viewport by exactly the rendered rows necessary to
+    # reveal the next visual cursor row. This avoids prompt_toolkit's wrapped
+    # logical-line scroller pulling an entire paragraph into view at once.
+    viewport_height = max(1, info.window_height)
+    current_top = text_area.window._absolute_rendered_scroll(heights, prefix)
+    desired_top = current_top
+    if target_absolute < current_top:
+        desired_top = target_absolute
+    elif target_absolute >= current_top + viewport_height:
+        desired_top = target_absolute - viewport_height + 1
+
     text_area.window.end_manual_scroll()
+    text_area.window._set_keyboard_rendered_scroll(
+        desired_top, heights, prefix, viewport_height
+    )
     text_area.window._visual_vertical_move_in_progress = True
     try:
         buf.cursor_position = target
