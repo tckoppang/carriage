@@ -49,7 +49,7 @@ spellcheck_command = ["aspell", "--mode=markdown", "check", "{file}"]
 
 Integer from 40 through 160. Default: `80`.
 
-This controls the visual prose width and the width used by **Export > Hard-Wrapped Markdown**. It does not insert source line breaks while editing.
+This controls the visual prose width and the width used by **Export > Hard-Wrapped Markdown**. It does not insert source line breaks while editing. This setting is not a terminal-size limit: supported modal dialogs require an 80×24 or larger terminal, while terminal width and height otherwise have no configured maximum.
 
 ### `interface.scrollbar`
 

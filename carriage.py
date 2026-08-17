@@ -56,6 +56,7 @@ are ignored with a warning while valid neighboring settings continue to load.
 Requires:
   Python 3.10 or newer
   prompt_toolkit>=3.0.52,<3.0.54
+  terminal 80x24 or larger for supported modal dialogs (no maximum size)
 
 Optional:
   pandoc, for document export (or configure another Pandoc executable)
@@ -95,7 +96,13 @@ from html.parser import HTMLParser
 from dataclasses import dataclass, field
 
 APP_NAME = "Carriage"
-APP_VERSION = "1.178"
+APP_VERSION = "1.180"
+
+# Carriage's editor remains usable below this size where the terminal permits,
+# but modal dialogs are supported only at 80x24 or larger. There is no maximum
+# terminal size; wide/tall terminals simply provide larger margins or viewports.
+MIN_SUPPORTED_TERMINAL_COLUMNS = 80
+MIN_SUPPORTED_TERMINAL_ROWS = 24
 
 
 def _build_command_line_parser():
@@ -3770,13 +3777,74 @@ current_footnote_editor = None
 # Dialog helpers
 # ---------------------------------------------------------------------------
 
-def show_dialog(dialog, focus=None, on_close=None):
-    """Show a modal dialog, preserving any dialog already underneath it."""
+def _current_terminal_size():
+    """Return ``(columns, rows)`` for the active terminal.
+
+    A real prompt_toolkit application always exposes a size here. The fallback
+    keeps construction/unit tests deterministic without pretending that an
+    undersized terminal is supported.
+    """
+    try:
+        size = get_app().output.get_size()
+        return max(1, int(size.columns)), max(1, int(size.rows))
+    except Exception:
+        return MIN_SUPPORTED_TERMINAL_COLUMNS, MIN_SUPPORTED_TERMINAL_ROWS
+
+
+def _dialog_terminal_supported(
+    min_columns=MIN_SUPPORTED_TERMINAL_COLUMNS,
+    min_rows=MIN_SUPPORTED_TERMINAL_ROWS,
+):
+    """Return whether the active terminal can safely host a modal dialog."""
+    columns, rows = _current_terminal_size()
+    return columns >= int(min_columns) and rows >= int(min_rows)
+
+
+def _notify_dialog_terminal_too_small(
+    min_columns=MIN_SUPPORTED_TERMINAL_COLUMNS,
+    min_rows=MIN_SUPPORTED_TERMINAL_ROWS,
+):
+    """Explain a refused dialog without trying to open another dialog."""
+    columns, rows = _current_terminal_size()
+    show_transient_status(
+        f"Terminal {columns}×{rows} is too small for dialogs; "
+        f"minimum supported size is {int(min_columns)}×{int(min_rows)}.",
+        duration=4.0,
+    )
+
+
+def show_dialog(
+    dialog,
+    focus=None,
+    on_close=None,
+    height=None,
+    *,
+    min_columns=MIN_SUPPORTED_TERMINAL_COLUMNS,
+    min_rows=MIN_SUPPORTED_TERMINAL_ROWS,
+):
+    """Show a modal dialog, preserving any dialog already underneath it.
+
+    ``height`` is normally left to prompt_toolkit's preferred-size negotiation.
+    Editors whose layout has its own measured viewport may supply an explicit,
+    resize-aware height callable instead. This prevents a transient preferred-
+    height mismeasurement from collapsing the floating dialog body to zero
+    rows while leaving only its frame visible.
+    """
     global current_float
+
+    # Below the supported terminal size, keep the main editor running but do
+    # not attempt to squeeze modal UI until controls disappear. A status-line
+    # notice is safe even when there is not enough room for a message dialog.
+    if not _dialog_terminal_supported(min_columns, min_rows):
+        _notify_dialog_terminal_too_small(min_columns, min_rows)
+        if on_close is not None:
+            on_close()
+        return None
+
     # Find/Replace and a modal dialog must never own focus simultaneously.
     if find_replace.active:
         _close_find_replace()
-    dialog_float = Float(content=dialog)
+    dialog_float = Float(content=dialog, height=height)
     focus_target = focus if focus is not None else dialog
     floats.append(dialog_float)
     dialog_stack.append((dialog_float, focus_target, on_close))
@@ -11310,10 +11378,30 @@ def _table_grid_cell_width(columns, terminal_width):
 
 
 def _minimum_table_editor_terminal_width(columns):
-    """Return the narrowest terminal that can represent every grid column."""
+    """Return the supported width required by the complete table dialog.
+
+    The old calculation measured only the grid and could therefore claim that
+    a 37-column terminal was sufficient for a six-column table even though the
+    title, frame, hints, and four-button command row could not fit. Measure the
+    two real width constraints instead: the narrowest one-character-per-column
+    grid plus its dialog chrome, and the complete button row plus frame/shadow.
+    Carriage's application-wide dialog floor (80 columns) remains the governing
+    minimum for every table currently supported by the basic editor.
+    """
     columns = max(1, int(columns))
-    minimum_grid_width = (4 * columns) + 1  # one content cell + frame/padding
-    return minimum_grid_width + 12
+    minimum_grid_width = (4 * columns) + 1  # content + cell padding/borders
+    grid_with_dialog_chrome = minimum_grid_width + 5
+
+    button_count = 4
+    button_width = 12  # prompt_toolkit Button default used by this dialog
+    button_padding = button_count - 1
+    buttons_with_dialog_chrome = (button_count * button_width) + button_padding + 3
+
+    return max(
+        MIN_SUPPORTED_TERMINAL_COLUMNS,
+        grid_with_dialog_chrome,
+        buttons_with_dialog_chrome,
+    )
 
 
 def _wrap_table_grid_cell(text, width):
@@ -11386,13 +11474,55 @@ def _table_grid_outer_border_fragments(session, edge):
     return [("class:table.border", getattr(layout, edge))]
 
 
-def _table_grid_body_height(session):
-    """Return the natural rendered height of the scrollable table body."""
+def _table_grid_viewport_height(session):
+    """Return the table-body rows that safely fit the current terminal."""
     layout = _table_grid_layout(session)
-    viewport_height = min(layout.natural_body_height, 18)
-    # Give HSplit permission to shrink on unusually short terminals, while the
-    # preferred/max pair prevents spare blank rows on ordinary layouts.
+    try:
+        terminal_rows = max(1, int(get_app().output.get_size().rows))
+    except Exception:
+        terminal_rows = 40
+
+    # The complete table dialog needs fourteen non-grid rows in navigation
+    # mode and one more while the cell editor is visible. Keep the grid's own
+    # preferred/max height inside the remaining terminal space instead of
+    # relying on an outer HSplit to shrink an 18-row request after the fact.
+    fixed_rows = 14 + (1 if session.editing else 0)
+    # Dialog's Shadow draws one extra row below the measured frame. Reserve it
+    # so an explicitly sized float never writes its command row off-screen.
+    usable_rows = max(1, terminal_rows - 1)
+    available = max(1, usable_rows - fixed_rows)
+    return max(1, min(layout.natural_body_height, 18, available))
+
+
+def _table_grid_body_height(session):
+    """Return the rendered height of the scrollable table body."""
+    viewport_height = _table_grid_viewport_height(session)
     return D(min=1, preferred=viewport_height, max=viewport_height)
+
+
+def _table_editor_dialog_height(session):
+    """Return a stable height for the complete table-editor float.
+
+    The table editor has a measured grid viewport, so there is no benefit in
+    asking the surrounding Float to rediscover the same height indirectly by
+    walking the nested Dialog/Box/VSplit tree.  In some live terminal states
+    that preferred-height negotiation can report only the Frame itself, which
+    produces a two-line, apparently blank table editor.  Size the float from
+    the grid directly and clamp it to the current terminal height instead.
+
+    Fourteen rows are the fixed non-grid portion of the normal editor dialog
+    (frame, title controls, separators, labels, padding, and button area).  Cell
+    edit mode needs one additional preferred row; the editor itself can still
+    shrink internally on a short terminal.
+    """
+    grid_height = _table_grid_viewport_height(session)
+    desired = 14 + grid_height + (1 if session.editing else 0)
+    try:
+        terminal_rows = int(get_app().output.get_size().rows)
+    except Exception:
+        terminal_rows = desired
+    # Dialog's Shadow consumes one rendered row beyond the frame itself.
+    return max(1, min(desired, max(1, terminal_rows - 1)))
 
 
 def _table_grid_fragments(session):
@@ -11483,6 +11613,10 @@ def _save_table_editor():
 
 def open_table_editor(table_number):
     global current_table_editor
+
+    if not _dialog_terminal_supported():
+        _notify_dialog_terminal_too_small()
+        return
 
     table = state.tables.get(table_number)
     if table is None:
@@ -11714,7 +11848,11 @@ def open_table_editor(table_number):
         ],
         width=D(preferred=110),
     )
-    session.dialog_float = show_dialog(dialog, focus=grid_window)
+    session.dialog_float = show_dialog(
+        dialog,
+        focus=grid_window,
+        height=lambda: _table_editor_dialog_height(session),
+    )
 
 
 def do_edit_table_at_cursor():
@@ -11726,6 +11864,9 @@ def do_edit_table_at_cursor():
 
 
 def do_insert_table():
+    if not _dialog_terminal_supported():
+        _notify_dialog_terminal_too_small()
+        return
     if _folded_placeholder_locked():
         show_message(
             "Folded object",
@@ -11799,6 +11940,28 @@ def do_insert_table():
 # ---------------------------------------------------------------------------
 # Prose footnote editor
 # ---------------------------------------------------------------------------
+
+def _footnote_editor_viewport_height():
+    """Return a resize-aware text viewport for the footnote editor."""
+    _columns, terminal_rows = _current_terminal_size()
+    # The surrounding Dialog consumes nine rows inside the Float: two frame
+    # borders, one body-padding row, three button rows, and the three fixed
+    # labels in the footnote body. Shadow occupies one more terminal row.
+    available = max(1, terminal_rows - 1 - 9)
+    return max(1, min(18, available))
+
+
+def _footnote_editor_text_height():
+    height = _footnote_editor_viewport_height()
+    return D(min=1, preferred=height, max=height)
+
+
+def _footnote_editor_dialog_height():
+    """Return an explicit complete height for the footnote-editor Float."""
+    desired = 9 + _footnote_editor_viewport_height()
+    _columns, terminal_rows = _current_terminal_size()
+    return max(1, min(desired, max(1, terminal_rows - 1)))
+
 
 def _footnote_source_span_at_cursor(document=None, direction=0):
     """Return the inline-footnote source span touching the cursor.
@@ -11944,6 +12107,10 @@ def open_footnote_editor(identifier):
     """Open the dedicated multiline editor for one folded prose footnote."""
     global current_footnote_editor
 
+    if not _dialog_terminal_supported():
+        _notify_dialog_terminal_too_small()
+        return
+
     note = state.footnotes.get(identifier)
     if note is None:
         show_message(
@@ -11960,7 +12127,7 @@ def open_footnote_editor(identifier):
         multiline=True,
         wrap_lines=True,
         scrollbar=True,
-        height=D(preferred=10, max=18),
+        height=_footnote_editor_text_height,
         style="class:footnote.editor",
     )
     editor.buffer.on_text_changed += _working_state_changed
@@ -12012,7 +12179,11 @@ def open_footnote_editor(identifier):
         ],
         width=D(preferred=78),
     )
-    session.dialog_float = show_dialog(dialog, focus=editor)
+    session.dialog_float = show_dialog(
+        dialog,
+        focus=editor,
+        height=_footnote_editor_dialog_height,
+    )
 
 
 def do_edit_footnote_at_cursor():
@@ -12063,6 +12234,9 @@ def _commit_new_footnote_at_cursor():
 
 def do_insert_footnote():
     """Insert a stable reference and append its folded prose definition object."""
+    if not _dialog_terminal_supported():
+        _notify_dialog_terminal_too_small()
+        return
     if _folded_placeholder_locked():
         show_message(
             "Folded object",
@@ -13022,15 +13196,39 @@ def _launch_spellcheck():
 # ---------------------------------------------------------------------------
 
 
+def _help_reference_viewport_height():
+    """Return a resize-aware body height for Help/Markdown Reference."""
+    _columns, terminal_rows = _current_terminal_size()
+    # Dialog frame/body padding/buttons consume six rows inside the Float; the
+    # Shadow consumes one more terminal row. Use the rest for the reference.
+    available = max(1, terminal_rows - 1 - 6)
+    return max(1, min(28, available))
+
+
+def _help_reference_body_height():
+    height = _help_reference_viewport_height()
+    return D(min=1, preferred=height, max=height)
+
+
+def _help_reference_dialog_height():
+    desired = 6 + _help_reference_viewport_height()
+    _columns, terminal_rows = _current_terminal_size()
+    return max(1, min(desired, max(1, terminal_rows - 1)))
+
+
 def _show_help_reference(title, text):
     """Show a word-wrapped, scrollable, read-only Help reference."""
+    if not _dialog_terminal_supported():
+        _notify_dialog_terminal_too_small()
+        return
+
     ok_button = Button(text="OK", handler=close_dialog)
     help_body = TextArea(
         text=text,
         read_only=True,
         wrap_lines=False,
         scrollbar=True,
-        height=D(preferred=28),
+        height=_help_reference_body_height,
         style="class:help-text",
         focus_on_click=True,
     )
@@ -13040,7 +13238,11 @@ def _show_help_reference(title, text):
         buttons=[ok_button],
         width=D(preferred=76),
     )
-    show_dialog(dialog, focus=help_body)
+    show_dialog(
+        dialog,
+        focus=help_body,
+        height=_help_reference_dialog_height,
+    )
 
 KEYBINDING_ROWS = [
     ("Ctrl+N", "New file"),
@@ -13111,6 +13313,14 @@ def _format_help_notes(width=62):
             "use Up/Down to choose a result, and press Enter to jump with that heading "
             "aligned at the top of the editor. Alt+Up and Alt+Down remain the faster "
             "commands for moving among nearby sections."
+        ),
+        (
+            f"Terminal size: {MIN_SUPPORTED_TERMINAL_COLUMNS}×{MIN_SUPPORTED_TERMINAL_ROWS} "
+            "is Carriage's minimum supported size for modal dialogs. The main editor may "
+            "remain usable in a smaller terminal, but dialogs are refused rather than "
+            "compressed until controls disappear. There is no maximum terminal width or "
+            "height; wider terminals add margins and taller terminals provide more viewport "
+            "space where a dialog can use it."
         ),
         (
             "Find / Replace: Ctrl+F opens the status-line search. Search is literal and "
@@ -13390,14 +13600,10 @@ def do_show_markdown_help():
 
 
 def do_show_about():
-    ok_button = Button(text="OK", handler=close_dialog)
-    dialog = Dialog(
-        title="About Carriage",
-        body=_dialog_prose(ABOUT_TEXT, width=62),
-        buttons=[ok_button],
-        width=D(preferred=70),
-    )
-    show_dialog(dialog, focus=ok_button)
+    # About prose can exceed a 24-row terminal once wrapped. Reuse the same
+    # explicit, scrollable sizing policy as Help rather than letting a Label
+    # silently clip when the dialog is forced shorter than its preferred height.
+    _show_help_reference("About Carriage", ABOUT_TEXT)
 
 
 # ---------------------------------------------------------------------------
@@ -13574,8 +13780,32 @@ def _section_filter_indices(metadata, query):
     )
 
 
+def _section_navigator_results_height():
+    """Return a resize-aware result-list height for Go to Section."""
+    _columns, terminal_rows = _current_terminal_size()
+    # With no button row, the Frame plus Filter/input/spacer/hint consume six
+    # rows inside the Float. Shadow consumes one additional terminal row.
+    available = max(1, terminal_rows - 1 - 6)
+    return max(1, min(20, available))
+
+
+def _section_navigator_results_dimension():
+    height = _section_navigator_results_height()
+    return D(min=1, preferred=height, max=height)
+
+
+def _section_navigator_dialog_height():
+    desired = 6 + _section_navigator_results_height()
+    _columns, terminal_rows = _current_terminal_size()
+    return max(1, min(desired, max(1, terminal_rows - 1)))
+
+
 def do_go_to_section():
     """Open the transient hierarchical ATX section navigator."""
+    if not _dialog_terminal_supported():
+        _notify_dialog_terminal_too_small()
+        return
+
     metadata = _document_metadata(text_area.text)
     if not metadata.heading_rows:
         show_transient_status("No sections in this document.")
@@ -13626,7 +13856,7 @@ def do_go_to_section():
     )
     results_window = Window(
         content=results_control,
-        height=D(min=5, preferred=16, max=20),
+        height=_section_navigator_results_dimension,
         wrap_lines=False,
         style="class:section-nav",
     )
@@ -13726,7 +13956,11 @@ def do_go_to_section():
         buttons=None,
         width=D(preferred=72, max=88),
     )
-    show_dialog(dialog, focus=filter_input)
+    show_dialog(
+        dialog,
+        focus=filter_input,
+        height=_section_navigator_dialog_height,
+    )
 
 
 def _fit_status_field(text, width):

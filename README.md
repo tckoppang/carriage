@@ -194,6 +194,9 @@ Carriage requires:
 
 - Python 3.10 or newer
 - `prompt_toolkit>=3.0.52,<3.0.54`
+- a terminal at least 80 columns wide and 24 rows high for supported modal dialogs
+
+There is no maximum supported terminal width or height. The main prose editor may remain usable below 80×24, but Carriage refuses to open modal dialogs in an undersized terminal rather than compressing them until controls disappear. Widen or enlarge the terminal and invoke the command again.
 
 The narrow prompt_toolkit range is intentional. Carriage relies on audited prompt_toolkit behavior for cursor geometry, scrolling, mouse handling, and unified undo.
 

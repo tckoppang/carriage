@@ -138,6 +138,10 @@ Spell check works on a saved file. Carriage offers to save unsaved changes befor
 
 Pandoc exports run without blocking normal editing, and only one Pandoc export can run at a time. Built-in targets are PDF, DOCX, ODT, and standalone HTML, plus a custom Pandoc command. Hard-wrapped Markdown does not require Pandoc.
 
+## Terminal size
+
+Carriage supports modal dialogs at terminal sizes of 80×24 or larger. There is no maximum terminal width or height. The main editor may remain usable below 80×24, but dialogs are refused rather than compressed until controls disappear. Resize the terminal and invoke the command again. Table, footnote, Help, Markdown Reference, About, and Go to Section dialogs use resize-aware viewports within the supported range.
+
 ## Configuration
 
 Settings are read at startup from `$XDG_CONFIG_HOME/carriage/config.toml`, or `~/.config/carriage/config.toml` when `XDG_CONFIG_HOME` is unset.
