@@ -81,7 +81,7 @@ Displays `↵` at Markdown hard line breaks made with two trailing spaces. The m
 
 Nonempty string. Default: `"pandoc"`.
 
-Specifies the executable used for PDF, DOCX, ODT, HTML, and custom Pandoc exports. It can be an executable name found on `PATH` or a path to an executable.
+Specifies the executable used for PDF, DOCX, ODT, HTML, and custom Pandoc exports. It can be an executable name found on `PATH` or a path to an executable. Carriage sends document text to Pandoc explicitly as UTF-8 rather than relying on the process locale.
 
 ### `tools.spellcheck_command`
 
@@ -94,6 +94,10 @@ spellcheck_command = ["aspell", "--mode=markdown", "check", "{file}"]
 The first item is the executable. At least one later argument must contain `{file}`, which Carriage replaces with the current document path.
 
 The command must edit the file in place, retain control of the terminal until complete, and return exit status zero on success. Carriage reloads the file only after successful completion.
+
+## Terminal color and environment
+
+Color depth is not configured in `config.toml`. Carriage requests 24-bit color when `COLORTERM` explicitly reports `truecolor` or `24bit`. For the Linux virtual console, limited terminals, and terminals without an explicit true-color signal, Carriage lets prompt_toolkit choose its terminal-safe default. Existing `PROMPT_TOOLKIT_COLOR_DEPTH` and `NO_COLOR` environment settings are respected.
 
 ## Validation and warnings
 

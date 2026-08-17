@@ -39,7 +39,7 @@ Ordinary paragraphs soft-wrap visually at the configured prose width without ins
 
 Markdown hard line breaks made with two trailing spaces can display a visible `↵` marker. The marker exists only in the editor and is never written to the file.
 
-Carriage takes a deliberately conservative approach to Markdown. It handles straightforward structures it understands and preserves structural, complex, or ambiguous Markdown rather than attempting to repair or reinterpret it.
+Carriage takes a deliberately conservative approach to Markdown. It reflows text only when it can positively identify a supported Markdown block or safe plain prose. Anything ambiguous, extension-like, or structurally unfamiliar is treated as opaque source and preserved rather than guessed at.
 
 ## Markdown stays Markdown
 
@@ -51,7 +51,7 @@ Carriage may actively reformat:
 - simple flat ordered and unordered lists
 - simple single-level blockquotes
 
-Carriage preserves structures whose layout or meaning should not be guessed, including fenced or indented code, YAML front matter, raw block HTML, reference definitions, complex containers, and unfamiliar or ambiguous Markdown.
+Carriage preserves structures whose layout or meaning should not be guessed, including fenced or indented code, YAML front matter, raw block HTML, reference definitions, display math, Markdown line blocks, directive or container syntax, GFM alerts and task lists, alternate list markers, unsupported table forms, and other unfamiliar or ambiguous Markdown.
 
 Input is read as UTF-8. CRLF and CR line endings are normalized to LF.
 
@@ -65,7 +65,7 @@ Input is read as UTF-8. CRLF and CR line endings are normalized to LF.
 - convert straightforward underscore emphasis to Carriage's preferred asterisk form
 - recognize supported pipe tables and prose footnotes as Carriage objects
 
-Conversion is intentionally conservative. Unsupported, complex, or ambiguous structures are preserved rather than repaired. Line-sensitive unsupported structures such as headerless or malformed pipe-table runs, Pandoc grid or simple tables, fenced containers, and definition lists are left intact rather than reflowed as prose.
+Conversion follows the same positive-recognition rule as normal editing and hard-wrapped export. If Carriage cannot positively identify a block as supported structure or safe plain prose, its source is preserved as opaque text rather than reflowed. This protects unsupported forms such as one-column or headerless pipe-table runs, Pandoc grid and simple tables, display math, line blocks, fenced or directive-style containers, alerts, task lists, definition lists, and other extension-like syntax.
 
 ## Tables
 
@@ -143,7 +143,7 @@ With Pandoc installed, Carriage can export to:
 - standalone HTML
 - custom Pandoc formats and arguments
 
-Pandoc exports use an immutable snapshot of the document, run without blocking the editor, protect the destination from external changes, and allow only one Pandoc export at a time.
+Pandoc exports use an immutable snapshot of the document, run without blocking the editor, protect the destination from external changes, and allow only one Pandoc export at a time. Document text is sent to Pandoc explicitly as UTF-8, independent of the process locale.
 
 ## Spell checking
 
@@ -196,7 +196,7 @@ Carriage requires:
 - `prompt_toolkit>=3.0.52,<3.0.54`
 - a terminal at least 80 columns wide and 24 rows high for supported modal dialogs
 
-There is no maximum supported terminal width or height. The main prose editor may remain usable below 80×24, but Carriage refuses to open modal dialogs in an undersized terminal rather than compressing them until controls disappear. Widen or enlarge the terminal and invoke the command again.
+There is no maximum supported terminal width or height. The main prose editor may remain usable below 80×24, but Carriage refuses to open modal dialogs in an undersized terminal rather than compressing them until controls disappear. Widen or enlarge the terminal and invoke the command again. A true-color terminal is not required: Carriage requests 24-bit color only when the terminal explicitly advertises it and otherwise lets prompt_toolkit choose a terminal-safe color depth. `NO_COLOR` and `PROMPT_TOOLKIT_COLOR_DEPTH` are respected.
 
 The narrow prompt_toolkit range is intentional. Carriage relies on audited prompt_toolkit behavior for cursor geometry, scrolling, mouse handling, and unified undo.
 

@@ -1,6 +1,6 @@
 # Markdown Syntax Reference
 
-This is a Markdown syntax reference, not a list of everything Carriage actively reformats. Carriage may normalize ordinary prose, simple flat lists, and simple single-level blockquotes. Code, YAML front matter, raw HTML, reference definitions, complex containers, and ambiguous structures are preserved rather than repaired.
+This is a Markdown syntax reference, not a list of everything Carriage actively reformats. Carriage may normalize ordinary prose, simple flat lists, and simple single-level blockquotes. Reflow is opt-in by recognition: if Carriage cannot positively identify a block as supported structure or safe plain prose, it preserves that block as opaque source rather than guessing. Code, YAML front matter, raw HTML, reference definitions, display math, line blocks, directive or container syntax, alerts, task lists, unsupported table forms, and other unfamiliar or ambiguous structures are therefore preserved rather than repaired.
 
 Highlighting, hanging structural markers, hard-break markers, and folded-object labels are visual only.
 

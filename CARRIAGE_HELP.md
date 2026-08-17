@@ -88,7 +88,7 @@ Ordinary prose soft-wraps visually at the configured prose width without changin
 - join supported hard-wrapped prose into logical source lines
 - recognize supported tables and footnotes
 
-Ambiguous or line-sensitive Markdown is preserved. This includes unsupported table forms such as headerless or malformed pipe-table runs and Pandoc grid/simple tables, as well as fenced containers and definition lists. **Export > Hard-Wrapped Markdown** uses the same conservative block classification and writes a separate wrapped copy without modifying the working file.
+Carriage reflows only blocks it can positively identify as supported structure or safe plain prose. Anything ambiguous, extension-like, or line-sensitive falls back to opaque exact-source preservation. This includes unsupported table forms such as one-column or headerless pipe-table runs and Pandoc grid/simple tables, as well as display math, line blocks, directive or fenced containers, alerts, task lists, definition lists, and other unfamiliar syntax. **Export > Hard-Wrapped Markdown** uses the same conservative block classification and writes a separate wrapped copy without modifying the working file.
 
 Two trailing spaces create a Markdown hard line break. When enabled, Carriage displays the break as `↵`. The marker is visual only.
 
@@ -136,11 +136,11 @@ Adjacent references remain separate atomic objects. Footnotes containing structu
 
 Spell check works on a saved file. Carriage offers to save unsaved changes before starting the configured terminal checker. The file is reloaded only when the checker exits successfully.
 
-Pandoc exports run without blocking normal editing, and only one Pandoc export can run at a time. Built-in targets are PDF, DOCX, ODT, and standalone HTML, plus a custom Pandoc command. Hard-wrapped Markdown does not require Pandoc.
+Pandoc exports run without blocking normal editing, and only one Pandoc export can run at a time. Built-in targets are PDF, DOCX, ODT, and standalone HTML, plus a custom Pandoc command. Document text is sent to Pandoc explicitly as UTF-8, independent of the process locale. Hard-wrapped Markdown does not require Pandoc.
 
 ## Terminal size
 
-Carriage supports modal dialogs at terminal sizes of 80×24 or larger. There is no maximum terminal width or height. The main editor may remain usable below 80×24, but dialogs are refused rather than compressed until controls disappear. Resize the terminal and invoke the command again. Table, footnote, Help, Markdown Reference, About, and Go to Section dialogs use resize-aware viewports within the supported range.
+Carriage supports modal dialogs at terminal sizes of 80×24 or larger. There is no maximum terminal width or height. The main editor may remain usable below 80×24, but dialogs are refused rather than compressed until controls disappear. Resize the terminal and invoke the command again. Table, footnote, Help, Markdown Reference, About, and Go to Section dialogs use resize-aware viewports within the supported range. True color is optional: Carriage uses 24-bit color only when the terminal explicitly advertises it and otherwise lets prompt_toolkit choose a safe depth; `NO_COLOR` and `PROMPT_TOOLKIT_COLOR_DEPTH` are respected.
 
 ## Configuration
 

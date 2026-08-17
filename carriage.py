@@ -91,12 +91,13 @@ import threading
 import time
 import stat
 import string
+from types import MappingProxyType
 from html import unescape as _html_unescape
 from html.parser import HTMLParser
 from dataclasses import dataclass, field
 
 APP_NAME = "Carriage"
-APP_VERSION = "1.180"
+APP_VERSION = "1.194"
 
 # Carriage's editor remains usable below this size where the terminal permits,
 # but modal dialogs are supported only at 80x24 or larger. There is no maximum
@@ -1462,6 +1463,8 @@ _FOOTNOTE_DEFINITION_RE = re.compile(
 _TABLE_CAPTION_RE = re.compile(r"^\s*(?:Table:|table:|:)\s*(?P<title>\S.*)\s*$")
 MAX_TABLE_EDITOR_COLUMNS = 6
 MAX_TABLE_INSERT_ROWS = 60
+TABLE_EDITOR_DIALOG_WIDTH = 110
+TABLE_EDITOR_GRID_MAX_WIDTH = TABLE_EDITOR_DIALOG_WIDTH - 5
 
 
 @dataclass
@@ -1493,7 +1496,6 @@ class TableEditorSession:
     cell_label: object | None = None
     mode_label: object | None = None
     grid_window: object | None = None
-    dialog_float: object | None = None
     editing: bool = False
     # Display-only table geometry/wrapping cache. The key includes the current
     # working cell contents and terminal width, so both height measurement and
@@ -1516,12 +1518,153 @@ class FootnoteData:
     dirty: bool = False
 
 
+@dataclass(frozen=True)
+class CommittedTableData:
+    """Immutable table record stored in a committed DocumentState."""
+
+    headers: tuple[str, ...]
+    rows: tuple[tuple[str, ...], ...]
+    title: str = ""
+    alignments: tuple[str, ...] = ()
+    original_lines: tuple[str, ...] | None = None
+    caption_position: str | None = None
+    dirty: bool = False
+
+    @property
+    def column_count(self):
+        return len(self.headers)
+
+
+@dataclass(frozen=True)
+class CommittedFootnoteData:
+    """Immutable footnote record stored in a committed DocumentState."""
+
+    identifier: str
+    text: str
+    original_lines: tuple[str, ...] | None = None
+    dirty: bool = False
+
+
+def _freeze_table_data(table):
+    """Return an immutable committed snapshot of one table-like object."""
+    if isinstance(table, CommittedTableData):
+        return table
+    return CommittedTableData(
+        headers=tuple(table.headers),
+        rows=tuple(tuple(row) for row in table.rows),
+        title=table.title,
+        alignments=tuple(table.alignments),
+        original_lines=(
+            None if table.original_lines is None else tuple(table.original_lines)
+        ),
+        caption_position=table.caption_position,
+        dirty=bool(table.dirty),
+    )
+
+
+def _mutable_table_data(table):
+    """Return an independent mutable table copy for an editor session."""
+    return TableData(
+        headers=list(table.headers),
+        rows=[list(row) for row in table.rows],
+        title=table.title,
+        alignments=list(table.alignments),
+        original_lines=(
+            None if table.original_lines is None else list(table.original_lines)
+        ),
+        caption_position=table.caption_position,
+        dirty=bool(table.dirty),
+    )
+
+
+def _freeze_footnote_data(note):
+    """Return an immutable committed snapshot of one footnote-like object."""
+    if isinstance(note, CommittedFootnoteData):
+        return note
+    return CommittedFootnoteData(
+        identifier=note.identifier,
+        text=note.text,
+        original_lines=(
+            None if note.original_lines is None else tuple(note.original_lines)
+        ),
+        dirty=bool(note.dirty),
+    )
+
+
+def _mutable_footnote_data(note):
+    """Return an independent mutable footnote copy for an editor session."""
+    return FootnoteData(
+        identifier=note.identifier,
+        text=note.text,
+        original_lines=(
+            None if note.original_lines is None else list(note.original_lines)
+        ),
+        dirty=bool(note.dirty),
+    )
+
+
+@dataclass(frozen=True)
+class FoldedObjectStore:
+    """Mechanically immutable copy-on-write store for folded document objects.
+
+    Both mappings are read-only proxies and every stored value is an immutable
+    committed record. Undo/Redo can therefore share a store by identity without
+    relying on callers to remember a copy-on-write convention. Editors receive
+    explicit mutable working copies and commits construct a replacement store.
+    """
+
+    tables: object = field(default_factory=dict)
+    footnotes: object = field(default_factory=dict)
+
+    def __post_init__(self):
+        frozen_tables = {
+            int(number): _freeze_table_data(table)
+            for number, table in dict(self.tables).items()
+        }
+        frozen_footnotes = {
+            str(identifier): _freeze_footnote_data(note)
+            for identifier, note in dict(self.footnotes).items()
+        }
+        object.__setattr__(self, "tables", MappingProxyType(frozen_tables))
+        object.__setattr__(self, "footnotes", MappingProxyType(frozen_footnotes))
+
+    def with_tables(self, tables):
+        if tables is self.tables:
+            return self
+        return FoldedObjectStore(tables=tables, footnotes=self.footnotes)
+
+    def with_footnotes(self, footnotes):
+        if footnotes is self.footnotes:
+            return self
+        return FoldedObjectStore(tables=self.tables, footnotes=footnotes)
+
+    def replace(self, *, tables=None, footnotes=None):
+        next_tables = self.tables if tables is None else tables
+        next_footnotes = self.footnotes if footnotes is None else footnotes
+        if next_tables is self.tables and next_footnotes is self.footnotes:
+            return self
+        return FoldedObjectStore(tables=next_tables, footnotes=next_footnotes)
+
+
+@dataclass(frozen=True)
+class DocumentState:
+    """One committed Carriage document: visible prose plus folded objects."""
+
+    visible_text: str
+    objects: FoldedObjectStore
+
+    def __post_init__(self):
+        if not isinstance(self.visible_text, str):
+            raise TypeError("DocumentState.visible_text must be a string.")
+        if not isinstance(self.objects, FoldedObjectStore):
+            raise TypeError("DocumentState.objects must be a FoldedObjectStore.")
+
+
 @dataclass
 class FootnoteEditorSession:
     identifier: str
     working: FootnoteData
     editor: object | None = None
-    dialog_float: object | None = None
 
 
 @dataclass
@@ -1593,12 +1736,14 @@ class EditorState:
         self.working_state_persisted_revision = 0
         self.working_state_first_dirty_at = None
         self.working_state_last_change_at = None
-        self.tables = {}
-        self.footnotes = {}
+        self.objects = FoldedObjectStore()
+
+    def document_state(self, current_text):
+        return DocumentState(current_text, self.objects)
 
     def is_modified(self, current_text):
         try:
-            source_text = _materialize_objects(current_text)
+            source_text = _materialize_document_state(self.document_state(current_text))
         except ValueError:
             return True
         return source_text != self.saved_text
@@ -1633,15 +1778,13 @@ def _reset_working_state_tracking():
 class _CarriageUndoState:
     """One complete committed-document state for Undo/Redo.
 
-    The table/footnote dictionaries are persistent snapshots: committed object
-    changes use copy-on-write, so ordinary prose edits can share these mappings
-    across many undo entries without deep-copying object data on every keypress.
+    Folded objects live behind one persistent store. Ordinary prose edits can
+    therefore share that store across many undo entries, while any committed
+    table/footnote change replaces it atomically with the visible document.
     """
 
-    text: str
+    document_state: DocumentState
     cursor_position: int
-    tables: dict[int, TableData]
-    footnotes: dict[str, FootnoteData]
 
 
 class CarriageBuffer(Buffer):
@@ -1649,18 +1792,15 @@ class CarriageBuffer(Buffer):
 
     def _carriage_state(self):
         return _CarriageUndoState(
-            text=self.text,
+            document_state=state.document_state(self.text),
             cursor_position=self.cursor_position,
-            tables=state.tables,
-            footnotes=state.footnotes,
         )
 
     @staticmethod
     def _same_content(first, second):
         return (
-            first.text == second.text
-            and first.tables is second.tables
-            and first.footnotes is second.footnotes
+            first.document_state.visible_text == second.document_state.visible_text
+            and first.document_state.objects is second.document_state.objects
         )
 
     def reset(self, document=None, append_to_history=False):
@@ -1679,10 +1819,8 @@ class CarriageBuffer(Buffer):
         if self._undo_stack and self._same_content(self._undo_stack[-1], current):
             previous = self._undo_stack[-1]
             self._undo_stack[-1] = _CarriageUndoState(
-                text=previous.text,
+                document_state=previous.document_state,
                 cursor_position=current.cursor_position,
-                tables=previous.tables,
-                footnotes=previous.footnotes,
             )
         else:
             self._undo_stack.append(current)
@@ -1691,31 +1829,52 @@ class CarriageBuffer(Buffer):
             self._redo_stack = []
 
     def _restore_carriage_state(self, snapshot):
-        # Dictionaries and committed object values are persistent. Future
-        # object changes replace a mapping rather than mutating one captured by
-        # history, so restoring these references is safe and inexpensive.
-        state.tables = snapshot.tables
-        state.footnotes = snapshot.footnotes
-        self.set_document(
-            Document(snapshot.text, cursor_position=snapshot.cursor_position),
-            bypass_readonly=True,
+        # Undo/Redo shares immutable object stores by identity. Restore the text
+        # and store through the same rollback-protected boundary used by other
+        # complete document-state installations, then mark the restored state as
+        # unsaved/recoverable work.
+        _apply_live_document_state_atomic(
+            self,
+            Document(
+                snapshot.document_state.visible_text,
+                cursor_position=snapshot.cursor_position,
+            ),
+            snapshot.document_state.objects,
+            reset_history=False,
+            mark_working_state=True,
         )
-        _working_state_changed()
 
     def undo(self):
-        current = self._carriage_state()
-        while self._undo_stack:
-            snapshot = self._undo_stack.pop()
-            if not self._same_content(snapshot, current):
-                self._redo_stack.append(current)
-                self._restore_carriage_state(snapshot)
-                break
+        old_undo_stack = list(self._undo_stack)
+        old_redo_stack = list(self._redo_stack)
+        try:
+            current = self._carriage_state()
+            while self._undo_stack:
+                snapshot = self._undo_stack.pop()
+                if not self._same_content(snapshot, current):
+                    self._redo_stack.append(current)
+                    self._restore_carriage_state(snapshot)
+                    break
+        except BaseException:
+            # _restore_carriage_state() rolls back document/object state. Restore
+            # the command-level history mutation as well so a failed Undo is a
+            # true no-op rather than consuming an entry.
+            self._undo_stack = old_undo_stack
+            self._redo_stack = old_redo_stack
+            raise
 
     def redo(self):
-        if self._redo_stack:
-            self.save_to_undo_stack(clear_redo_stack=False)
-            snapshot = self._redo_stack.pop()
-            self._restore_carriage_state(snapshot)
+        old_undo_stack = list(self._undo_stack)
+        old_redo_stack = list(self._redo_stack)
+        try:
+            if self._redo_stack:
+                self.save_to_undo_stack(clear_redo_stack=False)
+                snapshot = self._redo_stack.pop()
+                self._restore_carriage_state(snapshot)
+        except BaseException:
+            self._undo_stack = old_undo_stack
+            self._redo_stack = old_redo_stack
+            raise
 
     # Folded tables and footnote definitions are editor objects, not ordinary
     # text. Keep all character-level Buffer mutations from entering an object
@@ -1820,22 +1979,6 @@ class CenterPaddingMargin(Margin):
         return fragments
 
 
-def _last_mapped_content_y(yx_to_rowcol, x_min, x_max, y_min, y_max):
-    """Return the last rendered source row inside a Window content rectangle."""
-    mapped = (
-        y
-        for y, x in yx_to_rowcol
-        if y_min <= y < y_max and x_min <= x < x_max
-    )
-    return max(mapped, default=y_min)
-
-
-def _clamp_content_mouse_y(requested_y, y_min, y_max, last_content_y):
-    """Clamp a viewport mouse row to the final rendered source row."""
-    y = max(y_min, min(y_max - 1, requested_y))
-    return min(y, last_content_y)
-
-
 def _calculate_scrollbar_thumb_geometry(
     track_height,
     viewport_height,
@@ -1880,6 +2023,584 @@ def _calculate_scrollbar_thumb_geometry(
         max_thumb_top * min(rendered_top, max_document_top) / float(max_document_top)
     ))
     return max(0, min(max_thumb_top, thumb_top)), thumb_height
+
+
+
+_VISUAL_NAVIGATION_CACHE_ROWS = 64
+
+
+@dataclass(frozen=True)
+class _RenderedViewportSnapshot:
+    """One exact rendered-row viewport position captured from a real layout."""
+
+    rendered_top: int
+    heights: tuple[int, ...]
+    prefix: tuple[int, ...]
+    window_height: int
+
+
+class RenderedDocumentGeometry:
+    """Authoritative source/display/rendered-row geometry for the prose editor.
+
+    Carriage has several coordinate systems: Markdown source positions,
+    processor/display columns, visual rows created by soft wrapping, absolute
+    rendered rows in the whole document, and screen coordinates in the active
+    Window.  All conversions among those systems live here so mouse handling,
+    keyboard navigation, scrolling, Home/End, and the scrollbar cannot drift
+    into subtly different interpretations of the same rendered document.
+
+    The object is owned by ``ScrollableWindow``.  Text/layout changes invalidate
+    one generation; line-height measurements may be reused across generations
+    only when every width-affecting dependency key is unchanged.
+    """
+
+    def __init__(self, window):
+        self.window = window
+        self.generation = 0
+        self._height_cache_key = None
+        self._height_cache_heights = None
+        self._height_cache_prefix = None
+        self._height_line_cache = {}
+        self._display_positions_cache = {}
+        self._source_candidates_cache = {}
+
+    def invalidate(self):
+        """Invalidate document geometry after a text/layout change."""
+        self.generation += 1
+        self._height_cache_key = None
+        self._height_cache_heights = None
+        self._height_cache_prefix = None
+        self._display_positions_cache.clear()
+        self._source_candidates_cache.clear()
+
+    def _terminal_columns(self):
+        try:
+            return get_app().output.get_size().columns
+        except Exception:
+            return None
+
+    def _full_text(self):
+        try:
+            return self.window.content.buffer.text
+        except (AttributeError, TypeError):
+            return text_area.buffer.text
+
+    def _height_line_key(self, full_text, row, width, columns):
+        """Return every known dependency that can change one line's height."""
+        lines = _source_lines(full_text)
+        line = lines[row] if 0 <= row < len(lines) else ""
+        row_layout = _display_row_layout(full_text, row)
+        footnote_spans = tuple(_footnote_display_spans(full_text, row))
+        hard_break_span = _hard_break_display_span(full_text, row)
+        return (
+            line,
+            int(width),
+            columns,
+            row_layout,
+            footnote_spans,
+            hard_break_span,
+        )
+
+    @staticmethod
+    def _prefix_for_heights(heights):
+        prefix = [0]
+        for line_height in heights:
+            prefix.append(prefix[-1] + max(1, int(line_height)))
+        return prefix
+
+    def height_geometry(self, ui_content=None, width=None):
+        """Return cached ``(heights, prefix)`` for the current soft layout."""
+        info = self.window.render_info
+        if ui_content is None:
+            if info is None:
+                return None, None
+            ui_content = info.ui_content
+        if width is None:
+            if info is None or info.window_width <= 0:
+                return None, None
+            width = info.window_width
+        if width <= 0:
+            return None, None
+
+        columns = self._terminal_columns()
+        key = (self.generation, int(width), columns, ui_content.line_count)
+        if (
+            self._height_cache_key == key
+            and self._height_cache_heights is not None
+            and self._height_cache_prefix is not None
+        ):
+            return self._height_cache_heights, self._height_cache_prefix
+
+        full_text = self._full_text()
+        previous_line_heights = self._height_line_cache or {}
+        current_line_heights = {}
+        heights = []
+        for row in range(ui_content.line_count):
+            line_key = self._height_line_key(full_text, row, width, columns)
+            line_height = current_line_heights.get(line_key)
+            if line_height is None:
+                line_height = previous_line_heights.get(line_key)
+            if line_height is None:
+                line_height = max(
+                    1,
+                    ui_content.get_height_for_line(
+                        row, width, self.window.get_line_prefix
+                    ),
+                )
+            current_line_heights[line_key] = line_height
+            heights.append(line_height)
+
+        prefix = self._prefix_for_heights(heights)
+        self._height_line_cache = current_line_heights
+        self._height_cache_key = key
+        self._height_cache_heights = heights
+        self._height_cache_prefix = prefix
+        return heights, prefix
+
+    def _normalized_height_geometry(self, heights=None, prefix=None):
+        if heights is None or prefix is None:
+            cached_heights, cached_prefix = self.height_geometry()
+            heights = cached_heights if heights is None else heights
+            prefix = cached_prefix if prefix is None else prefix
+        if not heights:
+            return None, None
+        if prefix is None or len(prefix) != len(heights) + 1:
+            prefix = self._prefix_for_heights(heights)
+        return heights, prefix
+
+    def absolute_scroll(self, heights=None, prefix=None, logical_row=None, inside=None):
+        """Return an absolute rendered row for a Window scroll position."""
+        heights, prefix = self._normalized_height_geometry(heights, prefix)
+        if not heights:
+            return 0
+        if logical_row is None:
+            logical_row = self.window.vertical_scroll
+        if inside is None:
+            inside = self.window.vertical_scroll_2
+        logical_row = max(0, min(len(heights) - 1, int(logical_row)))
+        inside = max(0, min(heights[logical_row] - 1, int(inside)))
+        return prefix[logical_row] + inside
+
+    def absolute_to_row_wrap(self, rendered_row, heights=None, prefix=None):
+        """Map one absolute rendered row to ``(logical row, wrapped row)``."""
+        heights, prefix = self._normalized_height_geometry(heights, prefix)
+        if not heights:
+            return None
+        maximum = max(0, prefix[-1] - 1)
+        target = max(0, min(maximum, int(rendered_row)))
+        row = max(0, min(len(heights) - 1, bisect_right(prefix, target) - 1))
+        return row, target - prefix[row]
+
+    def scroll_components(self, rendered_row, viewport_height, heights=None, prefix=None):
+        """Return ``(clamped absolute, logical row, inside-line row)``."""
+        heights, prefix = self._normalized_height_geometry(heights, prefix)
+        if not heights:
+            return 0, 0, 0
+        max_top = max(0, prefix[-1] - max(1, int(viewport_height)))
+        target = max(0, min(max_top, int(rendered_row)))
+        row = max(0, min(len(heights) - 1, bisect_right(prefix, target) - 1))
+        return target, row, target - prefix[row]
+
+    def line_prefix_width(self, row, wrap_count):
+        prefix = self.window.get_line_prefix
+        if prefix is None:
+            return 0
+        try:
+            fragments = prefix(row, wrap_count)
+        except Exception:
+            return 0
+        width = 0
+        for fragment in fragments or []:
+            if len(fragment) >= 2:
+                width += _display_text_width(fragment[1])
+        return width
+
+    def _navigation_cache_key(self, row, info):
+        if info is None or info.window_width <= 0:
+            return None
+        return (
+            self.generation,
+            int(row),
+            int(info.window_width),
+            self._terminal_columns(),
+        )
+
+    @staticmethod
+    def _store_bounded(cache, key, value):
+        if key not in cache and len(cache) >= _VISUAL_NAVIGATION_CACHE_ROWS:
+            cache.pop(next(iter(cache)))
+        cache[key] = value
+        return value
+
+    def _processed_line(self, row):
+        get_processed = getattr(self.window.content, "_last_get_processed_line", None)
+        if get_processed is None:
+            return None
+        try:
+            return get_processed(row)
+        except Exception:
+            return None
+
+    def display_positions(self, row, info):
+        """Map processed display columns to ``(wrapped row, terminal x)``."""
+        key = self._navigation_cache_key(row, info)
+        if key is None:
+            return None
+        cached = self._display_positions_cache.get(key)
+        if cached is not None:
+            return cached
+
+        processed = self._processed_line(row)
+        if processed is None:
+            return None
+        try:
+            fragments = explode_text_fragments(processed.fragments)
+            fragments.append(("", " "))
+        except Exception:
+            return None
+
+        width = info.window_width
+        wrap_row = 0
+        x = self.line_prefix_width(row, 0)
+        positions = []
+        for fragment in fragments:
+            char = fragment[1]
+            char_width = _display_char_width(char)
+            if x + char_width > width:
+                wrap_row += 1
+                x = self.line_prefix_width(row, wrap_row)
+            positions.append((wrap_row, x))
+            x += char_width
+        positions.append((wrap_row, x))
+        return self._store_bounded(
+            self._display_positions_cache, key, tuple(positions)
+        )
+
+    def source_candidates(self, row, info, document=None):
+        """Return legal source cursor positions grouped by wrapped row."""
+        key = self._navigation_cache_key(row, info)
+        if key is None:
+            return None
+        cached = self._source_candidates_cache.get(key)
+        if cached is not None:
+            return cached
+
+        doc = document or self.window.content.buffer.document
+        if not (0 <= row < doc.line_count):
+            return None
+        processed = self._processed_line(row)
+        positions = self.display_positions(row, info)
+        if processed is None or not positions:
+            return None
+
+        source_line = doc.lines[row]
+        body_col = _hidden_structural_body_col(doc, row)
+        footnote_spans = tuple(_footnote_display_spans(doc.text, row))
+        compact_ranges = tuple(
+            (span[0], span[1])
+            for span in footnote_spans
+            if len(span) >= 5 and not span[4]
+        )
+        folded_footnote = any(len(span) >= 5 and span[4] for span in footnote_spans)
+        folded_visible_end = (
+            max(0, len(source_line) - 1)
+            if folded_footnote and source_line.endswith(FOOTNOTE_SENTINEL)
+            else None
+        )
+
+        by_wrap = {}
+        for source_col in range(len(source_line) + 1):
+            if source_col < body_col:
+                continue
+            if (
+                source_col > 0
+                and source_line[source_col - 1:source_col]
+                in {TABLE_SENTINEL, FOOTNOTE_SENTINEL}
+            ):
+                continue
+            if any(
+                start_col < source_col < end_col
+                for start_col, end_col in compact_ranges
+            ):
+                continue
+            if (
+                folded_visible_end is not None
+                and source_col not in {0, folded_visible_end}
+            ):
+                continue
+            try:
+                display_col = processed.source_to_display(source_col)
+            except Exception:
+                continue
+            display_col = max(0, min(display_col, len(positions) - 1))
+            wrap_row, x = positions[display_col]
+            by_wrap.setdefault(wrap_row, []).append((x, source_col))
+
+        frozen = {
+            wrap_row: tuple(sorted(candidates, key=lambda item: (item[0], item[1])))
+            for wrap_row, candidates in by_wrap.items()
+        }
+        return self._store_bounded(self._source_candidates_cache, key, frozen)
+
+    @staticmethod
+    def normalize_source_col(
+        document, row, source_col, *, structural_body_col=None
+    ):
+        """Snap a source column to one explicit visible cursor boundary.
+
+        Interactive mappings use the width-aware structural gutter. Startup and
+        recovery can provide ``structural_body_col`` from the stable document
+        layout before a real terminal exists.
+        """
+        if not (0 <= row < document.line_count):
+            return source_col
+        source_line = document.lines[row]
+        source_col = max(0, min(len(source_line), int(source_col)))
+        if structural_body_col is None:
+            structural_body_col = _hidden_structural_body_col(document, row)
+        structural_body_col = max(
+            0, min(len(source_line), int(structural_body_col))
+        )
+        source_col = max(source_col, structural_body_col)
+
+        if (
+            source_col > 0
+            and source_line[source_col - 1:source_col]
+            in {TABLE_SENTINEL, FOOTNOTE_SENTINEL}
+        ):
+            source_col -= 1
+
+        spans = tuple(_footnote_display_spans(document.text, row))
+        for start_col, end_col, _label, _identifier, placeholder in spans:
+            if placeholder:
+                visible_end = (
+                    max(0, len(source_line) - 1)
+                    if source_line.endswith(FOOTNOTE_SENTINEL)
+                    else len(source_line)
+                )
+                if 0 < source_col < visible_end:
+                    return min(
+                        (0, visible_end),
+                        key=lambda boundary: (
+                            abs(boundary - source_col), boundary
+                        ),
+                    )
+            elif start_col < source_col < end_col:
+                return min(
+                    (start_col, end_col),
+                    key=lambda boundary: (abs(boundary - source_col), boundary),
+                )
+        return source_col
+
+    def source_to_visual(self, row, source_col, info, document=None):
+        """Return ``(wrapped row, x)`` for a legal source cursor position."""
+        doc = document or self.window.content.buffer.document
+        if not (0 <= row < doc.line_count):
+            return None
+        source_col = self.normalize_source_col(doc, row, source_col)
+        processed = self._processed_line(row)
+        if processed is None:
+            return None
+        try:
+            display_col = processed.source_to_display(source_col)
+        except Exception:
+            return None
+        positions = self.display_positions(row, info)
+        if not positions:
+            return None
+        display_col = max(0, min(display_col, len(positions) - 1))
+        return positions[display_col]
+
+    def visual_to_source(self, row, wrap_row, preferred_x, info, document=None):
+        """Return the legal source column nearest one visual x position."""
+        by_wrap = self.source_candidates(row, info, document=document)
+        if by_wrap is None:
+            return None
+        row_candidates = by_wrap.get(wrap_row, ())
+        if not row_candidates:
+            return None
+        _x, source_col = min(
+            row_candidates,
+            key=lambda item: (abs(item[0] - preferred_x), item[1]),
+        )
+        return source_col
+
+    def source_to_absolute(self, row, source_col, info, heights=None, prefix=None, document=None):
+        """Return ``(absolute rendered row, x)`` for one source position."""
+        visual = self.source_to_visual(row, source_col, info, document=document)
+        heights, prefix = self._normalized_height_geometry(heights, prefix)
+        if visual is None or not heights or not (0 <= row < len(heights)):
+            return None
+        wrap_row, x = visual
+        wrap_row = max(0, min(heights[row] - 1, int(wrap_row)))
+        return prefix[row] + wrap_row, x
+
+    def row_boundary_source_index(self, row, wrap_row, *, end=False, info=None, document=None):
+        """Return the source index at one displayed row's start or end."""
+        doc = document or self.window.content.buffer.document
+        if not (0 <= row < doc.line_count):
+            return None
+        source_line = doc.lines[row]
+        if info is None:
+            info = self.window.render_info
+
+        def physical_boundary():
+            if end:
+                source_col = len(source_line)
+                if source_line.endswith((TABLE_SENTINEL, FOOTNOTE_SENTINEL)):
+                    source_col = max(0, source_col - 1)
+            else:
+                source_col = _hidden_structural_body_col(doc, row)
+            return doc.translate_row_col_to_index(row, source_col)
+
+        if info is None or info.window_width <= 0:
+            return physical_boundary()
+        by_wrap = self.source_candidates(row, info, document=doc)
+        if by_wrap is None:
+            return physical_boundary()
+        row_candidates = by_wrap.get(wrap_row, ())
+        if not row_candidates:
+            return physical_boundary()
+        _x, source_col = row_candidates[-1] if end else row_candidates[0]
+        return doc.translate_row_col_to_index(row, source_col)
+
+    @staticmethod
+    def inverse_screen_map(info):
+        """Return screen ``(y, x)`` -> processed ``(row, display_col)``."""
+        try:
+            return {value: key for key, value in info._rowcol_to_yx.items()}
+        except Exception:
+            return {}
+
+    @staticmethod
+    def last_mapped_content_y(inverse_map, x_min, x_max, y_min, y_max):
+        mapped = (
+            y
+            for y, x in inverse_map
+            if y_min <= y < y_max and x_min <= x < x_max
+        )
+        return max(mapped, default=y_min)
+
+    @staticmethod
+    def _clamp_screen_y(requested_y, y_min, y_max, last_content_y):
+        y = max(y_min, min(y_max - 1, requested_y))
+        return min(y, last_content_y)
+
+    def screen_to_display_position(
+        self,
+        screen_y,
+        screen_x,
+        *,
+        info,
+        x_min,
+        x_max,
+        y_min,
+        y_max,
+        inverse_map=None,
+    ):
+        """Map a content-screen click to the nearest painted display position."""
+        if inverse_map is None:
+            inverse_map = self.inverse_screen_map(info)
+        last_y = self.last_mapped_content_y(
+            inverse_map, x_min, x_max, y_min, y_max
+        )
+        y = self._clamp_screen_y(screen_y, y_min, y_max, last_y)
+        x = screen_x
+        while x >= x_min:
+            rowcol = inverse_map.get((y, x))
+            if rowcol is not None:
+                return rowcol
+            x -= 1
+        return None
+
+    def screen_row_to_row_wrap(
+        self,
+        screen_y,
+        *,
+        info,
+        x_min,
+        x_max,
+        y_min,
+        y_max,
+        inverse_map=None,
+    ):
+        """Return ``(logical row, wrapped row)`` owning one screen row."""
+        if inverse_map is None:
+            inverse_map = self.inverse_screen_map(info)
+        last_y = self.last_mapped_content_y(
+            inverse_map, x_min, x_max, y_min, y_max
+        )
+        y = self._clamp_screen_y(screen_y, y_min, y_max, last_y)
+
+        painted = [
+            (x, row, display_col)
+            for (mapped_y, x), (row, display_col) in inverse_map.items()
+            if mapped_y == y and x_min <= x < x_max
+        ]
+        if painted:
+            _x, row, display_col = min(painted)
+            positions = self.display_positions(row, info)
+            if positions:
+                display_col = max(0, min(display_col, len(positions) - 1))
+                return row, positions[display_col][0]
+
+        visible_y = y - info._y_offset
+        rowcol = info.visible_line_to_row_col.get(visible_y)
+        if rowcol is None:
+            return None
+        row, display_col = rowcol
+        positions = self.display_positions(row, info)
+        if not positions:
+            return row, 0
+        display_col = max(0, min(display_col, len(positions) - 1))
+        return row, positions[display_col][0]
+
+    def gutter_boundary_source_index(
+        self,
+        screen_y,
+        *,
+        end=False,
+        info,
+        x_min,
+        x_max,
+        y_min,
+        y_max,
+        inverse_map=None,
+        document=None,
+    ):
+        owner = self.screen_row_to_row_wrap(
+            screen_y,
+            info=info,
+            x_min=x_min,
+            x_max=x_max,
+            y_min=y_min,
+            y_max=y_max,
+            inverse_map=inverse_map,
+        )
+        if owner is None:
+            return None
+        row, wrap_row = owner
+        return self.row_boundary_source_index(
+            row, wrap_row, end=end, info=info, document=document
+        )
+
+    def viewport_snapshot(self, info=None):
+        """Capture the rendered top and the exact geometry that produced it."""
+        if info is None:
+            info = self.window.render_info
+        if info is None:
+            return None
+        heights, prefix = self.height_geometry(
+            ui_content=info.ui_content, width=info.window_width
+        )
+        if not heights or prefix is None:
+            return None
+        return _RenderedViewportSnapshot(
+            rendered_top=self.absolute_scroll(heights, prefix),
+            heights=tuple(heights),
+            prefix=tuple(prefix),
+            window_height=max(1, info.window_height),
+        )
 
 
 class RenderedScrollbarMargin(Margin):
@@ -1930,14 +2651,14 @@ class RenderedScrollbarMargin(Margin):
             return []
 
         window = self.window_getter()
-        heights, prefix = window._rendered_height_geometry(
+        heights, prefix = window.rendered_geometry.height_geometry(
             ui_content=window_render_info.ui_content,
             width=window_render_info.window_width,
         )
         total_height = prefix[-1] if heights and prefix else 0
         viewport_height = max(1, window_render_info.window_height)
         rendered_top = (
-            window._absolute_rendered_scroll(heights, prefix)
+            window.rendered_geometry.absolute_scroll(heights, prefix)
             if heights and prefix
             else 0
         )
@@ -2011,152 +2732,19 @@ class ScrollableWindow(Window):
     # edge. Carriage keeps the keyboard viewport in rendered-row coordinates.
     keyboard_scroll_active = False
 
-    def invalidate_rendered_height_cache(self):
-        """Invalidate document geometry while retaining reusable line heights.
-
-        Text edits can alter structural interpretation beyond the edited row
-        (for example lazy blockquotes, list runs, or footnote numbering), so
-        Carriage deliberately rebuilds the cheap height/prefix arrays after a
-        change.  The expensive prompt_toolkit line measurement is retained in a
-        dependency-keyed cache and reused only when every width-affecting input
-        for that logical row is unchanged.
-        """
-        self._height_cache_generation = getattr(self, "_height_cache_generation", 0) + 1
-        self._height_cache_key = None
-        self._height_cache_heights = None
-        self._height_cache_prefix = None
-
-    def _height_cache_columns(self):
-        """Return terminal columns that can affect continuation-prefix width."""
-        try:
-            return get_app().output.get_size().columns
-        except Exception:
-            return None
-
-    def _rendered_height_line_key(self, full_text, row, width, columns):
-        """Return all known inputs that can change one logical row's height.
-
-        Styling alone is intentionally absent: color/bold/italic do not change
-        terminal cell width.  Structural layout, compact footnote labels, hard-
-        break display substitution, source text, viewport width, and terminal
-        columns do.  Full-document parsing may therefore change this key for an
-        untouched source line, which is how dependent rows are invalidated
-        without assuming that an edit affects only one physical line.
-        """
-        lines = _source_lines(full_text)
-        line = lines[row] if 0 <= row < len(lines) else ""
-        row_layout = _display_row_layout(full_text, row)
-        footnote_spans = tuple(_footnote_display_spans(full_text, row))
-        hard_break_span = _hard_break_display_span(full_text, row)
-        return (
-            line,
-            int(width),
-            columns,
-            row_layout,
-            footnote_spans,
-            hard_break_span,
-        )
-
-    def _rendered_height_geometry(self, ui_content=None, width=None):
-        """Return cached ``(heights, prefix)`` for the current soft layout.
-
-        Whole-document geometry is rebuilt after text/layout changes, but line
-        heights are reused from the previous rendered geometry whenever their
-        complete render-dependency key is unchanged.  This keeps structural
-        invalidation conservative while avoiding a prompt_toolkit transformation
-        pass for every unaffected line after each keystroke.
-        """
-        info = self.render_info
-        if ui_content is None:
-            if info is None:
-                return None, None
-            ui_content = info.ui_content
-        if width is None:
-            if info is None or info.window_width <= 0:
-                return None, None
-            width = info.window_width
-        if width <= 0:
-            return None, None
-
-        generation = getattr(self, "_height_cache_generation", 0)
-        columns = self._height_cache_columns()
-        key = (generation, width, columns, ui_content.line_count)
-        if (
-            getattr(self, "_height_cache_key", None) == key
-            and getattr(self, "_height_cache_heights", None) is not None
-            and getattr(self, "_height_cache_prefix", None) is not None
-        ):
-            return self._height_cache_heights, self._height_cache_prefix
-
-        try:
-            full_text = self.content.buffer.text
-        except (AttributeError, TypeError):
-            full_text = text_area.buffer.text
-
-        previous_line_heights = getattr(self, "_height_line_cache", None) or {}
-        current_line_heights = {}
-        heights = []
-        for row in range(ui_content.line_count):
-            line_key = self._rendered_height_line_key(
-                full_text, row, width, columns
-            )
-            line_height = current_line_heights.get(line_key)
-            if line_height is None:
-                line_height = previous_line_heights.get(line_key)
-            if line_height is None:
-                line_height = max(
-                    1,
-                    ui_content.get_height_for_line(
-                        row, width, self.get_line_prefix
-                    ),
-                )
-            current_line_heights[line_key] = line_height
-            heights.append(line_height)
-
-        prefix = [0]
-        total = 0
-        for line_height in heights:
-            total += line_height
-            prefix.append(total)
-
-        # Retain only keys used by the current geometry.  This gives edits one
-        # generation of reuse without accumulating stale source lines forever.
-        self._height_line_cache = current_line_heights
-        self._height_cache_key = key
-        self._height_cache_heights = heights
-        self._height_cache_prefix = prefix
-        return heights, prefix
-
-    def _absolute_rendered_scroll(self, heights=None, prefix=None):
-        """Return the current viewport top as an absolute rendered-row index."""
-        if heights is None or prefix is None:
-            cached_heights, cached_prefix = self._rendered_height_geometry()
-            heights = cached_heights if heights is None else heights
-            prefix = cached_prefix if prefix is None else prefix
-        if not heights:
-            return 0
-        if prefix is None or len(prefix) != len(heights) + 1:
-            prefix = [0]
-            for line_height in heights:
-                prefix.append(prefix[-1] + line_height)
-        row = max(0, min(len(heights) - 1, self.vertical_scroll))
-        inside = max(0, min(heights[row] - 1, self.vertical_scroll_2))
-        return prefix[row] + inside
+    def invalidate_rendered_geometry(self):
+        """Invalidate the authoritative rendered-document geometry."""
+        self.rendered_geometry.invalidate()
 
     def _set_rendered_scroll(
         self, rendered_row, heights=None, prefix=None, window_height=None
     ):
-        """Set a cursor-independent viewport top from a rendered-row index."""
-        # Mouse-wheel/scrollbar viewport ownership supersedes keyboard vertical
-        # navigation. Manual mode hides the caret until editing resumes.
+        """Set a cursor-independent viewport top from an absolute rendered row."""
         self.keyboard_scroll_active = False
-        # Any explicit viewport scroll cancels a section-navigation top anchor.
-        # Otherwise ending a manual scroll while the caret remained on the
-        # heading could unexpectedly snap the heading back to the top.
         self._section_top_anchor_row = None
         info = self.render_info
         if heights is None or prefix is None:
-            cached_heights, cached_prefix = self._rendered_height_geometry()
+            cached_heights, cached_prefix = self.rendered_geometry.height_geometry()
             heights = cached_heights if heights is None else heights
             prefix = cached_prefix if prefix is None else prefix
         if not heights:
@@ -2164,30 +2752,15 @@ class ScrollableWindow(Window):
             self.vertical_scroll_2 = 0
             self.manual_scroll_active = False
             return
-        if prefix is None or len(prefix) != len(heights) + 1:
-            prefix = [0]
-            for line_height in heights:
-                prefix.append(prefix[-1] + line_height)
 
         if window_height is None:
             window_height = info.window_height if info is not None else 1
-        current = self._absolute_rendered_scroll(heights, prefix)
-        total_height = prefix[-1]
-        max_top = max(0, total_height - max(1, window_height))
-        target = max(0, min(max_top, int(rendered_row)))
-
-        # prefix is monotonically increasing because every logical line has a
-        # rendered height of at least one row. Binary search maps an absolute
-        # rendered row back to its logical line without scanning the document.
-        target_row = max(0, min(len(heights) - 1, bisect_right(prefix, target) - 1))
-        wrapped_offset = target - prefix[target_row]
-
+        current = self.rendered_geometry.absolute_scroll(heights, prefix)
+        target, target_row, wrapped_offset = self.rendered_geometry.scroll_components(
+            rendered_row, window_height, heights, prefix
+        )
         self.vertical_scroll = target_row
         self.vertical_scroll_2 = wrapped_offset
-        # Do not hide the caret merely because the user spun the wheel at an
-        # already-reached edge or in a document shorter than the viewport.
-        # Once manual browsing is active, however, keep it active at the edge
-        # until the user resumes editing/cursor movement.
         self.manual_scroll_active = self.manual_scroll_active or target != current
 
     def end_manual_scroll(self):
@@ -2197,24 +2770,15 @@ class ScrollableWindow(Window):
     def _set_keyboard_rendered_scroll(
         self, rendered_row, heights, prefix, window_height
     ):
-        """Keep a keyboard-driven viewport at one rendered-row position.
-
-        Unlike manual wheel/scrollbar browsing, the insertion cursor remains
-        visible. The explicit top survives repaints until a nonvertical cursor
-        move or an edit returns scrolling to prompt_toolkit.
-        """
-        if not heights or prefix is None or len(prefix) != len(heights) + 1:
+        """Keep a keyboard-driven viewport at one absolute rendered-row top."""
+        if not heights:
             self.keyboard_scroll_active = False
             return
-
-        total_height = prefix[-1]
-        max_top = max(0, total_height - max(1, int(window_height)))
-        target = max(0, min(max_top, int(rendered_row)))
-        target_row = max(
-            0, min(len(heights) - 1, bisect_right(prefix, target) - 1)
+        _target, target_row, wrapped_offset = self.rendered_geometry.scroll_components(
+            rendered_row, window_height, heights, prefix
         )
         self.vertical_scroll = target_row
-        self.vertical_scroll_2 = target - prefix[target_row]
+        self.vertical_scroll_2 = wrapped_offset
         self.keyboard_scroll_active = True
 
     def _scroll(self, ui_content, width, height):
@@ -2226,24 +2790,14 @@ class ScrollableWindow(Window):
                 and 0 <= anchor < ui_content.line_count
                 and ui_content.cursor_position.y == anchor
             ):
-                # Section navigation is deliberately stronger than
-                # prompt_toolkit's normal keep-cursor-visible behavior: the
-                # target ATX heading belongs on the first visible editor row,
-                # even near EOF where that leaves blank rows below it. Keep
-                # the anchor active until some other cursor/edit/scroll action
-                # cancels it, otherwise a later repaint would clamp the view
-                # back upward to keep the bottom of the document filled.
                 self.horizontal_scroll = 0
                 self.vertical_scroll = anchor
                 self.vertical_scroll_2 = 0
                 return
             return super()._scroll(ui_content, width, height)
 
-        # Manual browsing and keyboard vertical navigation both preserve an
-        # explicit rendered-row viewport top. Only manual browsing hides the
-        # cursor; keyboard mode keeps the caret visible.
         self.horizontal_scroll = 0
-        heights, prefix = self._rendered_height_geometry(
+        heights, prefix = self.rendered_geometry.height_geometry(
             ui_content=ui_content, width=width
         )
         if not heights:
@@ -2251,39 +2805,37 @@ class ScrollableWindow(Window):
             self.vertical_scroll_2 = 0
             return
 
-        # Re-map the stored logical-row/inside-line position to a valid absolute
-        # rendered-row position. Width/terminal geometry is part of the cache
-        # key, so resizing transparently rebuilds the soft-wrap measurements.
-        row = max(0, min(len(heights) - 1, self.vertical_scroll))
-        requested = prefix[row] + max(0, self.vertical_scroll_2)
-        total_height = prefix[-1]
-        max_top = max(0, total_height - max(1, height))
-        target = max(0, min(max_top, requested))
-
-        logical_row = max(
-            0, min(len(heights) - 1, bisect_right(prefix, target) - 1)
+        requested = self.rendered_geometry.absolute_scroll(heights, prefix)
+        _target, logical_row, inside = self.rendered_geometry.scroll_components(
+            requested, height, heights, prefix
         )
         self.vertical_scroll = logical_row
-        self.vertical_scroll_2 = target - prefix[logical_row]
+        self.vertical_scroll_2 = inside
 
     def _scroll_up(self):
-        heights, prefix = self._rendered_height_geometry()
         info = self.render_info
+        heights, prefix = self.rendered_geometry.height_geometry()
         if not heights or info is None:
             return
-        current = self._absolute_rendered_scroll(heights, prefix)
+        current = self.rendered_geometry.absolute_scroll(heights, prefix)
         self._set_rendered_scroll(
-            current - 1, heights=heights, prefix=prefix, window_height=info.window_height
+            current - 1,
+            heights=heights,
+            prefix=prefix,
+            window_height=info.window_height,
         )
 
     def _scroll_down(self):
-        heights, prefix = self._rendered_height_geometry()
         info = self.render_info
+        heights, prefix = self.rendered_geometry.height_geometry()
         if not heights or info is None:
             return
-        current = self._absolute_rendered_scroll(heights, prefix)
+        current = self.rendered_geometry.absolute_scroll(heights, prefix)
         self._set_rendered_scroll(
-            current + 1, heights=heights, prefix=prefix, window_height=info.window_height
+            current + 1,
+            heights=heights,
+            prefix=prefix,
+            window_height=info.window_height,
         )
 
     def _write_to_screen_at_index(
@@ -2301,40 +2853,25 @@ class ScrollableWindow(Window):
         # coordinates and source/display map.
         info = self.render_info
         if info is not None:
-            yx_to_rowcol = {v: k for k, v in info._rowcol_to_yx.items()}
+            screen_map = self.rendered_geometry.inverse_screen_map(info)
             content_x_min = info._x_offset
             content_x_max = info._x_offset + info.window_width
             content_y_min = write_position.ypos
             content_y_max = write_position.ypos + write_position.height
 
-            last_content_y = _last_mapped_content_y(
-                yx_to_rowcol,
-                content_x_min,
-                content_x_max,
-                content_y_min,
-                content_y_max,
-            )
-
             def click_viewport_snapshot():
                 """Capture the exact rendered top used by this mouse map."""
-                heights, prefix = self._rendered_height_geometry(
-                    ui_content=info.ui_content, width=info.window_width
-                )
-                if not heights or prefix is None:
-                    return None
-                return (
-                    self._absolute_rendered_scroll(heights, prefix),
-                    heights,
-                    prefix,
-                    max(1, info.window_height),
-                )
+                return self.rendered_geometry.viewport_snapshot(info)
 
             def restore_click_viewport(snapshot):
                 """Keep a positioning click from shifting the visible text."""
                 if snapshot is None:
                     self.end_manual_scroll()
                     return
-                rendered_top, heights, prefix, window_height = snapshot
+                rendered_top = snapshot.rendered_top
+                heights = snapshot.heights
+                prefix = snapshot.prefix
+                window_height = snapshot.window_height
                 # Moving the buffer cursor fires _resume_editor_view(), which
                 # intentionally ends wheel/manual scrolling. Reinstall the same
                 # rendered top afterward in cursor-visible mode. A subsequent
@@ -2346,17 +2883,9 @@ class ScrollableWindow(Window):
                 )
 
             def content_handler(mouse_event):
-                y = _clamp_content_mouse_y(
-                    mouse_event.position.y,
-                    content_y_min,
-                    content_y_max,
-                    last_content_y,
-                )
-                x = mouse_event.position.x
-
                 # Blank rows below EOF are part of the editor viewport, not a
-                # dead mouse zone. The y coordinate above is clamped to the
-                # final rendered content row before horizontal source lookup.
+                # dead mouse zone. RenderedDocumentGeometry clamps them to the
+                # final rendered content row before source lookup.
 
                 # A positioning click must use the render map that was actually
                 # clicked and keep that same viewport afterward. Ending manual
@@ -2403,24 +2932,29 @@ class ScrollableWindow(Window):
                         self._carriage_drag_viewport_snapshot = None
                     return result
 
-                # Search left from blank cells to the nearest rendered source
-                # position, matching prompt_toolkit's normal click behavior.
-                while x >= content_x_min:
-                    rowcol = yx_to_rowcol.get((y, x))
-                    if rowcol is not None:
-                        row, col = rowcol
-                        result = self.content.mouse_handler(
-                            MouseEvent(
-                                position=Point(x=col, y=row),
-                                event_type=mouse_event.event_type,
-                                button=mouse_event.button,
-                                modifiers=mouse_event.modifiers,
-                            )
+                mapped = self.rendered_geometry.screen_to_display_position(
+                    mouse_event.position.y,
+                    mouse_event.position.x,
+                    info=info,
+                    x_min=content_x_min,
+                    x_max=content_x_max,
+                    y_min=content_y_min,
+                    y_max=content_y_max,
+                    inverse_map=screen_map,
+                )
+                if mapped is not None:
+                    row, col = mapped
+                    result = self.content.mouse_handler(
+                        MouseEvent(
+                            position=Point(x=col, y=row),
+                            event_type=mouse_event.event_type,
+                            button=mouse_event.button,
+                            modifiers=mouse_event.modifiers,
                         )
-                        if result == NotImplemented:
-                            result = self._mouse_handler(mouse_event)
-                        return finish_mouse_event(result)
-                    x -= 1
+                    )
+                    if result == NotImplemented:
+                        result = self._mouse_handler(mouse_event)
+                    return finish_mouse_event(result)
 
                 result = self._mouse_handler(mouse_event)
                 return finish_mouse_event(result)
@@ -2434,48 +2968,17 @@ class ScrollableWindow(Window):
             )
 
             def gutter_boundary_target(screen_y, end=False):
-                """Map an outer-margin click to this displayed row's boundary."""
-                y = _clamp_content_mouse_y(
+                """Map an outer-margin click through the shared geometry."""
+                return self.rendered_geometry.gutter_boundary_source_index(
                     screen_y,
-                    content_y_min,
-                    content_y_max,
-                    last_content_y,
+                    end=end,
+                    info=info,
+                    x_min=content_x_min,
+                    x_max=content_x_max,
+                    y_min=content_y_min,
+                    y_max=content_y_max,
+                    inverse_map=screen_map,
                 )
-
-                # Find any processed display column actually painted on this
-                # screen row. Its logical row plus visual-wrap number are enough
-                # to reuse the exact Home/End boundary resolver.
-                painted = [
-                    (x, row, col)
-                    for (row, col), (mapped_y, x) in info._rowcol_to_yx.items()
-                    if mapped_y == y
-                    and content_x_min <= x < content_x_max
-                ]
-                if painted:
-                    _x, row, display_col = min(painted)
-                    positions = _visual_display_positions(row, info)
-                    if positions:
-                        display_col = max(0, min(display_col, len(positions) - 1))
-                        wrap_row = positions[display_col][0]
-                        return _visual_row_boundary_source_index(
-                            row, wrap_row, end=end, info=info
-                        )
-
-                # Empty lines may have no painted input cell. WindowRenderInfo
-                # still records which logical line owns every visible row.
-                visible_y = y - info._y_offset
-                rowcol = info.visible_line_to_row_col.get(visible_y)
-                if rowcol is not None:
-                    row, display_col = rowcol
-                    positions = _visual_display_positions(row, info)
-                    wrap_row = 0
-                    if positions:
-                        display_col = max(0, min(display_col, len(positions) - 1))
-                        wrap_row = positions[display_col][0]
-                    return _visual_row_boundary_source_index(
-                        row, wrap_row, end=end, info=info
-                    )
-                return None
 
             def make_gutter_handler(end=False):
                 def gutter_handler(mouse_event):
@@ -2593,7 +3096,7 @@ def _scrollbar_rendered_geometry():
     info = text_area.window.render_info
     if info is None:
         return None, None
-    return text_area.window._rendered_height_geometry(
+    return text_area.window.rendered_geometry.height_geometry(
         ui_content=info.ui_content, width=info.window_width
     )
 
@@ -3664,21 +4167,15 @@ text_area.buffer._undo_stack = []
 text_area.buffer._redo_stack = []
 text_area.control.__class__ = FullWidthSafeBufferControl
 text_area.window.__class__ = ScrollableWindow
-text_area.window._height_cache_generation = 0
-text_area.window._height_cache_key = None
-text_area.window._height_cache_heights = None
-text_area.window._height_cache_prefix = None
-text_area.window._height_line_cache = {}
+text_area.window.rendered_geometry = RenderedDocumentGeometry(text_area.window)
 # Preferred rendered-screen column for repeated Up/Down navigation. Unlike
 # Buffer.preferred_column, this is measured in visual cells after Carriage's
 # display transformations and soft wrapping.
 text_area.window._vertical_preferred_x = None
 text_area.window._visual_vertical_move_in_progress = False
 text_area.window.keyboard_scroll_active = False
-# Visual cursor geometry is expensive on very long logical paragraphs. Cache
-# only rows actually visited by navigation; text edits clear these caches.
-text_area.window._visual_positions_cache = {}
-text_area.window._visual_candidates_cache = {}
+# RenderedDocumentGeometry owns all visual-position and height caches so every
+# mouse/navigation/scroll path observes the same layout generation.
 # Alt+Up/Alt+Down can pin a target heading to the first visible editor row.
 # The anchor survives repaints but is cleared by any subsequent ordinary
 # cursor movement, edit, or manual viewport scroll.
@@ -3757,9 +4254,7 @@ def _editor_text_changed(_buffer=None):
     text_area.window.keyboard_scroll_active = False
     text_area.window._section_top_anchor_row = None
     text_area.window._vertical_preferred_x = None
-    text_area.window.invalidate_rendered_height_cache()
-    text_area.window._visual_positions_cache.clear()
-    text_area.window._visual_candidates_cache.clear()
+    text_area.window.invalidate_rendered_geometry()
     _working_state_changed()
 
 
@@ -3767,15 +4262,162 @@ text_area.buffer.on_cursor_position_changed += _resume_editor_view
 text_area.buffer.on_text_changed += _editor_text_changed
 
 floats = []
-dialog_stack = []
-current_float = None
-current_table_editor = None
-current_footnote_editor = None
 
 
 # ---------------------------------------------------------------------------
 # Dialog helpers
 # ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ModalSession:
+    """One admitted modal and all lifecycle state that belongs to it."""
+
+    dialog_float: object
+    focus_target: object
+    owner: object | None = None
+    on_close: object | None = None
+    owner_on_close: object | None = None
+
+
+class DialogManager:
+    """Own Carriage's complete modal stack, focus, and editor ownership.
+
+    A modal enters the stack only after terminal-size admission succeeds.  Its
+    Float, focus target, optional owner, and callbacks are therefore installed
+    as one state transition and removed together by ``close_top``.  Complex
+    editors are discovered through their owning ModalSession rather than
+    parallel global variables, so an editor can never be active without the
+    dialog that owns it.
+    """
+
+    def __init__(self, float_list):
+        self.floats = float_list
+        self.stack = []
+
+    @property
+    def current(self):
+        return self.stack[-1] if self.stack else None
+
+    def has_modal(self):
+        return bool(self.stack)
+
+    def can_open(
+        self,
+        min_columns=MIN_SUPPORTED_TERMINAL_COLUMNS,
+        min_rows=MIN_SUPPORTED_TERMINAL_ROWS,
+        *,
+        notify=False,
+    ):
+        """Return whether a modal meeting this size policy can be admitted."""
+        supported = _dialog_terminal_supported(min_columns, min_rows)
+        if not supported and notify:
+            _notify_dialog_terminal_too_small(min_columns, min_rows)
+        return supported
+
+    def top_owner(self, owner_type=None):
+        session = self.current
+        if session is None or session.owner is None:
+            return None
+        if owner_type is not None and not isinstance(session.owner, owner_type):
+            return None
+        return session.owner
+
+    def find_owner(self, owner_type):
+        """Return the nearest owning editor in the modal stack, if any."""
+        for session in reversed(self.stack):
+            if isinstance(session.owner, owner_type):
+                return session.owner
+        return None
+
+    def open(
+        self,
+        dialog,
+        focus=None,
+        on_close=None,
+        height=None,
+        *,
+        owner=None,
+        owner_on_close=None,
+        min_columns=MIN_SUPPORTED_TERMINAL_COLUMNS,
+        min_rows=MIN_SUPPORTED_TERMINAL_ROWS,
+    ):
+        """Admit and show one modal as a single lifecycle transition."""
+        if not self.can_open(min_columns, min_rows, notify=True):
+            if on_close is not None:
+                on_close()
+            return None
+
+        # Find/Replace and a modal dialog must never own focus simultaneously.
+        if find_replace.active:
+            _close_find_replace()
+
+        dialog_float = Float(content=dialog, height=height)
+        focus_target = focus if focus is not None else dialog
+        session = ModalSession(
+            dialog_float=dialog_float,
+            focus_target=focus_target,
+            owner=owner,
+            on_close=on_close,
+            owner_on_close=owner_on_close,
+        )
+
+        self.floats.append(dialog_float)
+        self.stack.append(session)
+
+        app = get_app()
+        try:
+            app.layout.focus(focus_target)
+            app.invalidate()
+        except BaseException:
+            # Admission is transactional: if prompt_toolkit rejects the focus
+            # transition, do not leave a half-open Float or registered owner.
+            if self.stack and self.stack[-1] is session:
+                self.stack.pop()
+            if dialog_float in self.floats:
+                self.floats.remove(dialog_float)
+            previous = self.current
+            if previous is not None:
+                try:
+                    app.layout.focus(previous.focus_target)
+                except BaseException:
+                    pass
+            raise
+        return session
+
+    def close_top(self):
+        """Close the top modal and restore focus to the one beneath it."""
+        if not self.stack:
+            return None
+
+        session = self.stack.pop()
+        if session.dialog_float in self.floats:
+            self.floats.remove(session.dialog_float)
+
+        callback_error = None
+        try:
+            if session.owner is not None and session.owner_on_close is not None:
+                session.owner_on_close(session.owner)
+        except BaseException as error:
+            callback_error = error
+
+        # Focus restoration is part of closing the modal even if an owner
+        # bookkeeping callback fails. Never strand focus on a removed control.
+        app = get_app()
+        next_session = self.current
+        if next_session is not None:
+            app.layout.focus(next_session.focus_target)
+        else:
+            app.layout.focus(text_area)
+        app.invalidate()
+
+        if session.on_close is not None:
+            session.on_close()
+        if callback_error is not None:
+            raise callback_error
+        return session
+
+
+dialog_manager = DialogManager(floats)
 
 def _current_terminal_size():
     """Return ``(columns, rows)`` for the active terminal.
@@ -3813,96 +4455,48 @@ def _notify_dialog_terminal_too_small(
     )
 
 
+def _object_editor_modal_closed(_owner):
+    """Refresh recovery state after a table/footnote owner leaves the stack."""
+    if _has_recoverable_changes():
+        _working_state_changed(immediate=True)
+    else:
+        _clear_recovery_file()
+        _reset_working_state_tracking()
+
+
 def show_dialog(
     dialog,
     focus=None,
     on_close=None,
     height=None,
     *,
+    owner=None,
+    owner_on_close=None,
     min_columns=MIN_SUPPORTED_TERMINAL_COLUMNS,
     min_rows=MIN_SUPPORTED_TERMINAL_ROWS,
 ):
-    """Show a modal dialog, preserving any dialog already underneath it.
+    """Compatibility wrapper around the single DialogManager lifecycle.
 
-    ``height`` is normally left to prompt_toolkit's preferred-size negotiation.
-    Editors whose layout has its own measured viewport may supply an explicit,
-    resize-aware height callable instead. This prevents a transient preferred-
-    height mismeasurement from collapsing the floating dialog body to zero
-    rows while leaving only its frame visible.
+    The return value is the admitted ``ModalSession`` or ``None`` when terminal
+    size policy refuses the dialog.  Most callers need no handle; owner dialogs
+    pass their editor session here so the manager becomes the sole authority for
+    editor lifetime.
     """
-    global current_float
-
-    # Below the supported terminal size, keep the main editor running but do
-    # not attempt to squeeze modal UI until controls disappear. A status-line
-    # notice is safe even when there is not enough room for a message dialog.
-    if not _dialog_terminal_supported(min_columns, min_rows):
-        _notify_dialog_terminal_too_small(min_columns, min_rows)
-        if on_close is not None:
-            on_close()
-        return None
-
-    # Find/Replace and a modal dialog must never own focus simultaneously.
-    if find_replace.active:
-        _close_find_replace()
-    dialog_float = Float(content=dialog, height=height)
-    focus_target = focus if focus is not None else dialog
-    floats.append(dialog_float)
-    dialog_stack.append((dialog_float, focus_target, on_close))
-    current_float = dialog_float
-
-    app = get_app()
-    app.layout.focus(focus_target)
-    app.invalidate()
-    return dialog_float
+    return dialog_manager.open(
+        dialog,
+        focus=focus,
+        on_close=on_close,
+        height=height,
+        owner=owner,
+        owner_on_close=owner_on_close,
+        min_columns=min_columns,
+        min_rows=min_rows,
+    )
 
 
 def close_dialog():
-    """Close the top dialog and restore focus to the dialog beneath it."""
-    global current_float, current_table_editor, current_footnote_editor
-
-    closed_float = None
-    on_close = None
-    if dialog_stack:
-        dialog_float, _, on_close = dialog_stack.pop()
-        closed_float = dialog_float
-        if dialog_float in floats:
-            floats.remove(dialog_float)
-
-    closed_object_editor = False
-    if (
-        current_table_editor is not None
-        and closed_float is current_table_editor.dialog_float
-    ):
-        current_table_editor = None
-        closed_object_editor = True
-    if (
-        current_footnote_editor is not None
-        and closed_float is current_footnote_editor.dialog_float
-    ):
-        current_footnote_editor = None
-        closed_object_editor = True
-
-    # An active object-editor draft participates in the protected working-state
-    # journal. Closing that editor, whether by Save or Cancel, changes what the
-    # next recovery should contain even when the main prose buffer is unchanged.
-    if closed_object_editor:
-        if _has_recoverable_changes():
-            _working_state_changed(immediate=True)
-        else:
-            _clear_recovery_file()
-            _reset_working_state_tracking()
-
-    app = get_app()
-    if dialog_stack:
-        current_float, focus_target, _ = dialog_stack[-1]
-        app.layout.focus(focus_target)
-    else:
-        current_float = None
-        app.layout.focus(text_area)
-    app.invalidate()
-
-    if on_close is not None:
-        on_close()
+    """Close the top modal through the shared DialogManager."""
+    return dialog_manager.close_top()
 
 
 class SingleLineBuffer(Buffer):
@@ -4736,7 +5330,7 @@ def _footnote_content_key(note):
 
 
 def _active_footnote_draft():
-    session = current_footnote_editor
+    session = dialog_manager.find_owner(FootnoteEditorSession)
     if session is None:
         return None
     working = copy.deepcopy(session.working)
@@ -4752,7 +5346,7 @@ def _active_table_draft():
     snapshot using the same newline normalization as a real cell commit. The
     live table-editor session is never mutated by working-state recovery.
     """
-    session = current_table_editor
+    session = dialog_manager.find_owner(TableEditorSession)
     if session is None:
         return None
 
@@ -4779,14 +5373,14 @@ def _has_recoverable_changes():
     draft = _active_table_draft()
     if draft is not None:
         table_number, working = draft
-        committed = state.tables.get(table_number)
+        committed = state.objects.tables.get(table_number)
         if committed is None or _table_content_key(working) != _table_content_key(committed):
             return True
 
     footnote_draft = _active_footnote_draft()
     if footnote_draft is not None:
         identifier, working = footnote_draft
-        committed = state.footnotes.get(identifier)
+        committed = state.objects.footnotes.get(identifier)
         if committed is None or _footnote_content_key(working) != _footnote_content_key(committed):
             return True
     return False
@@ -4878,14 +5472,14 @@ def _recovery_payload():
     """Capture recoverable editor state, including active object-editor drafts."""
     tables = {
         str(number): _table_recovery_record(table)
-        for number, table in state.tables.items()
+        for number, table in state.objects.tables.items()
     }
 
     draft = _active_table_draft()
     had_table_draft = False
     if draft is not None:
         table_number, working = draft
-        committed = state.tables.get(table_number)
+        committed = state.objects.tables.get(table_number)
         if committed is None or _table_content_key(working) != _table_content_key(committed):
             working.dirty = True
             tables[str(table_number)] = _table_recovery_record(working)
@@ -4893,13 +5487,13 @@ def _recovery_payload():
 
     footnotes = {
         identifier: _footnote_recovery_record(note)
-        for identifier, note in state.footnotes.items()
+        for identifier, note in state.objects.footnotes.items()
     }
     footnote_draft = _active_footnote_draft()
     had_footnote_draft = False
     if footnote_draft is not None:
         identifier, working = footnote_draft
-        committed = state.footnotes.get(identifier)
+        committed = state.objects.footnotes.get(identifier)
         if committed is None or _footnote_content_key(working) != _footnote_content_key(committed):
             working.dirty = True
             footnotes[identifier] = _footnote_recovery_record(working)
@@ -5542,9 +6136,12 @@ def _restore_recovery_file(path):
     # before the prose placeholder has been refreshed. Derive folded labels
     # from the recovered table objects so screen and save state agree. Preserve
     # the logical cursor row/column as closely as possible if a label changes.
+    restored_objects = FoldedObjectStore(
+        tables=restored_tables, footnotes=restored_footnotes
+    )
     old_doc = Document(text=recovered_visible_text, cursor_position=cursor_position)
     visible_text = _canonicalize_table_placeholders(
-        recovered_visible_text, restored_tables
+        recovered_visible_text, restored_objects
     )
     new_doc = Document(text=visible_text)
     cursor_row = min(old_doc.cursor_position_row, new_doc.line_count - 1)
@@ -5562,13 +6159,11 @@ def _restore_recovery_file(path):
     # cursor out of hidden structural Markdown while preserving valid logical
     # positions elsewhere in the recovered document.
     _install_editor_document(
-        visible_text,
+        DocumentState(visible_text=visible_text, objects=restored_objects),
         cursor_position=cursor_position,
         path=source_path,
         saved_text=saved_text,
         disk_snapshot=disk_snapshot,
-        tables=restored_tables,
-        footnotes=restored_footnotes,
         reset_working_state=False,
     )
 
@@ -5762,13 +6357,25 @@ def do_new():
             f"{cleanup_detail}",
         )
         return
-    text_area.buffer.reset(Document(text=""))
-    state.path = None
-    state.saved_text = ""
-    state.disk_snapshot = None
-    state.tables = {}
-    state.footnotes = {}
-    _reset_working_state_tracking()
+
+    try:
+        _install_editor_document(
+            DocumentState(visible_text="", objects=FoldedObjectStore()),
+            cursor_position=0,
+            path=None,
+            saved_text="",
+            disk_snapshot=None,
+        )
+    except Exception as e:
+        # Recovery was retired before the destructive transition. The atomic
+        # installer has restored the old in-memory document, so immediately
+        # protect it again rather than leaving restored RAM state unjournaled.
+        _reprotect_after_blocked_cleanup()
+        show_message(
+            "New document error",
+            "Carriage could not create the new document. The previous document "
+            "was restored and re-protected.\n\n" + str(e),
+        )
 
 
 def _normalized_installed_cursor_position(visible_text, cursor_position=0):
@@ -5784,7 +6391,7 @@ def _normalized_installed_cursor_position(visible_text, cursor_position=0):
     document = Document(visible_text, cursor_position=cursor_position)
     row = document.cursor_position_row
     row_layout = _display_row_layout(visible_text, row)
-    source_col = _normalize_visual_source_col(
+    source_col = RenderedDocumentGeometry.normalize_source_col(
         document,
         row,
         document.cursor_position_col,
@@ -5793,32 +6400,111 @@ def _normalized_installed_cursor_position(visible_text, cursor_position=0):
     return document.translate_row_col_to_index(row, source_col)
 
 
+def _set_buffer_document_for_state_transition(buffer, document):
+    """Install one document without changing history; isolated for fault tests."""
+    buffer.set_document(document, bypass_readonly=True)
+
+
+def _reset_buffer_for_state_transition(buffer, document):
+    """Install one document and clear history; isolated for fault tests."""
+    buffer.reset(document)
+
+
+def _apply_live_document_state_atomic(
+    buffer,
+    document,
+    objects,
+    *,
+    reset_history,
+    mark_working_state=False,
+):
+    """Install visible text and folded objects with complete rollback on failure.
+
+    The object store is installed before the Buffer operation so synchronous
+    prompt_toolkit callbacks see the new text and its matching folded objects. If
+    the Buffer operation or a callback raises, the old document, object store,
+    selection, history stacks, selection-mode flag, and working-state counters
+    are restored before the error escapes.
+    """
+    if not isinstance(objects, FoldedObjectStore):
+        raise TypeError("Document-state installation requires a FoldedObjectStore.")
+
+    old_document = buffer.document
+    old_selection = buffer.selection_state
+    old_objects = state.objects
+    old_undo_stack = list(buffer._undo_stack)
+    old_redo_stack = list(buffer._redo_stack)
+    old_extend_selection_mode = state.extend_selection_mode
+    old_tracking = {
+        name: getattr(state, name) for name in _WORKING_STATE_TRACKING_FIELDS
+    }
+
+    rollback_error = None
+    try:
+        state.objects = objects
+        if reset_history:
+            _reset_buffer_for_state_transition(buffer, document)
+        else:
+            _set_buffer_document_for_state_transition(buffer, document)
+        if mark_working_state:
+            _working_state_changed()
+    except BaseException as error:
+        state.objects = old_objects
+        buffer.selection_state = old_selection
+        try:
+            current = buffer.document
+            if (
+                current.text != old_document.text
+                or current.cursor_position != old_document.cursor_position
+            ):
+                # Bypass the fault-injection wrappers during rollback.
+                buffer.set_document(old_document, bypass_readonly=True)
+        except BaseException as restore_error:
+            rollback_error = restore_error
+        finally:
+            buffer.selection_state = old_selection
+            buffer._undo_stack = old_undo_stack
+            buffer._redo_stack = old_redo_stack
+            state.extend_selection_mode = old_extend_selection_mode
+            for name, value in old_tracking.items():
+                setattr(state, name, value)
+
+        if rollback_error is not None:
+            raise RuntimeError(
+                "Document-state installation failed and its rollback also failed."
+            ) from error
+        raise
+
+
 def _install_editor_document(
-    visible_text,
+    document_state,
     *,
     cursor_position=0,
     path,
     saved_text,
     disk_snapshot,
-    tables,
-    footnotes,
     reset_working_state=True,
 ):
-    """Install one complete visible document/object state consistently.
+    """Install one complete visible/object document state consistently.
 
-    File-menu opening, command-line startup, and recovery restoration must all
-    preserve the same cursor invariants.  Set the object maps before resetting
-    the Buffer so any synchronous document callbacks observe a coherent folded
-    state, then install the normalized document and its disk baseline together.
+    File opening, command-line startup, and recovery restoration all cross this
+    one boundary.  The folded-object store is installed before Buffer.reset so
+    synchronous callbacks can never observe placeholders from one document and
+    object data from another.
     """
+    visible_text = document_state.visible_text
     normalized_cursor = _normalized_installed_cursor_position(
         visible_text, cursor_position
     )
-    state.tables = tables
-    state.footnotes = footnotes
-    text_area.buffer.reset(
-        Document(text=visible_text, cursor_position=normalized_cursor)
+    _apply_live_document_state_atomic(
+        text_area.buffer,
+        Document(text=visible_text, cursor_position=normalized_cursor),
+        document_state.objects,
+        reset_history=True,
     )
+    # File identity is published only after the complete document state has been
+    # installed successfully, so a failed Buffer reset cannot partially switch
+    # the editor to the new file.
     state.path = path
     state.saved_text = saved_text
     state.disk_snapshot = disk_snapshot
@@ -5828,15 +6514,13 @@ def _install_editor_document(
 
 def _install_open_document(path, content, disk_snapshot):
     """Replace the editor document with one successfully read source file."""
-    visible = _collapse_objects_from_source(content)
+    document_state = _collapse_objects_from_source(content)
     _install_editor_document(
-        visible,
+        document_state,
         cursor_position=0,
         path=path,
         saved_text=content,
         disk_snapshot=disk_snapshot,
-        tables=state.tables,
-        footnotes=state.footnotes,
     )
 
 
@@ -6499,8 +7183,9 @@ def do_quit():
 
 # Normal editing is soft-wrapped and never reformats source automatically.
 # This section implements the hard-wrapped Markdown export formatter and the
-# shared Markdown structure metadata used by the display layer. Hard-wrap export
-# preserves only the short set of line-sensitive constructs defined below.
+# shared Markdown structure metadata used by the display layer. Conversion and
+# hard-wrap export rewrite only positively identified Carriage-safe prose; any
+# uncertain nonblank region is preserved byte-for-byte as opaque source.
 
 _ATX_HEADING_RE = re.compile(r"^#{1,6}(?!#)(?=.*\S)")
 _SETEXT_H1_RE = re.compile(r"^=+[ \t]*$")
@@ -6985,12 +7670,136 @@ def _alignment_from_separator_cell(cell):
     return "default"
 
 
-_GRID_TABLE_BORDER_RE = re.compile(r"^\s*\+(?:[-=:]{3,}\+){2,}\s*$")
+_GRID_TABLE_BORDER_RE = re.compile(r"^\s*\+(?:[-=:]{3,}\+){1,}\s*$")
 _SIMPLE_TABLE_SEPARATOR_RE = re.compile(
-    r"^\s*:?-{3,}:?(?:[ \t]{2,}:?-{3,}:?)+\s*$"
+    r"^\s*:?-{3,}:?(?:[ \t]+:?-{3,}:?)+\s*$"
 )
 _FENCED_DIV_RE = re.compile(r"^\s{0,3}(?P<fence>:{3,})(?P<tail>[ \t].*)?$")
 _DEFINITION_LIST_MARKER_RE = re.compile(r"^\s{0,3}[:~][ \t]+\S")
+
+# Positive prose recognition.  Convert for Carriage must prove that a physical
+# line is ordinary prose before it is allowed to collapse that line with its
+# neighbors.  These patterns identify generic extension/block shapes rather
+# than specific Markdown dialects; the safe default for anything uncertain is
+# exact source preservation.
+_ALT_LIST_MARKER_RE = re.compile(r"^\s{0,3}\d+[)][ \t]+\S")
+_TASK_OR_ALERT_MARKER_RE = re.compile(
+    r"^\[(?:[ xX]|![A-Za-z][A-Za-z0-9_-]*)\](?:[ \t]|$)"
+)
+_DOT_DIRECTIVE_RE = re.compile(r"^\.\.[ \t]+\S")
+_LATEX_BLOCK_RE = re.compile(r"^\\(?:begin|end)\s*\{|^\\[\[\]](?:[ \t]|$)")
+_AUTOLINK_PREFIX_RE = re.compile(
+    r"^<(?:https?://|mailto:|[^<>\s@]+@[^<>\s@]+)\S*>", re.IGNORECASE
+)
+
+
+def _plain_prose_fragment_is_safe(text):
+    """Return True only when one physical line is safe Carriage prose.
+
+    This is deliberately a positive test.  Recognized Markdown blocks are
+    handled before this function is called; here we admit only ordinary
+    prose-looking lines and familiar inline-Markdown starts.  Unknown
+    delimiter/container/directive shapes are rejected so the enclosing source
+    region becomes opaque instead of being joined or wrapped.
+    """
+    if not text.strip():
+        return True
+
+    # Four-space or tab indentation can carry block semantics.  Incidental
+    # one-to-three-space paragraph indentation remains eligible for conversion.
+    if text.startswith("\t"):
+        return False
+    leading_spaces = len(text) - len(text.lstrip(" "))
+    if leading_spaces >= 4:
+        return False
+
+    stripped = text.lstrip(" ")
+
+    # Carriage-supported block starts and exact-preservation constructs are
+    # never plain prose, even if this helper is used from a nested list/quote.
+    if (
+        TABLE_PLACEHOLDER_RE.match(text)
+        or FOOTNOTE_PLACEHOLDER_RE.match(text)
+        or _ATX_HEADING_RE.match(text)
+        or _LIST_ITEM_RE.match(text)
+        or _ALT_LIST_MARKER_RE.match(text)
+        or stripped.startswith(">")
+        or _fence_marker(text)
+        or _is_indented_code(text)
+        or _is_strong_html_start(text)
+        or _REFERENCE_DEF_RE.match(text)
+        or _is_thematic_break(text)
+        or _GRID_TABLE_BORDER_RE.match(text)
+        or _SIMPLE_TABLE_SEPARATOR_RE.match(text)
+    ):
+        return False
+
+    # Generic line-sensitive extension shapes.  The classifier does not need
+    # to understand their dialect; it only needs to know they are not proven
+    # safe to reflow.
+    if stripped.startswith("|"):
+        return False
+    if stripped.startswith("$$") or stripped.startswith("%%"):
+        return False
+    if stripped.startswith("::") or stripped.startswith("!!!"):
+        return False
+    if stripped.startswith("%") or stripped.startswith("{") or stripped.startswith("}"):
+        return False
+    if _DOT_DIRECTIVE_RE.match(stripped) or _LATEX_BLOCK_RE.match(stripped):
+        return False
+    if _TASK_OR_ALERT_MARKER_RE.match(stripped):
+        return False
+
+    if stripped.startswith("<"):
+        # A complete autolink is ordinary inline Markdown.  Other angle-tag
+        # starts may be custom/raw block syntax, so preserve them.
+        return _AUTOLINK_PREFIX_RE.match(stripped) is not None
+
+    if stripped.startswith("["):
+        # A bare bracketed token on a line by itself is a common extension
+        # directive shape.  Normal inline links/references with surrounding
+        # prose remain safe.
+        if re.fullmatch(r"\[[^]\n]+\]", stripped):
+            return False
+
+    if stripped.startswith("!"):
+        # Admit a normal inline image start, but not arbitrary bang-prefixed
+        # directive syntax.
+        return bool(
+            re.match(r"^!\[[^]\n]*\](?:\([^)]*\)|\[[^]\n]*\])", stripped)
+        )
+
+    if stripped.startswith("`"):
+        # An inline-code span beginning the line is safe only when it closes on
+        # this same physical line.  Cross-line code is preserved elsewhere.
+        return any(start == 0 for start, _end in _inline_code_span_ranges(stripped))
+
+    if stripped.startswith("\\"):
+        # Escaped punctuation is prose; command-like backslash words and block
+        # math delimiters are intentionally opaque.
+        return len(stripped) > 1 and not stripped[1].isalnum() and not stripped.startswith(("\\[", "\\]"))
+
+    if stripped == "$":
+        return False
+
+    first = stripped[0]
+    if first.isalnum() or ord(first) > 127:
+        return True
+
+    # Familiar prose/inline-Markdown opening punctuation.  Anything outside
+    # this small positive set is preserved rather than guessed at.
+    return first in "\"'([*_`-./@&$+"
+
+
+def _plain_prose_run_is_safe(lines, start, end):
+    """Return True only when every line in a candidate prose run is safe."""
+    if not (0 <= start < end <= len(lines)):
+        return False
+    source = lines[start:end]
+    if _prose_contains_multiline_inline_code(source):
+        # Cross-line inline code contains literal newline/spacing content.
+        return False
+    return all(_plain_prose_fragment_is_safe(line) for line in source)
 
 
 def _pipe_row_shape(line):
@@ -7432,9 +8241,14 @@ def _serialize_footnote(note):
 
 
 def _collapse_objects_from_source(source_text):
-    """Fold supported tables and prose footnote definitions in the editor."""
-    state.tables = {}
-    state.footnotes = {}
+    """Return a complete DocumentState with supported objects folded.
+
+    Parsing is side-effect free.  The caller installs the returned state only
+    after the entire source has been classified successfully, so the visible
+    buffer and folded objects can never transiently describe different files.
+    """
+    tables = {}
+    footnotes = {}
     lines = source_text.split("\n")
     visible = []
     i = 0
@@ -7469,16 +8283,16 @@ def _collapse_objects_from_source(source_text):
                 parsed.title = captioned["title"]
                 parsed.caption_position = captioned["caption_position"]
                 parsed.original_lines = captioned["original_lines"]
-                state.tables[table_number] = parsed
+                tables[table_number] = parsed
                 visible.append(_table_placeholder(table_number, parsed.title))
                 table_number += 1
                 i = captioned["end"]
                 continue
 
         footnote = _simple_footnote_definition_at(lines, i)
-        if footnote is not None and footnote["identifier"] not in state.footnotes:
+        if footnote is not None and footnote["identifier"] not in footnotes:
             identifier = footnote["identifier"]
-            state.footnotes[identifier] = FootnoteData(
+            footnotes[identifier] = FootnoteData(
                 identifier=identifier,
                 text=footnote["text"],
                 original_lines=footnote["original_lines"],
@@ -7491,30 +8305,31 @@ def _collapse_objects_from_source(source_text):
         visible.append(lines[i])
         i += 1
 
-    return "\n".join(visible)
+    return DocumentState(
+        visible_text="\n".join(visible),
+        objects=FoldedObjectStore(tables=tables, footnotes=footnotes),
+    )
 
-def _canonicalize_table_placeholders(visible_text, tables=None):
-    """Return visible text with folded table labels derived from table data.
 
-    The table object is the single source of truth for a folded table title.
-    This is used when restoring working-state recovery so an in-progress title draft
-    cannot leave an older placeholder label on screen.
-    """
-    table_map = state.tables if tables is None else tables
+def _canonicalize_table_placeholders(visible_text, objects=None):
+    """Return visible text with folded table labels derived from object state."""
+    object_store = state.objects if objects is None else objects
     rendered = []
     for line in visible_text.split("\n"):
         match = TABLE_PLACEHOLDER_RE.match(line)
         if match:
             number = int(match.group(1))
-            table = table_map.get(number)
+            table = object_store.tables.get(number)
             if table is not None:
                 line = _table_placeholder(number, table.title)
         rendered.append(line)
     return "\n".join(rendered)
 
 
-def _materialize_objects(visible_text):
-    """Expand folded tables and prose footnotes for saving/exporting."""
+def _materialize_document_state(document_state):
+    """Expand one complete Carriage DocumentState to ordinary Markdown source."""
+    visible_text = document_state.visible_text
+    objects = document_state.objects
     rendered = []
     seen_tables = set()
     seen_footnotes = set()
@@ -7528,7 +8343,7 @@ def _materialize_objects(visible_text):
                     f"Table {table_number} appears more than once in the document. "
                     "Use one folded reference per table."
                 )
-            table = state.tables.get(table_number)
+            table = objects.tables.get(table_number)
             if table is None:
                 raise ValueError(
                     f"Table {table_number} no longer has table data attached to it."
@@ -7551,7 +8366,7 @@ def _materialize_objects(visible_text):
                     f"Footnote {identifier!r} appears more than once in the document. "
                     "Use one folded definition per footnote."
                 )
-            note = state.footnotes.get(identifier)
+            note = objects.footnotes.get(identifier)
             if note is None:
                 raise ValueError(
                     f"Footnote {identifier!r} no longer has definition data attached to it."
@@ -7562,7 +8377,7 @@ def _materialize_objects(visible_text):
 
         rendered.append(line)
 
-    missing_tables = sorted(set(state.tables) - seen_tables)
+    missing_tables = sorted(set(objects.tables) - seen_tables)
     if missing_tables:
         label = ", ".join(f"Table {number}" for number in missing_tables)
         raise ValueError(
@@ -7570,7 +8385,7 @@ def _materialize_objects(visible_text):
             "Undo the deletion before saving."
         )
 
-    missing_footnotes = sorted(set(state.footnotes) - seen_footnotes)
+    missing_footnotes = sorted(set(objects.footnotes) - seen_footnotes)
     if missing_footnotes:
         referenced = {
             identifier
@@ -7581,7 +8396,7 @@ def _materialize_objects(visible_text):
             identifier
             for identifier in missing_footnotes
             if (
-                state.footnotes[identifier].original_lines is not None
+                objects.footnotes[identifier].original_lines is not None
                 or identifier in referenced
             )
         ]
@@ -7596,6 +8411,12 @@ def _materialize_objects(visible_text):
         # in-memory object available for Redo, but omit it from materialization.
 
     return "\n".join(rendered)
+
+
+def _materialize_objects(visible_text):
+    """Compatibility helper for callers that operate on the live document."""
+    return _materialize_document_state(state.document_state(visible_text))
+
 
 def _folded_object_line(line):
     return bool(TABLE_PLACEHOLDER_RE.match(line) or FOOTNOTE_PLACEHOLDER_RE.match(line))
@@ -7711,7 +8532,7 @@ def _replace_buffer_document(buffer, document):
     buffer.set_document(document, bypass_readonly=True)
 
 
-_UNCHANGED_OBJECT_MAP = object()
+_UNCHANGED_OBJECT_STORE = object()
 _UNCHANGED_SELECTION = object()
 _WORKING_STATE_TRACKING_FIELDS = (
     "working_state_revision",
@@ -7721,36 +8542,34 @@ _WORKING_STATE_TRACKING_FIELDS = (
 )
 
 
-def _commit_folded_object_transaction(
+def _commit_document_state_transaction(
     buffer,
     document,
     *,
-    tables=_UNCHANGED_OBJECT_MAP,
-    footnotes=_UNCHANGED_OBJECT_MAP,
+    objects=_UNCHANGED_OBJECT_STORE,
     selection=_UNCHANGED_SELECTION,
 ):
-    """Commit folded-object mappings and their visible document atomically.
+    """Commit visible text and folded objects through one atomic state boundary.
 
-    The object dictionaries and compact Markdown placeholders form one logical
-    document state.  Build the replacement values before calling this helper;
-    it captures undo/recovery bookkeeping, installs both halves, and restores
-    the exact prior state if prompt_toolkit raises during document replacement.
+    ``Document`` still carries prompt_toolkit's cursor position, but its text and
+    the FoldedObjectStore together are Carriage's committed DocumentState.  The
+    transaction captures Undo/Redo and recovery bookkeeping, installs that state
+    as one logical change, and restores the exact prior state if prompt_toolkit
+    raises during document replacement.
     """
     old_document = buffer.document
     old_selection = buffer.selection_state
-    old_tables = state.tables
-    old_footnotes = state.footnotes
+    old_objects = state.objects
+    next_objects = old_objects if objects is _UNCHANGED_OBJECT_STORE else objects
+    if not isinstance(next_objects, FoldedObjectStore):
+        raise TypeError("Document transactions require a FoldedObjectStore.")
     old_undo_stack = list(buffer._undo_stack)
     old_redo_stack = list(buffer._redo_stack)
     old_tracking = {
         name: getattr(state, name) for name in _WORKING_STATE_TRACKING_FIELDS
     }
 
-    object_changed = (
-        tables is not _UNCHANGED_OBJECT_MAP and tables is not old_tables
-    ) or (
-        footnotes is not _UNCHANGED_OBJECT_MAP and footnotes is not old_footnotes
-    )
+    object_changed = next_objects is not old_objects
     document_changed = (
         document.text != old_document.text
         or document.cursor_position != old_document.cursor_position
@@ -7759,21 +8578,17 @@ def _commit_folded_object_transaction(
     rollback_error = None
     try:
         buffer.save_to_undo_stack()
-        if tables is not _UNCHANGED_OBJECT_MAP:
-            state.tables = tables
-        if footnotes is not _UNCHANGED_OBJECT_MAP:
-            state.footnotes = footnotes
+        state.objects = next_objects
         if document_changed:
             _replace_buffer_document(buffer, document)
         if selection is not _UNCHANGED_SELECTION:
             buffer.selection_state = selection
         # Object-only edits do not fire the main buffer's text-change callback.
-        # Mark them only after both object and document state have committed.
+        # Mark them only after both halves of the DocumentState have committed.
         if object_changed and document.text == old_document.text:
             _working_state_changed(immediate=True)
     except BaseException as error:
-        state.tables = old_tables
-        state.footnotes = old_footnotes
+        state.objects = old_objects
         buffer.selection_state = old_selection
         try:
             current = buffer.document
@@ -7794,10 +8609,10 @@ def _commit_folded_object_transaction(
 
         if rollback_error is not None:
             raise RuntimeError(
-                "Folded-object transaction failed and its document rollback "
-                "also failed."
+                "Document-state transaction failed and its rollback also failed."
             ) from error
         raise
+
 
 
 def _table_state_for_placeholders(document):
@@ -7818,13 +8633,13 @@ def _table_state_for_placeholders(document):
             raise ValueError(
                 f"Table {number} appears more than once in the folded document."
             )
-        if number not in state.tables:
+        if number not in state.objects.tables:
             raise ValueError(
                 f"Table {number} has a folded reference but no table data."
             )
         seen.add(number)
 
-    missing = sorted(set(state.tables) - seen)
+    missing = sorted(set(state.objects.tables) - seen)
     if missing:
         label = ", ".join(f"Table {number}" for number in missing)
         raise ValueError(
@@ -7837,7 +8652,7 @@ def _shifted_table_state_for_insert(insert_number, document):
     _table_state_for_placeholders(document)
 
     shifted_tables = {}
-    for number, table in state.tables.items():
+    for number, table in state.objects.tables.items():
         target = number + 1 if number >= insert_number else number
         shifted_tables[target] = table
 
@@ -7850,7 +8665,7 @@ def _shifted_table_state_for_insert(insert_number, document):
         if match and int(match.group(1)) >= insert_number:
             old_number = int(match.group(1))
             new_number = old_number + 1
-            table = state.tables[old_number]  # validated above
+            table = state.objects.tables[old_number]  # validated above
             line = _table_placeholder(new_number, table.title)
             changed = True
         new_lines.append(line)
@@ -7920,10 +8735,10 @@ def _commit_new_table_at_cursor(insert_number, table):
     final_document = _document_with_inserted_table_placeholder(
         insert_number, table, shifted_document
     )
-    _commit_folded_object_transaction(
+    _commit_document_state_transaction(
         text_area.buffer,
         final_document,
-        tables=updated_tables,
+        objects=state.objects.with_tables(updated_tables),
     )
     return True
 
@@ -7981,7 +8796,7 @@ def _remove_folded_object_line(lines, row):
 
 def _delete_table_object(table_number):
     """Delete one folded table and renumber later table labels atomically."""
-    if table_number not in state.tables:
+    if table_number not in state.objects.tables:
         return False
 
     buf = text_area.buffer
@@ -7996,11 +8811,11 @@ def _delete_table_object(table_number):
         return False
 
     updated = {}
-    for number in sorted(state.tables):
+    for number in sorted(state.objects.tables):
         if number == table_number:
             continue
         new_number = number - 1 if number > table_number else number
-        updated[new_number] = state.tables[number]
+        updated[new_number] = state.objects.tables[number]
 
     lines, cursor_row = _remove_folded_object_line(doc.lines, target_row)
     for row, line in enumerate(lines):
@@ -8017,10 +8832,10 @@ def _delete_table_object(table_number):
     tmp = Document(new_text)
     cursor_row = min(cursor_row, tmp.line_count - 1)
     cursor_col = min(doc.cursor_position_col, len(tmp.lines[cursor_row]))
-    _commit_folded_object_transaction(
+    _commit_document_state_transaction(
         buf,
         Document(new_text, tmp.translate_row_col_to_index(cursor_row, cursor_col)),
-        tables=updated,
+        objects=state.objects.with_tables(updated),
     )
     return True
 
@@ -8056,8 +8871,8 @@ class _WrapBlock:
     ``wrappable`` describes eligibility for hard-wrapped Markdown export
     command. Normal editing does not rewrite any of these blocks. False is
     reserved for constructs whose physical source layout is content: code,
-    tables, front matter, raw block HTML, and atomic block lines such as ATX
-    headings, thematic breaks, and reference definitions.
+    tables, front matter, raw block HTML, opaque/uncertain source, and atomic
+    block lines such as ATX headings, thematic breaks, and reference definitions.
     """
 
     kind: str
@@ -8138,29 +8953,14 @@ def _blockquote_gutter_text(depth, gutter_width):
 
 
 def _simple_list_fragment_is_safe(text):
-    """Return True when ``text`` is ordinary prose inside a simple list item.
+    """Return True when a simple-list body is positively safe prose.
 
-    This is intentionally much narrower than the old ambiguity filter. A list
-    item becomes complex only when its body explicitly starts another Markdown
-    block that Carriage handles separately. Unknown extension-like syntax is
-    not protected merely because it looks structural.
+    Lists use the same conservative prose gate as top-level paragraphs.  This
+    keeps task-list markers, alert/directive syntax, display math, and future
+    extension-like constructs from being reflowed merely because they appeared
+    inside an otherwise simple list item.
     """
-    if not text.strip():
-        return True
-
-    stripped = text.lstrip()
-    return not (
-        TABLE_PLACEHOLDER_RE.match(text)
-        or FOOTNOTE_PLACEHOLDER_RE.match(text)
-        or _ATX_HEADING_RE.match(text)
-        or _LIST_ITEM_RE.match(text)
-        or stripped.startswith(">")
-        or _fence_marker(text)
-        or _is_indented_code(text)
-        or _is_strong_html_start(text)
-        or _REFERENCE_DEF_RE.match(text)
-        or _is_thematic_break(text)
-    )
+    return _plain_prose_fragment_is_safe(text)
 
 
 def _simple_list_continuation_prefix_width(line, marker_prefix):
@@ -8849,11 +9649,12 @@ def _analyze_document_layout(full_text, width=None):
             i = block.end
             continue
 
-        # Default path: prose continues until a blank line or an explicitly
-        # recognized block begins. A small set of table/container/definition-list
-        # signatures above is preserved even though Carriage does not edit those
-        # extensions; everything else remains ordinary prose. Indentation cannot
-        # interrupt an existing paragraph merely by looking like indented code.
+        # Unrecognized source is *not* prose by default.  First collect the
+        # candidate nonblank paragraph region, stopping at an explicit block
+        # boundary.  Reflow is permitted only when every physical line passes
+        # the positive prose-safety gate; otherwise preserve the region exactly.
+        # This reverses the former blacklist model, where every unknown syntax
+        # was treated as prose until a special-case recognizer was added.
         start = i
         i += 1
         while i < len(lines) and lines[i].strip():
@@ -8862,7 +9663,19 @@ def _analyze_document_layout(full_text, width=None):
             ) is not None:
                 break
             i += 1
-        blocks.append(_make_plain_prose_block(lines, start, i))
+
+        if _plain_prose_run_is_safe(lines, start, i):
+            blocks.append(_make_plain_prose_block(lines, start, i))
+        else:
+            blocks.append(
+                _WrapBlock(
+                    kind="opaque",
+                    start=start,
+                    end=i,
+                    source_lines=list(lines[start:i]),
+                    wrappable=False,
+                )
+            )
 
     return tuple(blocks)
 
@@ -9642,8 +10455,8 @@ def convert_for_carriage_text(full_text):
     hard-wrapped prose becomes one physical line per logical segment; original
     Markdown hard breaks made with two trailing spaces remain physical line
     boundaries; straightforward underscore emphasis is normalized to Carriage's
-    preferred asterisk form. Line-sensitive structural blocks are preserved when Carriage
-    does not have a safe compatibility transformation for them.
+    preferred asterisk form. Carriage reflows only positively identified safe
+    prose; unfamiliar, ambiguous, or extension-like source is preserved exactly.
     """
     blocks = _analyze_document_layout(full_text, WRAP_COLUMN)
     marker_overrides = _ordered_list_marker_overrides(blocks)
@@ -10265,40 +11078,47 @@ def _normalize_footnote_source_lines(note):
 
 
 def _normalize_folded_object_emphasis():
-    """Return copy-on-write table/footnote mappings normalized for Convert."""
-    tables = state.tables
-    footnotes = state.footnotes
+    """Return a copy-on-write FoldedObjectStore normalized for Convert."""
+    objects = state.objects
+    tables = objects.tables
+    footnotes = objects.footnotes
     tables_changed = False
     footnotes_changed = False
 
     updated_tables = dict(tables)
     for number, table in tables.items():
-        headers = [_normalize_underscore_emphasis_inline(value) for value in table.headers]
-        rows = [
-            [_normalize_underscore_emphasis_inline(value) for value in row]
+        headers = tuple(
+            _normalize_underscore_emphasis_inline(value) for value in table.headers
+        )
+        rows = tuple(
+            tuple(_normalize_underscore_emphasis_inline(value) for value in row)
             for row in table.rows
-        ]
+        )
         title = _normalize_underscore_emphasis_inline(table.title)
         original_lines = (
             None
             if table.original_lines is None
-            else [
+            else tuple(
                 _normalize_underscore_emphasis_inline(line)
                 for line in table.original_lines
-            ]
+            )
         )
         if (
-            headers != table.headers
-            or rows != table.rows
+            headers != tuple(table.headers)
+            or rows != tuple(tuple(row) for row in table.rows)
             or title != table.title
-            or original_lines != table.original_lines
+            or original_lines != (
+                None if table.original_lines is None else tuple(table.original_lines)
+            )
         ):
             updated_tables[number] = TableData(
-                headers=headers,
-                rows=rows,
+                headers=list(headers),
+                rows=[list(row) for row in rows],
                 title=title,
                 alignments=list(table.alignments),
-                original_lines=original_lines,
+                original_lines=(
+                    None if original_lines is None else list(original_lines)
+                ),
                 caption_position=table.caption_position,
                 dirty=table.dirty,
             )
@@ -10307,21 +11127,30 @@ def _normalize_folded_object_emphasis():
     updated_footnotes = dict(footnotes)
     for identifier, note in footnotes.items():
         text = _normalize_underscore_emphasis_inline(note.text)
-        original_lines = _normalize_footnote_source_lines(note)
-        if text != note.text or original_lines != note.original_lines:
+        normalized_source = _normalize_footnote_source_lines(note)
+        original_lines = (
+            None if normalized_source is None else tuple(normalized_source)
+        )
+        committed_source = (
+            None if note.original_lines is None else tuple(note.original_lines)
+        )
+        if text != note.text or original_lines != committed_source:
             updated_footnotes[identifier] = FootnoteData(
                 identifier=note.identifier,
                 text=text,
-                original_lines=original_lines,
+                original_lines=(
+                    None if original_lines is None else list(original_lines)
+                ),
                 dirty=note.dirty,
             )
             footnotes_changed = True
 
-    return (
-        updated_tables if tables_changed else tables,
-        updated_footnotes if footnotes_changed else footnotes,
-        tables_changed or footnotes_changed,
-    )
+    if not tables_changed and not footnotes_changed:
+        return objects, False
+    return objects.replace(
+        tables=updated_tables if tables_changed else tables,
+        footnotes=updated_footnotes if footnotes_changed else footnotes,
+    ), True
 
 
 def do_convert_for_carriage():
@@ -10330,24 +11159,23 @@ def do_convert_for_carriage():
     old_text = buf.text
     old_cursor = buf.cursor_position
     new_text, new_cursor = convert_for_carriage_with_cursor(old_text, old_cursor)
-    new_tables, new_footnotes, objects_changed = _normalize_folded_object_emphasis()
+    new_objects, objects_changed = _normalize_folded_object_emphasis()
 
     # A table title is part of its folded prose placeholder. Underscore to
     # asterisk normalization is length-preserving, so refreshing those labels
     # cannot disturb the cursor mapping produced above.
-    if new_tables is not state.tables:
-        new_text = _canonicalize_table_placeholders(new_text, new_tables)
+    if new_objects.tables is not state.objects.tables:
+        new_text = _canonicalize_table_placeholders(new_text, new_objects)
 
     if new_text == old_text and not objects_changed:
         return
 
     if new_cursor is None:
         new_cursor = len(new_text)
-    _commit_folded_object_transaction(
+    _commit_document_state_transaction(
         buf,
         Document(text=new_text, cursor_position=new_cursor),
-        tables=new_tables,
-        footnotes=new_footnotes,
+        objects=new_objects,
     )
 
 
@@ -10655,7 +11483,7 @@ def _find_replace_replace_current():
     session.search_anchor = next_anchor
 
     if new_text != old_text:
-        _commit_folded_object_transaction(
+        _commit_document_state_transaction(
             buf,
             Document(text=new_text, cursor_position=next_anchor),
             selection=None,
@@ -10707,7 +11535,7 @@ def _find_replace_replace_all():
         _close_find_replace(message="No changes made.")
         return
 
-    _commit_folded_object_transaction(
+    _commit_document_state_transaction(
         buf,
         Document(text=new_text, cursor_position=first_end),
         selection=None,
@@ -10758,7 +11586,7 @@ def _close_find_replace(*, cursor_position=None, message=None):
 
 def do_find_replace():
     """Open Carriage's status-line literal Find/Replace interface."""
-    if current_float is not None:
+    if dialog_manager.has_modal():
         return
     session = find_replace
     buf = text_area.buffer
@@ -11032,7 +11860,7 @@ def _focus_table_title(session):
 
 
 def _begin_table_cell_edit():
-    session = current_table_editor
+    session = dialog_manager.find_owner(TableEditorSession)
     if session is None or session.cell_editor is None:
         return
     _load_table_editor_cell(session)
@@ -11042,7 +11870,7 @@ def _begin_table_cell_edit():
 
 
 def _finish_table_cell_edit():
-    session = current_table_editor
+    session = dialog_manager.find_owner(TableEditorSession)
     if session is None:
         return
     _commit_table_editor_cell(session)
@@ -11051,7 +11879,7 @@ def _finish_table_cell_edit():
 
 
 def _cancel_table_cell_edit():
-    session = current_table_editor
+    session = dialog_manager.find_owner(TableEditorSession)
     if session is None:
         return
     # The working table is not changed until a cell is committed, so reload
@@ -11063,7 +11891,7 @@ def _cancel_table_cell_edit():
 
 def _move_table_editor_cell(delta):
     """Move sequentially through cells; used by Tab/Shift+Tab in navigation."""
-    session = current_table_editor
+    session = dialog_manager.find_owner(TableEditorSession)
     if session is None or session.editing:
         return
     rows = _table_rows(session)
@@ -11082,7 +11910,7 @@ def _move_table_editor_cell(delta):
 
 def _move_table_editor_col(delta):
     """Move left/right in navigation mode without wrapping to another row."""
-    session = current_table_editor
+    session = dialog_manager.find_owner(TableEditorSession)
     if session is None or session.editing:
         return
     session.selected_col = max(
@@ -11094,7 +11922,7 @@ def _move_table_editor_col(delta):
 
 def _move_table_editor_row(delta):
     """Move up/down in navigation mode while staying in the same column."""
-    session = current_table_editor
+    session = dialog_manager.find_owner(TableEditorSession)
     if session is None or session.editing:
         return
     rows = _table_rows(session)
@@ -11109,7 +11937,7 @@ def _move_table_editor_row(delta):
 
 def _insert_table_editor_row(where):
     """Insert a blank data row above or below the selected data row."""
-    session = current_table_editor
+    session = dialog_manager.find_owner(TableEditorSession)
     if session is None:
         return
 
@@ -11145,7 +11973,7 @@ def _insert_table_editor_row(where):
 
 def _delete_table_editor_row():
     """Delete the selected data row; the header row is never deletable."""
-    session = current_table_editor
+    session = dialog_manager.find_owner(TableEditorSession)
     if session is None:
         return
 
@@ -11163,7 +11991,7 @@ def _delete_table_editor_row():
 
 def _insert_table_editor_column(where):
     """Insert a blank column to the left or right of the selected column."""
-    session = current_table_editor
+    session = dialog_manager.find_owner(TableEditorSession)
     if session is None:
         return
 
@@ -11194,7 +12022,7 @@ def _insert_table_editor_column(where):
 
 def _delete_table_editor_column():
     """Delete the selected column, while keeping at least two columns."""
-    session = current_table_editor
+    session = dialog_manager.find_owner(TableEditorSession)
     if session is None:
         return
 
@@ -11299,7 +12127,7 @@ def _show_table_command_dialog(title, message, buttons, width, focus=None):
     show_dialog(dialog, focus=focus if focus is not None else buttons[0])
 
 def _show_table_row_menu():
-    session = current_table_editor
+    session = dialog_manager.find_owner(TableEditorSession)
     if session is None:
         return
     if session.editing:
@@ -11330,7 +12158,7 @@ def _show_table_row_menu():
 
 
 def _show_table_column_menu():
-    session = current_table_editor
+    session = dialog_manager.find_owner(TableEditorSession)
     if session is None:
         return
     if session.editing:
@@ -11372,7 +12200,14 @@ def _table_grid_cell_width(columns, terminal_width):
     """
     columns = max(1, int(columns))
     terminal_width = max(1, int(terminal_width))
-    available = min(120, max(1, terminal_width - 12))
+    # The outer table Dialog prefers 110 columns. Its frame and body padding
+    # leave at most about 106 columns for the centered grid. Earlier versions
+    # capped the grid at 120 columns based only on terminal width. On terminals
+    # roughly 130 columns or wider, the grid could therefore become wider than
+    # its own dialog even though the terminal had abundant room; prompt_toolkit
+    # then replaced the dialog body with its red ``Window too small...`` fallback.
+    # Size against both constraints: the live terminal and the dialog interior.
+    available = min(TABLE_EDITOR_GRID_MAX_WIDTH, max(1, terminal_width - 12))
     border_and_padding = (3 * columns) + 1
     return max(1, (available - border_and_padding) // columns)
 
@@ -11572,7 +12407,7 @@ def _table_grid_fragments(session):
     return fragments
 
 def _save_table_editor():
-    session = current_table_editor
+    session = dialog_manager.find_owner(TableEditorSession)
     if session is None:
         return
     _commit_table_editor_cell(session)
@@ -11584,7 +12419,7 @@ def _save_table_editor():
     # content.  Only replace the committed object when its editable content
     # actually differs.  This keeps original spacing, alignment syntax, caption
     # placement, and hard wrapping byte-for-byte until a real table edit occurs.
-    committed = state.tables.get(session.table_number)
+    committed = state.objects.tables.get(session.table_number)
     changed = (
         committed is None
         or _table_content_key(session.working) != _table_content_key(committed)
@@ -11594,17 +12429,17 @@ def _save_table_editor():
         # refreshed folded label first, then commit both through one rollback-
         # protected transaction.
         session.working.dirty = True
-        updated_tables = dict(state.tables)
+        updated_tables = dict(state.objects.tables)
         updated_tables[session.table_number] = session.working
         new_document = _document_with_refreshed_table_placeholder(
             session.table_number,
             session.working,
             text_area.buffer.document,
         )
-        _commit_folded_object_transaction(
+        _commit_document_state_transaction(
             text_area.buffer,
             new_document,
-            tables=updated_tables,
+            objects=state.objects.with_tables(updated_tables),
         )
 
     close_dialog()
@@ -11612,13 +12447,11 @@ def _save_table_editor():
 
 
 def open_table_editor(table_number):
-    global current_table_editor
 
-    if not _dialog_terminal_supported():
-        _notify_dialog_terminal_too_small()
+    if not dialog_manager.can_open(notify=True):
         return
 
-    table = state.tables.get(table_number)
+    table = state.objects.tables.get(table_number)
     if table is None:
         show_message("Table not found", f"Table {table_number} has no attached table data.")
         return
@@ -11646,9 +12479,8 @@ def open_table_editor(table_number):
 
     session = TableEditorSession(
         table_number=table_number,
-        working=copy.deepcopy(table),
+        working=_mutable_table_data(table),
     )
-    current_table_editor = session
 
     table_nav_kb = KeyBindings()
 
@@ -11846,13 +12678,17 @@ def open_table_editor(table_number):
             Button(text="Save", handler=_save_table_editor),
             Button(text="Cancel", handler=close_dialog),
         ],
-        width=D(preferred=110),
+        width=D(preferred=TABLE_EDITOR_DIALOG_WIDTH),
     )
-    session.dialog_float = show_dialog(
+    admitted = show_dialog(
         dialog,
         focus=grid_window,
         height=lambda: _table_editor_dialog_height(session),
+        owner=session,
+        owner_on_close=_object_editor_modal_closed,
     )
+    if admitted is None:
+        return
 
 
 def do_edit_table_at_cursor():
@@ -11864,8 +12700,7 @@ def do_edit_table_at_cursor():
 
 
 def do_insert_table():
-    if not _dialog_terminal_supported():
-        _notify_dialog_terminal_too_small()
+    if not dialog_manager.can_open(notify=True):
         return
     if _folded_placeholder_locked():
         show_message(
@@ -12017,7 +12852,7 @@ def _next_footnote_identifier(source_text=None):
     """Return a stable generated identifier that does not renumber older notes."""
     highest = 0
     pattern = re.compile(r"^fn-(\d+)$")
-    identifiers = set(state.footnotes)
+    identifiers = set(state.objects.footnotes)
     if source_text is None:
         source_text = text_area.text
     for _start, _end, identifier, _row, _start_col, _end_col in _footnote_reference_spans(source_text):
@@ -12051,7 +12886,7 @@ def _document_with_appended_footnote_placeholder(
 
 
 def _save_footnote_editor():
-    session = current_footnote_editor
+    session = dialog_manager.find_owner(FootnoteEditorSession)
     if session is None or session.editor is None:
         return
 
@@ -12080,7 +12915,7 @@ def _save_footnote_editor():
     # As with tables, an unchanged folded footnote must keep its original source
     # lines.  Merely opening the note editor and pressing Save should never
     # collapse an existing hard-wrapped definition or otherwise canonicalize it.
-    committed = state.footnotes.get(session.identifier)
+    committed = state.objects.footnotes.get(session.identifier)
     changed = (
         committed is None
         or _footnote_content_key(session.working) != _footnote_content_key(committed)
@@ -12091,12 +12926,12 @@ def _save_footnote_editor():
         # boundary as mixed document/object operations so recovery bookkeeping
         # cannot leave a partially installed note.
         session.working.dirty = True
-        updated_footnotes = dict(state.footnotes)
+        updated_footnotes = dict(state.objects.footnotes)
         updated_footnotes[session.identifier] = session.working
-        _commit_folded_object_transaction(
+        _commit_document_state_transaction(
             text_area.buffer,
             text_area.buffer.document,
-            footnotes=updated_footnotes,
+            objects=state.objects.with_footnotes(updated_footnotes),
         )
 
     close_dialog()
@@ -12105,13 +12940,11 @@ def _save_footnote_editor():
 
 def open_footnote_editor(identifier):
     """Open the dedicated multiline editor for one folded prose footnote."""
-    global current_footnote_editor
 
-    if not _dialog_terminal_supported():
-        _notify_dialog_terminal_too_small()
+    if not dialog_manager.can_open(notify=True):
         return
 
-    note = state.footnotes.get(identifier)
+    note = state.objects.footnotes.get(identifier)
     if note is None:
         show_message(
             "Footnote source",
@@ -12120,8 +12953,7 @@ def open_footnote_editor(identifier):
         )
         return
 
-    session = FootnoteEditorSession(identifier=identifier, working=copy.deepcopy(note))
-    current_footnote_editor = session
+    session = FootnoteEditorSession(identifier=identifier, working=_mutable_footnote_data(note))
     editor = TextArea(
         text=session.working.text,
         multiline=True,
@@ -12179,11 +13011,15 @@ def open_footnote_editor(identifier):
         ],
         width=D(preferred=78),
     )
-    session.dialog_float = show_dialog(
+    admitted = show_dialog(
         dialog,
         focus=editor,
         height=_footnote_editor_dialog_height,
+        owner=session,
+        owner_on_close=_object_editor_modal_closed,
     )
+    if admitted is None:
+        return
 
 
 def do_edit_footnote_at_cursor():
@@ -12216,17 +13052,17 @@ def _commit_new_footnote_at_cursor():
         reference_document.cursor_position,
     )
 
-    updated_footnotes = dict(state.footnotes)
+    updated_footnotes = dict(state.objects.footnotes)
     updated_footnotes[identifier] = FootnoteData(
         identifier=identifier,
         text="",
         original_lines=None,
         dirty=True,
     )
-    _commit_folded_object_transaction(
+    _commit_document_state_transaction(
         buf,
         final_document,
-        footnotes=updated_footnotes,
+        objects=state.objects.with_footnotes(updated_footnotes),
         selection=None,
     )
     return identifier
@@ -12234,8 +13070,7 @@ def _commit_new_footnote_at_cursor():
 
 def do_insert_footnote():
     """Insert a stable reference and append its folded prose definition object."""
-    if not _dialog_terminal_supported():
-        _notify_dialog_terminal_too_small()
+    if not dialog_manager.can_open(notify=True):
         return
     if _folded_placeholder_locked():
         show_message(
@@ -12254,7 +13089,7 @@ def do_insert_footnote():
 
 def _delete_footnote_object(identifier):
     """Delete one folded footnote definition and all of its references."""
-    if identifier not in state.footnotes:
+    if identifier not in state.objects.footnotes:
         return False
 
     buf = text_area.buffer
@@ -12286,7 +13121,7 @@ def _delete_footnote_object(identifier):
     if target_row is None:
         return False
 
-    updated = dict(state.footnotes)
+    updated = dict(state.objects.footnotes)
     del updated[identifier]
 
     lines, cursor_row = _remove_folded_object_line(doc.lines, target_row)
@@ -12301,17 +13136,17 @@ def _delete_footnote_object(identifier):
         )
     else:
         final_cursor = max(0, min(len(result), new_cursor))
-    _commit_folded_object_transaction(
+    _commit_document_state_transaction(
         buf,
         Document(result, final_cursor),
-        footnotes=updated,
+        objects=state.objects.with_footnotes(updated),
     )
     return True
 
 
 def do_delete_footnote_at_cursor():
     identifier = _footnote_identifier_at_cursor()
-    if identifier is None or identifier not in state.footnotes:
+    if identifier is None or identifier not in state.objects.footnotes:
         show_message(
             "No footnote",
             "Place the cursor on a folded footnote or one of its references first.",
@@ -12346,7 +13181,7 @@ async def _working_state_iteration():
     if (
         state.recovery_error
         and not state.recovery_error_reported
-        and current_float is None
+        and not dialog_manager.has_modal()
     ):
         state.recovery_error_reported = True
         detail = state.recovery_error_message or "Unknown recovery error."
@@ -12768,7 +13603,7 @@ def _perform_pandoc_export_worker(
                 input=source_text,
                 check=True,
                 capture_output=True,
-                text=True,
+                encoding="utf-8",
             )
 
         def validate_before_replace():
@@ -13132,10 +13967,15 @@ def _reload_spellchecked_file(path, *, allow_large=False):
         )
         return False
 
-    visible = _collapse_objects_from_source(content)
-    text_area.buffer.reset(Document(text=visible))
-    state.saved_text = content
-    state.disk_snapshot = disk_snapshot
+    document_state = _collapse_objects_from_source(content)
+    _install_editor_document(
+        document_state,
+        cursor_position=0,
+        path=state.path,
+        saved_text=content,
+        disk_snapshot=disk_snapshot,
+        reset_working_state=False,
+    )
     cleanup_ok = _clear_recovery_file()
     _reset_working_state_tracking()
     if not cleanup_ok:
@@ -13218,8 +14058,7 @@ def _help_reference_dialog_height():
 
 def _show_help_reference(title, text):
     """Show a word-wrapped, scrollable, read-only Help reference."""
-    if not _dialog_terminal_supported():
-        _notify_dialog_terminal_too_small()
+    if not dialog_manager.can_open(notify=True):
         return
 
     ok_button = Button(text="OK", handler=close_dialog)
@@ -13630,16 +14469,14 @@ def _heading_title(line):
 class _DocumentMetadata:
     """Cached writer-facing metadata for one committed document generation.
 
-    The visible text object and the copy-on-write object dictionaries are used
-    as identity tokens. Cursor movement leaves all three identities unchanged,
-    while prose edits and committed table/footnote changes replace at least one
-    of them. This keeps repaint-only status work O(1) without tying display
-    metadata to the recovery journal's broader revision counter.
+    The visible text object and FoldedObjectStore are identity tokens. Cursor
+    movement leaves both unchanged, while prose edits or committed object edits
+    replace at least one. This keeps repaint-only status work O(1) without tying
+    display metadata to the recovery journal's broader revision counter.
     """
 
     visible_text: str
-    tables: object
-    footnotes: object
+    objects: FoldedObjectStore
     word_count: int
     heading_rows: tuple[int, ...]
     heading_levels: tuple[int, ...]
@@ -13661,8 +14498,7 @@ def _document_metadata(visible_text=None):
     if (
         cache is not None
         and cache.visible_text is visible_text
-        and cache.tables is state.tables
-        and cache.footnotes is state.footnotes
+        and cache.objects is state.objects
     ):
         return cache
 
@@ -13686,8 +14522,7 @@ def _document_metadata(visible_text=None):
 
     cache = _DocumentMetadata(
         visible_text=visible_text,
-        tables=state.tables,
-        footnotes=state.footnotes,
+        objects=state.objects,
         word_count=_prose_word_count(visible_text, blocks=blocks),
         heading_rows=tuple(heading_rows),
         heading_levels=tuple(heading_levels),
@@ -13802,8 +14637,7 @@ def _section_navigator_dialog_height():
 
 def do_go_to_section():
     """Open the transient hierarchical ATX section navigator."""
-    if not _dialog_terminal_supported():
-        _notify_dialog_terminal_too_small()
+    if not dialog_manager.can_open(notify=True):
         return
 
     metadata = _document_metadata(text_area.text)
@@ -14130,7 +14964,7 @@ def _prose_word_count(visible_text, blocks=None):
             if len(block.source_lines) == 1:
                 match = TABLE_PLACEHOLDER_RE.match(block.source_lines[0])
                 if match is not None:
-                    table = state.tables.get(int(match.group(1)))
+                    table = state.objects.tables.get(int(match.group(1)))
                     if table is not None:
                         total += _count_table_prose(table)
                     continue
@@ -14140,7 +14974,7 @@ def _prose_word_count(visible_text, blocks=None):
         if block.kind == "footnote-placeholder":
             match = FOOTNOTE_PLACEHOLDER_RE.match(block.source_lines[0])
             if match is not None:
-                note = state.footnotes.get(match.group(1))
+                note = state.objects.footnotes.get(match.group(1))
                 if note is not None:
                     total += _count_prose_fragment(note.text)
             continue
@@ -14508,8 +15342,8 @@ menu_container = EdgeAlignedMenuContainer(
 # list at construction time (`... + (floats or [])`), so it never actually
 # keeps a live reference to our `floats` list - appending to it later has no
 # effect on what's rendered. We wrap it in our own FloatContainer instead,
-# which stores the list by reference, so show_dialog()/close_dialog() can
-# mutate `floats` and have it actually show up.
+# which stores the list by reference. DialogManager mutates that shared list
+# when modals open/close, while static overlays remain ordinary Floats.
 root_container = FloatContainer(
     content=HSplit([title_bar, title_divider, menu_container]), floats=floats
 )
@@ -14738,21 +15572,24 @@ def _(event):
 
 
 no_dialog_open = Condition(
-    lambda: current_float is None and not find_replace.active
+    lambda: not dialog_manager.has_modal() and not find_replace.active
 )
 menu_focused = Condition(lambda: get_app().layout.has_focus(menu_container.window))
-dialog_open = Condition(lambda: current_float is not None)
+dialog_open = Condition(dialog_manager.has_modal)
 table_editor_active = Condition(
-    lambda: (
-        current_table_editor is not None
-        and current_float is current_table_editor.dialog_float
-    )
+    lambda: dialog_manager.top_owner(TableEditorSession) is not None
 )
 cursor_on_table_reference = Condition(
-    lambda: current_table_editor is None and _table_number_at_cursor() is not None
+    lambda: (
+        dialog_manager.find_owner(TableEditorSession) is None
+        and _table_number_at_cursor() is not None
+    )
 )
 cursor_on_footnote_reference = Condition(
-    lambda: current_footnote_editor is None and _footnote_identifier_at_cursor() is not None
+    lambda: (
+        dialog_manager.find_owner(FootnoteEditorSession) is None
+        and _footnote_identifier_at_cursor() is not None
+    )
 )
 
 
@@ -14960,281 +15797,12 @@ def _(event):
     buf.insert_text("\n")
 
 
-def _line_prefix_cell_width(row, wrap_count):
-    """Return the terminal-cell width of one display-only continuation prefix."""
-    prefix = text_area.window.get_line_prefix
-    if prefix is None:
-        return 0
-    try:
-        fragments = prefix(row, wrap_count)
-    except Exception:
-        return 0
-    width = 0
-    for fragment in fragments or []:
-        # Formatted-text fragments can carry mouse handlers/extra tuple fields;
-        # style is item 0 and text is item 1.
-        if len(fragment) >= 2:
-            width += _display_text_width(fragment[1])
-    return width
-
-
-_VISUAL_NAVIGATION_CACHE_ROWS = 64
-
-
-def _visual_navigation_cache_key(row, info):
-    """Return the layout generation key for one navigated logical row."""
-    if info is None or info.window_width <= 0:
-        return None
-    generation = getattr(text_area.window, "_height_cache_generation", 0)
-    try:
-        columns = get_app().output.get_size().columns
-    except Exception:
-        columns = None
-    return (generation, int(row), int(info.window_width), columns)
-
-
-def _store_bounded_visual_cache(cache, key, value):
-    """Keep navigation caches useful without retaining an unbounded row set."""
-    if key not in cache and len(cache) >= _VISUAL_NAVIGATION_CACHE_ROWS:
-        cache.pop(next(iter(cache)))
-    cache[key] = value
-    return value
-
-
-def _visual_display_positions(row, info):
-    """Map processed display columns on one logical line to (wrap row, x).
-
-    This mirrors prompt_toolkit Window._copy_body's line-wrapping rule, but it
-    operates only on one logical line and creates no screen. ``x`` is measured
-    in rendered terminal cells inside the editor Window, after Carriage's
-    display processor and continuation prefix have been applied.
-
-    Vertical navigation asks for this mapping repeatedly while moving through a
-    long soft-wrapped paragraph.  Cache it for the current text/layout
-    generation so the same transformed line is measured only once.
-    """
-    key = _visual_navigation_cache_key(row, info)
-    if key is None:
-        return None
-    cache = text_area.window._visual_positions_cache
-    cached = cache.get(key)
-    if cached is not None:
-        return cached
-
-    try:
-        get_processed = getattr(text_area.control, "_last_get_processed_line", None)
-        if get_processed is None:
-            return None
-        # BufferControl's processed-line cache already contains Carriage's
-        # transformed fragments. UIContent.get_line() wraps that same result
-        # and appends one cursor cell; avoid asking it to process the line again.
-        processed = get_processed(row)
-        fragments = explode_text_fragments(processed.fragments)
-        fragments.append(("", " "))
-    except Exception:
-        return None
-
-    width = info.window_width
-    wrap_row = 0
-    x = _line_prefix_cell_width(row, 0)
-    positions = []
-
-    for fragment in fragments:
-        char = fragment[1]
-        char_width = _display_char_width(char)
-        if x + char_width > width:
-            wrap_row += 1
-            x = _line_prefix_cell_width(row, wrap_row)
-        positions.append((wrap_row, x))
-        x += char_width
-
-    # Cursor position after the final display character. In practice UIContent
-    # appends one cursor cell to every line, so source EOL normally maps to the
-    # position of that cell; keeping the terminal position here is useful for
-    # defensive/fallback mappings as well.
-    positions.append((wrap_row, x))
-    return _store_bounded_visual_cache(cache, key, tuple(positions))
-
-
-def _visual_source_candidates(row, info):
-    """Return navigable source positions grouped by rendered wrap row.
-
-    This is the single source/display resolver used by Up/Down and Home/End.
-    Hidden structural prefixes, compact-footnote interiors, and positions after
-    folded-object sentinels are excluded explicitly rather than relying on
-    source-column tie breaking to make them unreachable by accident.
-    """
-    key = _visual_navigation_cache_key(row, info)
-    if key is None:
-        return None
-    cache = text_area.window._visual_candidates_cache
-    cached = cache.get(key)
-    if cached is not None:
-        return cached
-
-    doc = text_area.buffer.document
-    if not (0 <= row < doc.line_count):
-        return None
-
-    get_processed = getattr(text_area.control, "_last_get_processed_line", None)
-    positions = _visual_display_positions(row, info)
-    if get_processed is None or not positions:
-        return None
-    try:
-        processed = get_processed(row)
-    except Exception:
-        return None
-
-    source_line = doc.lines[row]
-    body_col = _hidden_structural_body_col(doc, row)
-    footnote_spans = tuple(_footnote_display_spans(doc.text, row))
-    compact_ranges = tuple(
-        (span[0], span[1])
-        for span in footnote_spans
-        if len(span) >= 5 and not span[4]
-    )
-    folded_footnote = any(len(span) >= 5 and span[4] for span in footnote_spans)
-    folded_visible_end = (
-        max(0, len(source_line) - 1)
-        if folded_footnote and source_line.endswith(FOOTNOTE_SENTINEL)
-        else None
-    )
-
-    by_wrap = {}
-    for source_col in range(len(source_line) + 1):
-        # Structural Markdown rendered in the hanging gutter is presentation,
-        # not ordinary caret space.
-        if source_col < body_col:
-            continue
-        # The source position after a folded-object sentinel is invisible. The
-        # canonical visible line end is immediately before the sentinel.
-        if (
-            source_col > 0
-            and source_line[source_col - 1:source_col]
-            in {TABLE_SENTINEL, FOOTNOTE_SENTINEL}
-        ):
-            continue
-        # Compact footnote source such as ``[^smith]`` is displayed as ``[1]``.
-        # Only the two visible object boundaries are legal cursor stops.
-        if any(start_col < source_col < end_col for start_col, end_col in compact_ranges):
-            continue
-        # A folded footnote definition is also one atomic visible object. Its
-        # source identifier is hidden behind ``[[Footnote N]]`` and must never
-        # become an intermediate cursor stop.
-        if (
-            folded_visible_end is not None
-            and source_col not in {0, folded_visible_end}
-        ):
-            continue
-
-        try:
-            display_col = processed.source_to_display(source_col)
-        except Exception:
-            continue
-        display_col = max(0, min(display_col, len(positions) - 1))
-        wrap_row, x = positions[display_col]
-        candidate = (x, source_col)
-        by_wrap.setdefault(wrap_row, []).append(candidate)
-
-    # Source order is normally already visual order, but sorting makes the
-    # boundary and nearest-x policies explicit even around transformed spans.
-    frozen_by_wrap = {
-        wrap_row: tuple(sorted(candidates, key=lambda item: (item[0], item[1])))
-        for wrap_row, candidates in by_wrap.items()
-    }
-    return _store_bounded_visual_cache(cache, key, frozen_by_wrap)
-
-
-def _normalize_visual_source_col(
-    document, row, source_col, *, structural_body_col=None
-):
-    """Snap a source column to an explicit visible cursor boundary.
-
-    ``structural_body_col`` lets startup/recovery normalization use the stable
-    document layout before a real terminal width exists.  Interactive callers
-    keep the ordinary width-aware gutter behavior by leaving it unset.
-    """
-    if not (0 <= row < document.line_count):
-        return source_col
-    source_line = document.lines[row]
-    source_col = max(0, min(len(source_line), int(source_col)))
-    if structural_body_col is None:
-        structural_body_col = _hidden_structural_body_col(document, row)
-    structural_body_col = max(0, min(len(source_line), int(structural_body_col)))
-    source_col = max(source_col, structural_body_col)
-
-    if (
-        source_col > 0
-        and source_line[source_col - 1:source_col]
-        in {TABLE_SENTINEL, FOOTNOTE_SENTINEL}
-    ):
-        source_col -= 1
-
-    spans = tuple(_footnote_display_spans(document.text, row))
-    for start_col, end_col, _label, _identifier, placeholder in spans:
-        if placeholder:
-            visible_end = (
-                max(0, len(source_line) - 1)
-                if source_line.endswith(FOOTNOTE_SENTINEL)
-                else len(source_line)
-            )
-            if 0 < source_col < visible_end:
-                return min(
-                    (0, visible_end),
-                    key=lambda boundary: (abs(boundary - source_col), boundary),
-                )
-        elif start_col < source_col < end_col:
-            return min(
-                (start_col, end_col),
-                key=lambda boundary: (abs(boundary - source_col), boundary),
-            )
-    return source_col
-
-
-def _source_visual_position(row, source_col, info):
-    """Return (wrap row, x) for one explicit visible source position."""
-    doc = text_area.buffer.document
-    if not (0 <= row < doc.line_count):
-        return None
-    source_col = _normalize_visual_source_col(doc, row, source_col)
-
-    get_processed = getattr(text_area.control, "_last_get_processed_line", None)
-    if get_processed is None:
-        return None
-    try:
-        processed = get_processed(row)
-        display_col = processed.source_to_display(source_col)
-        positions = _visual_display_positions(row, info)
-    except Exception:
-        return None
-    if not positions:
-        return None
-    display_col = max(0, min(display_col, len(positions) - 1))
-    return positions[display_col]
-
-
-def _source_col_for_visual_position(row, wrap_row, preferred_x, info):
-    """Return the navigable source column nearest ``preferred_x``."""
-    by_wrap = _visual_source_candidates(row, info)
-    if by_wrap is None:
-        return None
-    row_candidates = by_wrap.get(wrap_row, ())
-    if not row_candidates:
-        return None
-
-    _x, source_col = min(
-        row_candidates,
-        key=lambda item: (abs(item[0] - preferred_x), item[1]),
-    )
-    return source_col
-
 def _move_editor_cursor_visual_rows(delta):
     """Move the prose caret by one rendered screen row.
 
-    Up/Down navigation is based on the visual soft-wrapped document, not the
-    underlying logical source lines. The preferred x position is retained over
-    repeated vertical moves so crossing a short rendered row and then a longer
-    one returns to the writer's original visual column.
+    Up/Down navigation is based on the authoritative rendered geometry rather
+    than logical source lines. Repeated moves retain one preferred visual x
+    position while the viewport advances only when the caret crosses an edge.
     """
     if delta == 0:
         return False
@@ -15243,7 +15811,18 @@ def _move_editor_cursor_visual_rows(delta):
     doc = buf.document
     info = text_area.window.render_info
     if info is None or info.window_width <= 0 or doc.line_count <= 0:
-        # Safe fallback before the first render.
+        old = buf.cursor_position
+        if delta < 0:
+            buf.cursor_up(count=abs(delta))
+        else:
+            buf.cursor_down(count=abs(delta))
+        return buf.cursor_position != old
+
+    geometry = text_area.window.rendered_geometry
+    heights, prefix = geometry.height_geometry(
+        ui_content=info.ui_content, width=info.window_width
+    )
+    if not heights or prefix is None:
         old = buf.cursor_position
         if delta < 0:
             buf.cursor_up(count=abs(delta))
@@ -15252,12 +15831,15 @@ def _move_editor_cursor_visual_rows(delta):
         return buf.cursor_position != old
 
     row = doc.cursor_position_row
-    source_col = doc.cursor_position_col
-    current_visual = _source_visual_position(row, source_col, info)
-    heights, prefix = text_area.window._rendered_height_geometry(
-        ui_content=info.ui_content, width=info.window_width
+    current = geometry.source_to_absolute(
+        row,
+        doc.cursor_position_col,
+        info,
+        heights=heights,
+        prefix=prefix,
+        document=doc,
     )
-    if current_visual is None or not heights or prefix is None:
+    if current is None:
         old = buf.cursor_position
         if delta < 0:
             buf.cursor_up(count=abs(delta))
@@ -15265,24 +15847,24 @@ def _move_editor_cursor_visual_rows(delta):
             buf.cursor_down(count=abs(delta))
         return buf.cursor_position != old
 
-    current_wrap, current_x = current_visual
+    absolute_row, current_x = current
     preferred_x = text_area.window._vertical_preferred_x
     if preferred_x is None:
         preferred_x = current_x
         text_area.window._vertical_preferred_x = preferred_x
 
-    absolute_row = prefix[row] + current_wrap
     target_absolute = absolute_row + delta
     if target_absolute < 0 or target_absolute >= prefix[-1]:
         return False
 
-    target_row = max(
-        0,
-        min(len(heights) - 1, bisect_right(prefix, target_absolute) - 1),
+    target_owner = geometry.absolute_to_row_wrap(
+        target_absolute, heights=heights, prefix=prefix
     )
-    target_wrap = target_absolute - prefix[target_row]
-    target_col = _source_col_for_visual_position(
-        target_row, target_wrap, preferred_x, info
+    if target_owner is None:
+        return False
+    target_row, target_wrap = target_owner
+    target_col = geometry.visual_to_source(
+        target_row, target_wrap, preferred_x, info, document=doc
     )
     if target_col is None:
         return False
@@ -15291,12 +15873,8 @@ def _move_editor_cursor_visual_rows(delta):
     if target == buf.cursor_position:
         return False
 
-    # Keep the caret at its current screen row until it reaches a viewport edge;
-    # after that, move the viewport by exactly the rendered rows necessary to
-    # reveal the next visual cursor row. This avoids prompt_toolkit's wrapped
-    # logical-line scroller pulling an entire paragraph into view at once.
     viewport_height = max(1, info.window_height)
-    current_top = text_area.window._absolute_rendered_scroll(heights, prefix)
+    current_top = geometry.absolute_scroll(heights, prefix)
     desired_top = current_top
     if target_absolute < current_top:
         desired_top = target_absolute
@@ -15310,8 +15888,6 @@ def _move_editor_cursor_visual_rows(delta):
     text_area.window._visual_vertical_move_in_progress = True
     try:
         buf.cursor_position = target
-        # prompt_toolkit's logical preferred column must not leak into visual
-        # movement if some other binding used cursor_up/cursor_down previously.
         buf.preferred_column = None
     finally:
         text_area.window._visual_vertical_move_in_progress = False
@@ -15401,44 +15977,6 @@ def _extend_selection_by_word(delta):
     return _move_editor_selection_by_word(delta)
 
 
-def _visual_row_boundary_source_index(row, wrap_row, end=False, info=None):
-    """Return one displayed-row boundary as an absolute source index.
-
-    This is the shared boundary resolver for Home/End and prose-gutter clicks.
-    ``row`` is a logical source row and ``wrap_row`` is the zero-based visual
-    row within it. Hidden compact-footnote source and folded-object sentinels
-    are excluded by the same candidate resolver used by Up/Down.
-    """
-    doc = text_area.buffer.document
-    if not (0 <= row < doc.line_count):
-        return None
-
-    source_line = doc.lines[row]
-    if info is None:
-        info = text_area.window.render_info
-
-    def physical_boundary():
-        if end:
-            source_col = len(source_line)
-            if source_line.endswith((TABLE_SENTINEL, FOOTNOTE_SENTINEL)):
-                source_col = max(0, source_col - 1)
-        else:
-            source_col = _hidden_structural_body_col(doc, row)
-        return doc.translate_row_col_to_index(row, source_col)
-
-    if info is None or info.window_width <= 0:
-        return physical_boundary()
-
-    by_wrap = _visual_source_candidates(row, info)
-    if by_wrap is None:
-        return physical_boundary()
-    row_candidates = by_wrap.get(wrap_row, ())
-    if not row_candidates:
-        return physical_boundary()
-
-    _x, source_col = row_candidates[-1] if end else row_candidates[0]
-    return doc.translate_row_col_to_index(row, source_col)
-
 def _visual_row_boundary_target(end=False):
     """Return the source index at the start/end of the current rendered row."""
     buf = text_area.buffer
@@ -15453,13 +15991,16 @@ def _visual_row_boundary_target(end=False):
             target = max(doc.translate_row_col_to_index(row, 0), target - 1)
         return target
 
-    current_visual = _source_visual_position(row, doc.cursor_position_col, info)
+    geometry = text_area.window.rendered_geometry
+    current_visual = geometry.source_to_visual(
+        row, doc.cursor_position_col, info, document=doc
+    )
     if current_visual is None:
         amount = doc.get_end_of_line_position() if end else doc.get_start_of_line_position()
         return doc.cursor_position + amount
 
-    return _visual_row_boundary_source_index(
-        row, current_visual[0], end=end, info=info
+    return geometry.row_boundary_source_index(
+        row, current_visual[0], end=end, info=info, document=doc
     )
 
 
@@ -15890,6 +16431,28 @@ style = Style.from_dict(
 application = None
 
 
+def _preferred_application_color_depth():
+    """Return an explicit depth only when the terminal advertises true color.
+
+    prompt_toolkit already honors PROMPT_TOOLKIT_COLOR_DEPTH and knows about
+    limited TERM values such as the Linux virtual console.  Do not override
+    either of those decisions.  COLORTERM=truecolor/24bit is a sufficiently
+    explicit capability signal for modern terminal emulators such as Kitty;
+    otherwise return None and let prompt_toolkit choose its safe default.
+    """
+    if os.environ.get("NO_COLOR") or os.environ.get("PROMPT_TOOLKIT_COLOR_DEPTH"):
+        return None
+
+    term = os.environ.get("TERM", "").strip().lower()
+    if term in {"linux", "eterm-color", "dumb"}:
+        return None
+
+    colorterm = os.environ.get("COLORTERM", "").strip().lower()
+    if colorterm in {"truecolor", "24bit"}:
+        return ColorDepth.DEPTH_24_BIT
+    return None
+
+
 def _create_application():
     """Construct the interactive prompt_toolkit application after CLI parsing."""
     app = Application(
@@ -15899,12 +16462,9 @@ def _create_application():
         clipboard=CarriageClipboard(),
         mouse_support=MOUSE_ENABLED,
         full_screen=True,
-        # Without this, prompt_toolkit's default color depth is 256-color, not
-        # true 24-bit - our exact hex values would get approximated to the
-        # nearest of 256 colors, which can quietly collapse contrast between
-        # similar tones. Kitty (and virtually every modern terminal) supports
-        # real 24-bit color, so ask for it explicitly.
-        color_depth=ColorDepth.DEPTH_24_BIT,
+        # Use true color only when the terminal explicitly advertises it;
+        # otherwise prompt_toolkit retains control of its terminal-safe default.
+        color_depth=_preferred_application_color_depth,
         cursor=SimpleCursorShapeConfig(cursor_shape=CursorShape.BEAM),
     )
     # VT100 terminals encode Alt/meta keys and special-key sequences with an
