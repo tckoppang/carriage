@@ -25,6 +25,7 @@
 | `F10` or `Ctrl+Space` | Open the menu bar |
 | `Home` / `End` | Start / end of the displayed row |
 | `Ctrl+Home` / `Ctrl+End` | Top / end of the document |
+| `Alt+G` | Go directly to an ATX section |
 | `Alt+Up` / `Alt+Down` | Previous / next ATX section |
 | `1` through `6` | Jump among File, Edit, Go, Export, Tools, and Help while the menu bar is active |
 | `Tab` | Indent normally; edit a folded table or footnote at the cursor |
@@ -44,6 +45,12 @@ Press `F6` again to leave the mode while preserving the selection. Shift-based s
 
 Double-click selects a word. Triple-click selects the current paragraph or list item. Structural Markdown shown in the hanging gutter is not a cursor destination.
 
+## Navigation
+
+`Alt+G` opens **Go to Section**, a temporary hierarchical list of the document's recognized ATX headings. The current section is selected when the dialog opens. Type to filter by visible heading text, use Up and Down to choose a result, and press Enter to jump with that heading aligned at the top of the editor. Esc cancels without moving the document cursor.
+
+`Alt+Up` and `Alt+Down` remain the faster commands for moving directly to the previous or next section.
+
 ## Find and replace
 
 `Ctrl+F` opens Find / Replace on the status-line row. Search is literal, begins at the current cursor position, and wraps around the document. If a single-line selection is active, it becomes the initial search term.
@@ -59,7 +66,7 @@ While the Find field is active:
 
 While the Replace field is active, Enter replaces the current match and advances, Down skips to the next match, Up moves to the previous match, and `Alt+A` replaces all matches. Replace All is recorded as one undoable document change. Tab or Shift+Tab returns to Find.
 
-Carriage does not use regular expressions for Find / Replace. Find / Replace searches ordinary visible document text. Folded table and footnote placeholder lines and their hidden contents are excluded from search. Complex or multiline footnotes that remain ordinary Markdown are searched normally.
+Carriage does not use regular expressions for Find / Replace. Find / Replace searches ordinary visible document text. Folded table and footnote placeholder lines and their hidden contents are excluded from search. Structurally complex footnotes that remain ordinary Markdown are searched normally.
 
 ## Clipboard
 
@@ -83,7 +90,7 @@ Ordinary prose soft-wraps visually at the configured prose width without changin
 - join supported hard-wrapped prose into logical source lines
 - recognize supported tables and footnotes
 
-Ambiguous or line-sensitive Markdown is preserved. **Export > Hard-Wrapped Markdown** writes a separate wrapped copy without modifying the working file.
+Ambiguous or line-sensitive Markdown is preserved. This includes unsupported table forms such as headerless or malformed pipe-table runs and Pandoc grid/simple tables, as well as fenced containers and definition lists. **Export > Hard-Wrapped Markdown** uses the same conservative block classification and writes a separate wrapped copy without modifying the working file.
 
 Two trailing spaces create a Markdown hard line break. When enabled, Carriage displays the break as `↵`. The marker is visual only.
 
@@ -107,7 +114,7 @@ Save As suggests a filename from the first recognized ATX heading. It uses visib
 
 ## Tables
 
-`F4` or **Tools > Insert Table** creates a basic table with 2 to 6 columns and 1 to 20 data rows.
+`F4` or **Tools > Insert Table** creates a basic table with 2 to 6 columns and 1 to 60 data rows. Existing and imported tables with up to six columns can be edited regardless of row count.
 
 In the table editor:
 
@@ -119,13 +126,13 @@ In the table editor:
 - `C` opens column commands in navigation mode.
 - Save commits the table; Cancel discards the table-editor session.
 
-Imported tables wider than six columns are preserved as Markdown but cannot be opened in the basic editor.
+Imported tables wider than six columns are preserved as Markdown but cannot be opened in the basic editor. Headerless-looking pipe tables can use a blank header row and remain editable.
 
 ## Footnotes
 
-`F5` or **Tools > Insert Footnote** creates a standard inline reference and a folded single-paragraph definition. References display sequentially as `[1]`, `[2]`, and so on. `Tab` opens the associated editor.
+`F5` or **Tools > Insert Footnote** creates a standard inline reference and a folded prose definition. References display sequentially as `[1]`, `[2]`, and so on. `Tab` opens the associated multiline editor. Enter inserts a line break; a blank line starts a new paragraph; `Ctrl+S` saves.
 
-Adjacent references remain separate atomic objects. Complex footnotes remain ordinary Markdown source.
+Adjacent references remain separate atomic objects. Footnotes containing structural blocks such as lists, blockquotes, code, raw HTML, reference definitions, thematic breaks, or tables remain ordinary Markdown source. The editor refuses to save structural Markdown into a folded prose footnote.
 
 ## Spell check and export
 

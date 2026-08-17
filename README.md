@@ -65,9 +65,9 @@ Input is read as UTF-8. CRLF and CR line endings are normalized to LF.
 - join supported hard-wrapped prose into logical source lines
 - renumber straightforward ordered lists from their existing first number
 - convert straightforward underscore emphasis to Carriage's preferred asterisk form
-- recognize supported pipe tables and simple footnotes as Carriage objects
+- recognize supported pipe tables and prose footnotes as Carriage objects
 
-Conversion is intentionally conservative. Unsupported, complex, or ambiguous structures are preserved rather than repaired.
+Conversion is intentionally conservative. Unsupported, complex, or ambiguous structures are preserved rather than repaired. Line-sensitive unsupported structures such as headerless or malformed pipe-table runs, Pandoc grid or simple tables, fenced containers, and definition lists are left intact rather than reflowed as prose.
 
 ## Tables
 
@@ -79,19 +79,19 @@ In the prose view, a table is folded into a compact reference such as:
 [[Table 1: Movement Rates]]
 ```
 
-Press `Tab` on the reference to open the table editor. The basic editor can create and edit tables with 2 to 6 columns and 1 to 20 data rows. It supports an optional title, headers, alignment, row and column commands, cell navigation, and visually wrapped cell contents.
+Press `Tab` on the reference to open the table editor. The basic editor can create tables with 2 to 6 columns and 1 to 60 data rows. Existing and imported tables with up to six columns can be edited regardless of row count. The editor supports an optional title, headers, alignment, row and column commands, cell navigation, and visually wrapped cell contents.
 
-Imported tables wider than six columns are preserved as Markdown and participate in saving and recovery, but they cannot be opened in the basic table editor.
+Imported tables wider than six columns are preserved as Markdown and participate in saving and recovery, but they cannot be opened in the basic table editor. Headerless-looking pipe tables can use a blank header row and remain fully editable.
 
 On disk, every table remains an ordinary Markdown pipe table. Optional titles use Pandoc table captions.
 
 ## Footnotes
 
-Carriage provides first-class support for simple Pandoc-style Markdown footnotes.
+Carriage provides first-class support for prose-only Pandoc-style Markdown footnotes.
 
-Inline references display as sequential numbers such as `[1]` and `[2]`, while supported single-paragraph definitions fold out of the main prose view. Press `Tab` at a reference or folded definition to open the footnote editor.
+Inline references display as sequential numbers such as `[1]` and `[2]`, while supported single- and multi-paragraph definitions fold out of the main prose view. Press `Tab` at a reference or folded definition to open the multiline footnote editor. Blank lines separate paragraphs.
 
-Adjacent references remain separate atomic objects. Complex or multiline footnotes that Carriage cannot safely model remain ordinary Markdown source.
+Adjacent references remain separate atomic objects. Footnotes containing structural blocks such as lists, blockquotes, code, raw HTML, reference definitions, thematic breaks, or tables remain ordinary Markdown source. The footnote editor applies the same prose-only rule when saving, so Carriage does not create a folded footnote it would refuse to fold when reopened.
 
 ## Undo and redo
 
@@ -103,7 +103,7 @@ Press `Ctrl+F` or choose **Edit > Find / Replace** to open the one-line search i
 
 Enter or Down moves to the next match; Up moves to the previous match. Tab switches to replacement. In Replace mode, Enter replaces the current occurrence and advances, while `Alt+A` replaces all matches as one undoable document change. `Alt+C` toggles case-sensitive matching and `Alt+W` toggles whole-word matching. Esc returns to the document. Regular-expression search is intentionally not included.
 
-Find / Replace searches ordinary visible document text. Folded table and footnote placeholder lines and their hidden contents are excluded from search. Complex or multiline footnotes that remain ordinary Markdown are searched normally.
+Find / Replace searches ordinary visible document text. Folded table and footnote placeholder lines and their hidden contents are excluded from search. Structurally complex footnotes that remain ordinary Markdown are searched normally.
 
 ## Saving and recovery
 
@@ -309,10 +309,13 @@ Press `F10` or `Ctrl+Space` to activate the menu bar. `F1` opens Carriage Help.
 | `F7` | Spell check |
 | `F8` | Renumber the numbered list at the cursor |
 | `Ctrl+Home` / `Ctrl+End` | Top / end of document |
+| `Alt+G` | Go directly to an ATX section |
 | `Alt+Up` / `Alt+Down` | Previous / next ATX section |
 | `Tab` | Edit a folded table or footnote at the cursor |
 
 Carriage exchanges plain text with the desktop system clipboard when an available platform backend is present. Windows uses native clipboard support; macOS uses `pbcopy`/`pbpaste`; Linux uses `wl-copy`/`wl-paste` from **wl-clipboard** under Wayland, or `xclip`/`xsel` under X11. Linux clipboard helpers are optional. If no system clipboard backend is available, Cut/Copy/Paste automatically fall back to Carriage's internal clipboard. Pasted CRLF or CR line endings are normalized to LF.
+
+**Go to Section.** Press `Alt+G` or choose **Go > Go to Section** to open a temporary hierarchical list of the document's recognized ATX headings. The current section is selected initially. Type to filter by visible heading text, use Up/Down to choose a result, and press Enter to jump with that heading aligned at the top of the editor. `Alt+Up` and `Alt+Down` remain available for moving directly to the previous or next section.
 
 ## Documentation
 
