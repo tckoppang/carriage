@@ -69,7 +69,7 @@ Temporary messages still occupy the status-bar line when the normal status bar i
 
 Boolean. Default: `true`.
 
-Enables prompt_toolkit mouse handling, including clicking, scrolling, double-click word selection, and triple-click paragraph or list-item selection.
+Enables mouse handling where Carriage provides it. In the main prose editor, this includes clicking to place the insertion point, drag selection, mouse-wheel and scrollbar scrolling, double-click word selection, and triple-click paragraph or list-item selection. Ordinary prompt_toolkit controls such as buttons and text fields also remain mouse-accessible. Custom views may provide a narrower mouse interface; in v1.194, the table grid itself remains keyboard-driven.
 
 ### `interface.hard_break_marker`
 

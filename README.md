@@ -77,7 +77,7 @@ In the prose view, a table is folded into a compact reference such as:
 [[Table 1: Movement Rates]]
 ```
 
-Press `Tab` on the reference to open the table editor. The basic editor can create tables with 2 to 6 columns and 1 to 60 data rows. Existing and imported tables with up to six columns can be edited regardless of row count. The editor supports an optional title, headers, alignment, row and column commands, cell navigation, and visually wrapped cell contents.
+Press `Tab` on the reference to open the table editor. The basic editor can create tables with 2 to 6 columns and 1 to 60 data rows. Existing and imported tables with up to six columns can be edited regardless of row count. The editor supports an optional title, headers, row and column commands, cell navigation, and visually wrapped cell contents. Existing Markdown column alignment is preserved, but alignment is not yet editable in the basic table editor.
 
 Imported tables wider than six columns are preserved as Markdown and participate in saving and recovery, but they cannot be opened in the basic table editor. Headerless-looking pipe tables can use a blank header row and remain fully editable.
 
@@ -321,6 +321,7 @@ Carriage exchanges plain text with the desktop system clipboard when an availabl
 - [Carriage Help](CARRIAGE_HELP.md) mirrors the practical built-in help.
 - [Markdown Reference](MARKDOWN_REFERENCE.md) mirrors the built-in Markdown syntax reference.
 - [Configuration Reference](CONFIGURATION.md) documents every current configuration setting.
+- [Features To-Do List](to-do_list_for_carriage.md) tracks planned refinements and lower-priority possibilities.
 - [Keyboard Cheat Sheet](carriage_keyboard_cheat_sheet.pdf) is a printable one-page PDF.
 
 ## Design philosophy
